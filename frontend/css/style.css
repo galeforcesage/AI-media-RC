@@ -1,0 +1,291 @@
+/* ============================================================
+   LLM Remote — CSS
+   Responsive, dark-theme, mobile-first UI
+   ============================================================ */
+
+:root {
+  --bg: #121212;
+  --surface: #1e1e1e;
+  --surface2: #2a2a2a;
+  --primary: #4fc3f7;
+  --primary-dark: #0288d1;
+  --danger: #ef5350;
+  --text: #e0e0e0;
+  --text-muted: #9e9e9e;
+  --border: #333;
+  --radius: 8px;
+  --shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 16px; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- Header ---- */
+#header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.logo { font-size: 1.1rem; font-weight: 700; color: var(--primary); }
+.header-controls { display: flex; gap: 0.5rem; }
+.header-controls select {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.6rem;
+  font-size: 0.9rem;
+}
+
+/* ---- Panels ---- */
+.panel {
+  background: var(--surface);
+  margin: 0.5rem;
+  padding: 1rem;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* ---- Now Playing ---- */
+#now-playing { text-align: center; }
+.np-title { font-size: 1.2rem; font-weight: 600; }
+.np-episode { font-size: 0.9rem; color: var(--text-muted); margin-top: 0.2rem; }
+.np-channel { font-size: 0.85rem; color: var(--text-muted); }
+.np-state { font-size: 0.8rem; color: var(--primary); margin-top: 0.3rem; text-transform: uppercase; }
+.np-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+.np-progress span { font-size: 0.8rem; color: var(--text-muted); min-width: 3rem; }
+.np-progress input[type="range"] { flex: 1; }
+
+/* ---- Transport ---- */
+#transport { text-align: center; }
+.transport-row {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.transport-row.secondary { gap: 1rem; }
+.transport-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  width: 52px;
+  height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s;
+  font-size: 1rem;
+}
+.transport-btn:hover { background: var(--primary-dark); }
+.transport-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.transport-btn.primary { width: 64px; height: 64px; background: var(--primary-dark); font-size: 1.3rem; }
+.transport-btn .label { font-size: 0.6rem; margin-top: 1px; }
+.transport-btn.small { width: 40px; height: 40px; border-radius: var(--radius); font-size: 0.85rem; }
+.volume-control { display: flex; align-items: center; gap: 0.4rem; }
+.volume-control input[type="range"] { width: 100px; }
+
+/* ---- Chat / Messages ---- */
+#chat { display: flex; flex-direction: column; flex: 1; min-height: 160px; }
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 300px;
+  padding: 0.5rem 0;
+}
+.msg {
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius);
+  max-width: 85%;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+.msg.user { background: var(--primary-dark); margin-left: auto; }
+.msg.assistant { background: var(--surface2); }
+.msg.error { background: #4a1c1c; border: 1px solid var(--danger); }
+.msg .confirm-btns { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+.msg .confirm-btns button {
+  padding: 0.3rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+}
+.msg .confirm-btns button.yes { background: var(--primary-dark); }
+
+.input-row { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
+#text-input {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.75rem;
+  color: var(--text);
+  font-size: 0.95rem;
+}
+.btn-send, .btn-voice {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 1.2rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.btn-voice { background: var(--primary-dark); }
+.btn-voice.recording { background: var(--danger); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: 0.6; } }
+
+/* ---- Footer ---- */
+#footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+.footer-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.footer-btn:hover { color: var(--primary); }
+.footer-status { color: var(--text-muted); }
+.footer-status.connected { color: #66bb6a; }
+
+/* ---- Dialogs ---- */
+dialog {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  max-width: 500px;
+  width: 90%;
+  box-shadow: var(--shadow);
+}
+dialog::backdrop { background: rgba(0,0,0,0.7); }
+dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
+dialog fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 0.75rem; margin-bottom: 0.75rem; }
+dialog legend { color: var(--primary); font-size: 0.9rem; padding: 0 0.3rem; }
+dialog label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }
+dialog input, dialog select {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.4rem;
+  width: 100%;
+  margin-top: 0.2rem;
+}
+.dialog-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+.dialog-actions button {
+  padding: 0.5rem 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+/* Admin tabs */
+.admin-tabs { display: flex; gap: 0.3rem; margin-bottom: 1rem; }
+.tab {
+  padding: 0.4rem 1rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.tab.active { color: var(--primary); border-bottom-color: var(--surface); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+.btn-small {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.85rem;
+  margin: 0.3rem 0;
+}
+.btn-danger { border-color: var(--danger); color: var(--danger); }
+.btn-danger:hover { background: var(--danger); color: #fff; }
+
+/* Device list in admin */
+.device-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.device-item .name { font-weight: 600; }
+.device-item .meta { font-size: 0.8rem; color: var(--text-muted); }
+
+/* Range inputs */
+input[type="range"] {
+  -webkit-appearance: none;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  background: var(--primary);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+/* ---- Responsive ---- */
+@media (min-width: 768px) {
+  body { max-width: 600px; margin: 0 auto; }
+  .messages { max-height: 400px; }
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa;
+    --surface: #fff;
+    --surface2: #f0f0f0;
+    --text: #212121;
+    --text-muted: #757575;
+    --border: #ddd;
+  }
+}

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Remote</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- Region 1: Header -->
+  <header id="header">
+    <div class="header-left">
+      <h1 class="logo">LLM Remote</h1>
+    </div>
+    <div class="header-controls">
+      <select id="system-picker" aria-label="Select system">
+        <option value="sagetv">SageTV</option>
+        <option value="channelsdvr">Channels DVR</option>
+      </select>
+      <select id="device-picker" aria-label="Select device">
+        <option value="">Select device...</option>
+      </select>
+    </div>
+  </header>
+
+  <!-- Region 2: Now Playing -->
+  <section id="now-playing" class="panel" aria-live="polite">
+    <div class="np-info">
+      <div class="np-title" id="np-title">No active playback</div>
+      <div class="np-episode" id="np-episode"></div>
+      <div class="np-channel" id="np-channel"></div>
+      <div class="np-state" id="np-state"></div>
+    </div>
+    <div class="np-progress">
+      <span id="np-position">0:00</span>
+      <input type="range" id="seek-slider" min="0" max="100" value="0" aria-label="Seek position">
+      <span id="np-duration">0:00</span>
+    </div>
+  </section>
+
+  <!-- Region 3: Transport Controls -->
+  <section id="transport" class="panel">
+    <div class="transport-row">
+      <button id="btn-skip-back" class="transport-btn" title="Skip back 10s" aria-label="Skip back 10 seconds">
+        <span class="icon">⏪</span><span class="label">-10s</span>
+      </button>
+      <button id="btn-play-pause" class="transport-btn primary" title="Play / Pause" aria-label="Play or Pause">
+        <span class="icon" id="play-pause-icon">▶</span>
+      </button>
+      <button id="btn-stop" class="transport-btn" title="Stop" aria-label="Stop">
+        <span class="icon">⏹</span>
+      </button>
+      <button id="btn-skip-forward" class="transport-btn" title="Skip forward 30s" aria-label="Skip forward 30 seconds">
+        <span class="icon">⏩</span><span class="label">+30s</span>
+      </button>
+    </div>
+    <div class="transport-row secondary">
+      <button id="btn-commercial-skip" class="transport-btn small" title="Skip commercial" aria-label="Skip commercial" hidden>
+        <span class="icon">⏭</span><span class="label">Com Skip</span>
+      </button>
+      <div class="volume-control">
+        <button id="btn-mute" class="transport-btn small" title="Mute" aria-label="Mute">
+          <span class="icon" id="mute-icon">🔊</span>
+        </button>
+        <input type="range" id="volume-slider" min="0" max="100" value="75" aria-label="Volume">
+      </div>
+    </div>
+  </section>
+
+  <!-- Region 4: Voice + Text + LLM -->
+  <section id="chat" class="panel">
+    <div id="messages" class="messages" role="log" aria-live="polite"></div>
+    <div class="input-row">
+      <input type="text" id="text-input" placeholder="Type a command..." aria-label="Command input"
+             autocomplete="off">
+      <button id="btn-send" class="btn-send" title="Send" aria-label="Send command">➤</button>
+      <button id="btn-voice" class="btn-voice" title="Hold to speak" aria-label="Hold to speak">🎤</button>
+    </div>
+  </section>
+
+  <!-- Region 5: Footer -->
+  <footer id="footer">
+    <button id="btn-settings" class="footer-btn" aria-label="Settings">⚙ Settings</button>
+    <button id="btn-admin" class="footer-btn" aria-label="Admin Panel">🛠 Admin</button>
+    <span class="footer-status" id="footer-status">Disconnected</span>
+  </footer>
+
+  <!-- Settings Modal -->
+  <dialog id="settings-dialog">
+    <h2>Settings</h2>
+    <form method="dialog">
+      <fieldset>
+        <legend>System</legend>
+        <label>Default system:
+          <select id="setting-default-system">
+            <option value="sagetv">SageTV</option>
+            <option value="channelsdvr">Channels DVR</option>
+          </select>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Orchestrator</legend>
+        <label>API URL:
+          <input type="text" id="setting-api-url" value="http://127.0.0.1:8000">
+        </label>
+      </fieldset>
+      <div class="dialog-actions">
+        <button type="submit" value="save">Save</button>
+        <button type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Admin Modal -->
+  <dialog id="admin-dialog">
+    <h2>Admin Panel</h2>
+    <div class="admin-tabs">
+      <button class="tab active" data-tab="devices">Devices</button>
+      <button class="tab" data-tab="system">System</button>
+      <button class="tab" data-tab="transcription">Transcription</button>
+    </div>
+    <div class="admin-content" id="admin-content">
+      <div id="tab-devices" class="tab-panel active">
+        <div id="device-list"></div>
+        <button id="btn-add-device" class="btn-small">+ Add Device</button>
+      </div>
+      <div id="tab-system" class="tab-panel">
+        <button id="btn-restart-sagetv" class="btn-small btn-danger">Restart SageTV</button>
+        <button id="btn-restart-channels" class="btn-small btn-danger">Restart Channels DVR</button>
+        <button id="btn-docker-status" class="btn-small">Docker Status</button>
+        <div id="system-output"></div>
+      </div>
+      <div id="tab-transcription" class="tab-panel">
+        <div id="transcription-stats"></div>
+        <div id="transcription-jobs"></div>
+      </div>
+    </div>
+    <div class="dialog-actions">
+      <button id="btn-close-admin">Close</button>
+    </div>
+  </dialog>
+
+  <script src="js/api.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/voice.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
