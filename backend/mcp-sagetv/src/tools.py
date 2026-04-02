@@ -303,6 +303,206 @@ async def sagetv_open_live_tv(client: SageXClient, args: Dict) -> Dict:
 
 
 # ==================================================================
+# ENTITY LOOKUP TOOLS
+# ==================================================================
+
+async def sagetv_get_recording(client: SageXClient, args: Dict) -> Dict:
+    """Get a single recording by MediaFile ID — fully hydrated with Airing + Show."""
+    media_file_id = str(args.get("media_file_id", ""))
+    if not media_file_id:
+        return _fail("missing_media_file_id", "MediaFile ID is required")
+    mf = await client.call("GetMediaFileForID", [media_file_id])
+    if not mf:
+        return _fail("not_found", f"MediaFile {media_file_id} not found")
+    return _ok(data=mf, message="Recording retrieved")
+
+
+async def sagetv_get_airing(client: SageXClient, args: Dict) -> Dict:
+    """Get an airing by ID — includes embedded Show and Channel data."""
+    airing_id = str(args.get("airing_id", ""))
+    if not airing_id:
+        return _fail("missing_airing_id", "Airing ID is required")
+    airing = await client.call("GetAiringForID", [airing_id])
+    if not airing:
+        return _fail("not_found", f"Airing {airing_id} not found")
+    return _ok(data=airing, message="Airing retrieved")
+
+
+async def sagetv_get_show(client: SageXClient, args: Dict) -> Dict:
+    """Get show/program metadata by external ID (e.g. EP01234567)."""
+    show_id = str(args.get("show_id", ""))
+    if not show_id:
+        return _fail("missing_show_id", "Show external ID is required")
+    show = await client.call("GetShowForExternalID", [show_id])
+    if not show:
+        return _fail("not_found", f"Show {show_id} not found")
+    return _ok(data=show, message="Show retrieved")
+
+
+async def sagetv_get_channel(client: SageXClient, args: Dict) -> Dict:
+    """Get channel info by station ID."""
+    station_id = str(args.get("station_id", ""))
+    if not station_id:
+        return _fail("missing_station_id", "Station ID is required")
+    channel = await client.call("GetChannelForStationID", [station_id])
+    if not channel:
+        return _fail("not_found", f"Channel for station {station_id} not found")
+    return _ok(data=channel, message="Channel retrieved")
+
+
+# ==================================================================
+# RECORDING QUERY TOOLS
+# ==================================================================
+
+async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
+    """Search recordings with multiple filter criteria."""
+    title = args.get("title", "")
+    channel = args.get("channel", "")
+    start_time = args.get("start_time")
+    end_time = args.get("end_time")
+    watched = args.get("watched")
+    archived = args.get("archived")
+    recording_state = args.get("recording_state")
+    limit = int(args.get("limit", 50))
+
+    data = await client.call("GetMediaFiles", ["T"])
+    if not data or not isinstance(data, list):
+        return _ok(data=[], message="No recordings found")
+
+    results = []
+    for mf in data:
+        airing = mf.get("Airing") or mf.get("airing") or {}
+        show = airing.get("Show") or airing.get("show") or {}
+
+        if title:
+            mf_title = show.get("Title") or show.get("title") or ""
+            ep_title = show.get("EpisodeTitle") or show.get("episodeTitle") or ""
+            combined = f"{mf_title} {ep_title}".lower()
+            if title.lower() not in combined:
+                continue
+
+        if channel:
+            ch = airing.get("Channel") or airing.get("channel") or {}
+            ch_num = str(ch.get("ChannelNumber") or ch.get("channelNumber") or "")
+            ch_name = str(ch.get("CallSign") or ch.get("callSign") or "")
+            if channel.lower() not in ch_num.lower() and channel.lower() not in ch_name.lower():
+                continue
+
+        mf_start = mf.get("StartTime") or mf.get("startTime") or 0
+        mf_end = mf.get("EndTime") or mf.get("endTime") or 0
+        if start_time and int(mf_start) < int(start_time):
+            continue
+        if end_time and int(mf_end) > int(end_time):
+            continue
+
+        if watched is not None:
+            is_watched = mf.get("Watched") or mf.get("watched") or False
+            if bool(watched) != bool(is_watched):
+                continue
+
+        if archived is not None:
+            is_lib = mf.get("IsLibraryFile") or mf.get("isLibraryFile") or False
+            if bool(archived) != bool(is_lib):
+                continue
+
+        if recording_state is not None:
+            is_complete = mf.get("IsCompleteRecording") or mf.get("isCompleteRecording")
+            currently_recording = not bool(is_complete) if is_complete is not None else False
+            if recording_state == "recording" and not currently_recording:
+                continue
+            if recording_state == "complete" and currently_recording:
+                continue
+
+        results.append(mf)
+        if len(results) >= limit:
+            break
+
+    return _ok(data=results, message=f"Found {len(results)} matching recordings")
+
+
+async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
+    """Get the most recently completed recordings."""
+    limit = int(args.get("limit", 20))
+    data = await client.call("GetMediaFiles", ["T"], size=limit)
+    if not data:
+        return _ok(data=[], message="No recent recordings")
+    items = data if isinstance(data, list) else []
+    return _ok(data=items, message=f"{len(items)} recent recordings")
+
+
+async def sagetv_get_active_recordings(client: SageXClient, args: Dict) -> Dict:
+    """Get recordings currently in progress."""
+    data = await client.call("GetCurrentlyRecordingMediaFiles")
+    if not data:
+        return _ok(data=[], message="No active recordings")
+    items = data if isinstance(data, list) else []
+    return _ok(data=items, message=f"{len(items)} active recordings")
+
+
+# ==================================================================
+# MUTATION TOOLS
+# ==================================================================
+
+async def sagetv_set_watched(client: SageXClient, args: Dict) -> Dict:
+    """Mark a recording as watched or unwatched by airing ID."""
+    airing_id = str(args.get("airing_id", ""))
+    watched = args.get("watched", True)
+    if not airing_id:
+        return _fail("missing_airing_id", "Airing ID is required")
+    if watched:
+        await client.call("SetWatched", [airing_id])
+        return _ok(message=f"Airing {airing_id} marked as watched")
+    else:
+        await client.call("ClearWatched", [airing_id])
+        return _ok(message=f"Airing {airing_id} marked as unwatched")
+
+
+async def sagetv_set_archived(client: SageXClient, args: Dict) -> Dict:
+    """Archive (protect from auto-delete) or unarchive a recording."""
+    media_file_id = str(args.get("media_file_id", ""))
+    archived = args.get("archived", True)
+    if not media_file_id:
+        return _fail("missing_media_file_id", "MediaFile ID is required")
+    if archived:
+        await client.call("MoveFileToLibrary", [media_file_id])
+        return _ok(message=f"MediaFile {media_file_id} archived")
+    else:
+        await client.call("MoveTVFileOutOfLibrary", [media_file_id])
+        return _ok(message=f"MediaFile {media_file_id} unarchived")
+
+
+async def sagetv_set_media_file_property(client: SageXClient, args: Dict) -> Dict:
+    """Set a custom property on a MediaFile (e.g. transcript_path, embedding_id)."""
+    media_file_id = str(args.get("media_file_id", ""))
+    key = str(args.get("key", ""))
+    value = str(args.get("value", ""))
+    if not media_file_id:
+        return _fail("missing_media_file_id", "MediaFile ID is required")
+    if not key:
+        return _fail("missing_key", "Property key is required")
+    await client.call("SetMediaFileMetadata", [media_file_id, key, value])
+    return _ok(data={"media_file_id": media_file_id, "key": key, "value": value},
+               message=f"Property '{key}' set on MediaFile {media_file_id}")
+
+
+async def sagetv_get_media_file_property(client: SageXClient, args: Dict) -> Dict:
+    """Get a custom property value from a MediaFile."""
+    media_file_id = str(args.get("media_file_id", ""))
+    key = str(args.get("key", ""))
+    if not media_file_id:
+        return _fail("missing_media_file_id", "MediaFile ID is required")
+    if not key:
+        return _fail("missing_key", "Property key is required")
+    value = await client.call("GetMediaFileMetadata", [media_file_id, key])
+    return _ok(data={"media_file_id": media_file_id, "key": key, "value": value})
+
+
+# Placeholder handler for event tools (actual logic in server.py transport layer)
+async def _event_stub(client: SageXClient, args: Dict) -> Dict:
+    return _fail("server_handled", "This tool is handled at the server transport level")
+
+
+# ==================================================================
 # TOOL REGISTRY
 # ==================================================================
 
@@ -542,5 +742,129 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "input_schema": _session_id_schema(),
         "safety": Safety.SAFE,
         "handler": sagetv_open_live_tv,
+    },
+
+    # ---- Entity Lookup ----
+    "sagetv_get_recording": {
+        "description": "Get a single recording by MediaFile ID, fully hydrated with Airing + Show + Channel data. Returns: mediaFileId, filePath, fileSize, startTime, endTime, duration, isRecording, isComplete, isWatched, isArchived, recordingQuality, container, resolution, airingId, showId, channelId, and user properties.",
+        "input_schema": {"type": "object", "properties": {
+            "media_file_id": {"type": "string", "description": "The MediaFile ID"},
+        }, "required": ["media_file_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_recording,
+    },
+    "sagetv_get_airing": {
+        "description": "Get an airing (broadcast instance) by ID with embedded Show and Channel data.",
+        "input_schema": {"type": "object", "properties": {
+            "airing_id": {"type": "string", "description": "The Airing ID"},
+        }, "required": ["airing_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_airing,
+    },
+    "sagetv_get_show": {
+        "description": "Get show/program metadata by external ID (e.g. EP01234567 from Schedules Direct).",
+        "input_schema": {"type": "object", "properties": {
+            "show_id": {"type": "string", "description": "The show external ID"},
+        }, "required": ["show_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_show,
+    },
+    "sagetv_get_channel": {
+        "description": "Get channel/station info by station ID.",
+        "input_schema": {"type": "object", "properties": {
+            "station_id": {"type": "string", "description": "The station ID"},
+        }, "required": ["station_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_channel,
+    },
+
+    # ---- Recording Queries ----
+    "sagetv_search_recordings": {
+        "description": "Search recordings with filters: title, channel, date range, watched, archived, recording state.",
+        "input_schema": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
+            "channel": {"type": "string", "description": "Channel number or call sign filter"},
+            "start_time": {"type": "integer", "description": "Minimum start time (epoch ms)"},
+            "end_time": {"type": "integer", "description": "Maximum end time (epoch ms)"},
+            "watched": {"type": "boolean", "description": "Filter by watched status"},
+            "archived": {"type": "boolean", "description": "Filter by archived/library status"},
+            "recording_state": {"type": "string", "enum": ["recording", "complete"], "description": "Filter by recording state"},
+            "limit": {"type": "integer", "description": "Max results (default 50)"},
+        }},
+        "safety": Safety.SAFE,
+        "handler": sagetv_search_recordings,
+    },
+    "sagetv_get_recent_recordings": {
+        "description": "Get the most recently completed recordings.",
+        "input_schema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "Max results (default 20)"},
+        }},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_recent_recordings,
+    },
+    "sagetv_get_active_recordings": {
+        "description": "Get recordings currently in progress (actively being recorded now).",
+        "input_schema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_active_recordings,
+    },
+
+    # ---- Mutations ----
+    "sagetv_set_watched": {
+        "description": "Mark a recording as watched or unwatched.",
+        "input_schema": {"type": "object", "properties": {
+            "airing_id": {"type": "string", "description": "The Airing ID"},
+            "watched": {"type": "boolean", "description": "True=watched, false=unwatched (default true)"},
+        }, "required": ["airing_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_set_watched,
+    },
+    "sagetv_set_archived": {
+        "description": "Archive (protect from auto-delete) or unarchive a recording.",
+        "input_schema": {"type": "object", "properties": {
+            "media_file_id": {"type": "string", "description": "The MediaFile ID"},
+            "archived": {"type": "boolean", "description": "True=archive, false=unarchive (default true)"},
+        }, "required": ["media_file_id"]},
+        "safety": Safety.CONFIRM,
+        "handler": sagetv_set_archived,
+    },
+    "sagetv_set_media_file_property": {
+        "description": "Set a custom metadata property on a MediaFile (e.g. transcript_path, embedding_id, summary_version).",
+        "input_schema": {"type": "object", "properties": {
+            "media_file_id": {"type": "string", "description": "The MediaFile ID"},
+            "key": {"type": "string", "description": "Property key name"},
+            "value": {"type": "string", "description": "Property value"},
+        }, "required": ["media_file_id", "key", "value"]},
+        "safety": Safety.CONFIRM,
+        "handler": sagetv_set_media_file_property,
+    },
+    "sagetv_get_media_file_property": {
+        "description": "Get a custom metadata property from a MediaFile.",
+        "input_schema": {"type": "object", "properties": {
+            "media_file_id": {"type": "string", "description": "The MediaFile ID"},
+            "key": {"type": "string", "description": "Property key name"},
+        }, "required": ["media_file_id", "key"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_media_file_property,
+    },
+
+    # ---- Events ----
+    "sagetv_subscribe_events": {
+        "description": "Subscribe to recording lifecycle events. Events are pushed as JSON-RPC notifications on the same connection. Types: recording.started, recording.completed, recording.updated, recording.deleted.",
+        "input_schema": {"type": "object", "properties": {
+            "events": {"type": "array", "items": {"type": "string", "enum": [
+                "recording.started", "recording.completed", "recording.updated", "recording.deleted", "*"
+            ]}, "description": "Event types to subscribe to. Use '*' for all events."},
+        }, "required": ["events"]},
+        "safety": Safety.SAFE,
+        "handler": _event_stub,
+    },
+    "sagetv_unsubscribe_events": {
+        "description": "Unsubscribe from recording lifecycle events.",
+        "input_schema": {"type": "object", "properties": {
+            "events": {"type": "array", "items": {"type": "string"}, "description": "Event types to unsubscribe from. Omit to unsubscribe from all."},
+        }},
+        "safety": Safety.SAFE,
+        "handler": _event_stub,
     },
 }

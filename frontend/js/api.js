@@ -22,7 +22,15 @@ const API = (() => {
 
   async function playback(action, params = {}) {
     const target = params.system || 'sagetv';
-    return request(`${baseUrl}/api/playback`, 'POST', { action, target, payload: params });
+    const deviceId = params.device_id || '';
+    // Strip meta-fields from payload — they go as top-level request fields
+    const { system: _s, device_id: _d, ...payload } = params;
+    return request(`${baseUrl}/api/playback`, 'POST', {
+      action,
+      target,
+      device_id: deviceId || undefined,
+      payload,
+    });
   }
 
   async function search(query) {
@@ -37,10 +45,12 @@ const API = (() => {
     if (items.length > 0) {
       const item = items[0];
       const id = item.id || item.recording_id || item.program_id;
-      return playback('play', { system: target, id, title });
+      const deviceId = State.get().deviceId;
+      return playback('play', { system: target, device_id: deviceId, id, title });
     }
     // Fallback: try playing by title directly
-    return playback('play', { system: target, title });
+    const deviceId = State.get().deviceId;
+    return playback('play', { system: target, device_id: deviceId, title });
   }
 
   async function system(action, params = {}) {

@@ -5,6 +5,7 @@ const State = (() => {
   const state = {
     system: localStorage.getItem('system') || 'sagetv',
     deviceId: localStorage.getItem('device_id') || '',
+    sessionId: '',  // Resolved session_id from session manager
     devices: [],
     session: null,  // PlaybackContext from session manager
     connected: false,
@@ -42,7 +43,8 @@ const State = (() => {
     }
     try {
       const data = await API.resolveSession(state.deviceId);
-      set({ session: data, connected: true });
+      const sessionId = data?.session?.session_id || '';
+      set({ session: data, sessionId, connected: true });
     } catch (e) {
       console.warn('Session resolve failed:', e);
       set({ connected: false });

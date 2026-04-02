@@ -48,6 +48,7 @@ class PlaybackRequest(BaseModel):
     """Request body for /playback."""
     action: str  # play, pause, stop, seek, status
     target: str = "sagetv"
+    device_id: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -127,10 +128,14 @@ async def query_voice(audio: UploadFile = File(...)):
 async def playback(request: PlaybackRequest):
     """
     Control playback: play, pause, stop, seek, or query status.
+    If device_id is provided, the orchestrator resolves it to a session_id.
     """
     orch = _require_orchestrator()
+    payload = dict(request.payload or {})
+    if request.device_id:
+        payload["device_id"] = request.device_id
     return await _safe_execute(
-        orch.run_playback(request.action, request.target, request.payload or {})
+        orch.run_playback(request.action, request.target, payload)
     )
 
 

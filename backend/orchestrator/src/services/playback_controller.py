@@ -43,34 +43,34 @@ class PlaybackController:
             logger.exception("play failed")
             return {"error": str(exc)}
 
-    async def pause(self, target: str | None = None) -> Dict[str, Any]:
+    async def pause(self, target: str | None = None, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Pause playback on the specified target."""
         t = target or self.default_target
         logger.info("PlaybackController.pause target=%s", t)
         try:
-            return await self.orchestrator.execute(f"{t}.pause", {})
+            return await self.orchestrator.execute(f"{t}.pause", payload or {})
         except Exception as exc:
             logger.exception("pause failed")
             return {"error": str(exc)}
 
-    async def stop(self, target: str | None = None) -> Dict[str, Any]:
+    async def stop(self, target: str | None = None, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Stop playback on the specified target."""
         t = target or self.default_target
         logger.info("PlaybackController.stop target=%s", t)
         try:
-            return await self.orchestrator.execute(f"{t}.stop", {})
+            return await self.orchestrator.execute(f"{t}.stop", payload or {})
         except Exception as exc:
             logger.exception("stop failed")
             return {"error": str(exc)}
 
-    async def seek(self, position: int, target: str | None = None) -> Dict[str, Any]:
+    async def seek(self, position: int, target: str | None = None, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Seek to a position (seconds) on the specified target."""
         t = target or self.default_target
         logger.info("PlaybackController.seek target=%s position=%d", t, position)
         try:
-            return await self.orchestrator.execute(
-                f"{t}.seek", {"position": position}
-            )
+            args = dict(payload or {})
+            args["position"] = position
+            return await self.orchestrator.execute(f"{t}.seek", args)
         except Exception as exc:
             logger.exception("seek failed")
             return {"error": str(exc)}

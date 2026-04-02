@@ -30,6 +30,7 @@ from services.voice_session import VoiceSessionManager
 from services.tool_router import ToolRouter
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
+from services.mcp_client import MCPClient
 
 logger = get_logger(__name__)
 
@@ -99,9 +100,21 @@ class Orchestrator:
             worker=self.whisper.transcribe,
         )
 
-        # Backend client stubs (populated on init)
-        self._sagetv: Any = None
-        self._channels: Any = None
+        # Backend MCP clients
+        mcp = config.get("mcp", {})
+        self._sagetv = MCPClient(
+            host=mcp.get("sagetv_host", "127.0.0.1"),
+            port=mcp.get("sagetv_port", 8766),
+            name="sagetv",
+        )
+        self._channels = MCPClient(
+            host=mcp.get("channels_host", "127.0.0.1"),
+            port=mcp.get("channels_port", 8767),
+            name="channels",
+        )
+
+        # Session manager URL for device → session_id resolution
+        self._session_url = config.get("session_manager_url", "http://127.0.0.1:8769")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -130,6 +143,8 @@ class Orchestrator:
         await self.tts.unload()
         await self.whisper.unload()
         await self.llm.unload()
+        await self._sagetv.close()
+        await self._channels.close()
 
         logger.info("Orchestrator shutdown complete")
 
@@ -256,19 +271,35 @@ class Orchestrator:
     async def run_playback(
         self, action: str, target: str = "sagetv", payload: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Execute a playback action."""
+        """Execute a playback action with device→session resolution."""
         logger.info("run_playback: %s.%s", target, action)
         try:
+            payload = dict(payload or {})
+
+            # Resolve device_id → session_id if present
+            device_id = payload.pop("device_id", None)
+            if device_id and "session_id" not in payload:
+                ctx = await self.resolve_session(device_id)
+                if ctx and ctx.get("session"):
+                    session = ctx["session"]
+                    payload["session_id"] = session.get("session_id", "")
+                    # Override target system from resolved device if needed
+                    resolved_system = ctx.get("system")
+                    if resolved_system and resolved_system != "unknown":
+                        target = resolved_system
+                    logger.info("Resolved device %s → session_id=%s system=%s",
+                                device_id, payload.get("session_id"), target)
+
             ctrl = self.playback_controller
             if action == "play":
                 return await ctrl.play(target, payload)
             if action == "pause":
-                return await ctrl.pause(target)
+                return await ctrl.pause(target, payload)
             if action == "stop":
-                return await ctrl.stop(target)
+                return await ctrl.stop(target, payload)
             if action == "seek":
-                position = (payload or {}).get("position", 0)
-                return await ctrl.seek(position, target)
+                position = payload.get("position", 0)
+                return await ctrl.seek(position, target, payload)
             if action == "status":
                 states = await ctrl.now_playing(target)
                 return {k: v.to_dict() for k, v in states.items()}
@@ -307,20 +338,101 @@ class Orchestrator:
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------
-    # Backend execution stubs
+    # Backend execution via MCP
     # ------------------------------------------------------------------
 
+    # Maps short action names (used by orchestrator) to actual MCP tool names
+    _SAGETV_TOOL_MAP = {
+        "play": "sagetv_resume_playback",
+        "pause": "sagetv_pause_playback",
+        "stop": "sagetv_stop_playback",
+        "seek": "sagetv_seek_absolute",
+        "volume": "sagetv_set_volume",
+        "mute": "sagetv_mute",
+        "unmute": "sagetv_unmute",
+        "skip_forward": "sagetv_skip_forward",
+        "skip_back": "sagetv_skip_back",
+        "status": "sagetv_get_now_playing",
+        "tune": "sagetv_tune_channel",
+        "get_recordings": "sagetv_get_recordings",
+        "search": "sagetv_search_shows",
+        "get_channels": "sagetv_get_channels",
+        "record": "sagetv_record_show",
+        "cancel_recording": "sagetv_cancel_recording",
+        "delete": "sagetv_delete_media_file",
+        "get_recording": "sagetv_get_recording",
+        "get_airing": "sagetv_get_airing",
+        "search_recordings": "sagetv_search_recordings",
+        "recent_recordings": "sagetv_get_recent_recordings",
+        "active_recordings": "sagetv_get_active_recordings",
+        "set_watched": "sagetv_set_watched",
+        "set_archived": "sagetv_set_archived",
+        "set_property": "sagetv_set_media_file_property",
+        "get_property": "sagetv_get_media_file_property",
+        "play_pause": "sagetv_pause_playback",
+        "commercial_skip": "sagetv_skip_forward",
+        "mute_toggle": "sagetv_mute",
+    }
+
+    _CHANNELS_TOOL_MAP = {
+        "play": "channels_resume_playback",
+        "pause": "channels_pause_playback",
+        "stop": "channels_stop_playback",
+        "seek": "channels_seek",
+        "status": "channels_get_now_playing",
+        "get_recordings": "channels_get_recordings",
+        "search": "channels_search",
+        "get_channels": "channels_get_channels",
+        "delete": "channels_delete_recording",
+        "play_pause": "channels_pause_playback",
+        "skip_forward": "channels_skip_forward",
+        "skip_back": "channels_skip_back",
+        "commercial_skip": "channels_skip_forward",
+        "mute_toggle": "channels_mute",
+    }
+
     async def _execute_sagetv(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Route SageTV commands through the MCP client when available."""
-        if self._sagetv:
-            return await self._sagetv.execute(action, payload)
-        return {"stub": f"sagetv.{action}", "payload": payload}
+        """Route SageTV commands through the MCP client."""
+        tool_name = self._SAGETV_TOOL_MAP.get(action, f"sagetv_{action}")
+        try:
+            return await self._sagetv.call_tool(tool_name, payload)
+        except ConnectionError as exc:
+            logger.warning("SageTV MCP unavailable: %s", exc)
+            return {"error": f"SageTV MCP unavailable: {exc}"}
 
     async def _execute_channels(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Route ChannelsDVR commands through the MCP client when available."""
-        if self._channels:
-            return await self._channels.execute(action, payload)
-        return {"stub": f"channels.{action}", "payload": payload}
+        """Route ChannelsDVR commands through the MCP client."""
+        tool_name = self._CHANNELS_TOOL_MAP.get(action, f"channels_{action}")
+        try:
+            return await self._channels.call_tool(tool_name, payload)
+        except ConnectionError as exc:
+            logger.warning("ChannelsDVR MCP unavailable: %s", exc)
+            return {"error": f"ChannelsDVR MCP unavailable: {exc}"}
+
+    # ------------------------------------------------------------------
+    # Session resolution
+    # ------------------------------------------------------------------
+
+    async def resolve_session(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve device_id → session context via the Session Manager.
+        Returns dict with session_id, system, device_name, etc.
+        """
+        if not device_id:
+            return None
+        import aiohttp
+        url = f"{self._session_url}/sessions/resolve/{device_id}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data
+                    logger.warning("Session resolve returned %d", resp.status)
+                    return None
+        except Exception as exc:
+            logger.warning("Session resolution failed for %s: %s", device_id, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Default command registration
