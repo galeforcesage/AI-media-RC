@@ -87,17 +87,39 @@ class SearchService:
         self, query: str, filters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Search transcripts via the transcription MCP server's
-        transcript_cross_search tool.
+        Search transcripts via direct JSON-RPC to the transcription MCP server.
         """
         logger.info("Transcript search: query=%s filters=%s", query, filters)
         try:
+            import asyncio, json
             args = {"query": query}
             if filters:
                 args.update(filters)
-            return await self.orchestrator.execute(
-                "transcription.transcript_cross_search", args
-            )
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", 8770)
+            request = json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "transcript_cross_search",
+                    "arguments": args,
+                },
+            }) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            writer.close()
+            await writer.wait_closed()
+
+            if not line:
+                return {"error": "Empty response from transcription server"}
+
+            resp = json.loads(line.decode())
+            result = resp.get("result", {})
+            content = result.get("content", [])
+            if content and content[0].get("type") == "text":
+                return json.loads(content[0]["text"])
+            return result
         except Exception as exc:
             logger.exception("transcript_search failed")
             return {"error": str(exc)}

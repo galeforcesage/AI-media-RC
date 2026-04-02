@@ -82,6 +82,41 @@ const UI = (() => {
     el['messages'].scrollTop = el['messages'].scrollHeight;
   }
 
+  function addEpisodeCards(results, sender = 'assistant') {
+    if (!results || results.length === 0) return;
+    const bubble = document.createElement('div');
+    bubble.className = `message ${sender} episode-results`;
+
+    const heading = document.createElement('div');
+    heading.className = 'episode-results-heading';
+    heading.textContent = 'Matching episodes — click to play:';
+    bubble.appendChild(heading);
+
+    results.forEach(r => {
+      const card = document.createElement('button');
+      card.className = 'episode-card';
+      card.dataset.recordingId = r.recording_id || '';
+      card.dataset.title = r.title || '';
+      card.dataset.system = r.system || '';
+
+      const title = r.title || 'Unknown';
+      const ep = r.episode_title ? ` — ${r.episode_title}` : '';
+      const time = r.start_time != null ? ` at ${formatTime(r.start_time)}` : '';
+      const channel = r.channel ? ` (${r.channel})` : '';
+      const snippet = (r.snippet || '').replace(/<b>/g, '').replace(/<\/b>/g, '');
+
+      card.innerHTML =
+        `<span class="ec-title">${esc(title)}${esc(ep)}</span>` +
+        `<span class="ec-meta">${esc(channel)}${esc(time)}</span>` +
+        (snippet ? `<span class="ec-snippet">${esc(snippet.substring(0, 120))}…</span>` : '');
+
+      bubble.appendChild(card);
+    });
+
+    el['messages'].appendChild(bubble);
+    el['messages'].scrollTop = el['messages'].scrollHeight;
+  }
+
   function clearMessages() {
     el['messages'].innerHTML = '';
   }
@@ -194,7 +229,7 @@ const UI = (() => {
 
   return {
     cacheElements, updateNowPlaying, formatTime,
-    addMessage, addMessageHTML, clearMessages,
+    addMessage, addMessageHTML, addEpisodeCards, clearMessages,
     updateDevicePicker, updateStatus,
     renderDeviceList, renderSystemOutput, renderTranscriptionStats,
     openSettings, openAdmin, refreshAdminDevices,

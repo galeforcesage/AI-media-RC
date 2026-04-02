@@ -137,6 +137,41 @@ body {
 }
 .msg .confirm-btns button.yes { background: var(--primary-dark); }
 
+/* ---- Episode Cards ---- */
+.episode-results-heading {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+.episode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.4rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s, border-color 0.15s;
+}
+.episode-card:hover {
+  background: var(--primary-dark);
+  border-color: var(--primary);
+}
+.episode-card.loading {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.ec-title { font-weight: 600; }
+.ec-meta { font-size: 0.8rem; color: var(--text-muted); }
+.ec-snippet { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
+.episode-results { max-width: 100%; }
+
 .input-row { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
 #text-input {
   flex: 1;

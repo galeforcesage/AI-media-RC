@@ -29,6 +29,20 @@ const API = (() => {
     return request(`${baseUrl}/api/search?q=${encodeURIComponent(query)}`);
   }
 
+  async function playTitle(title, system) {
+    // Search for the title, then start playback of the first result
+    const results = await search(title);
+    const target = system || 'sagetv';
+    const items = results[target]?.results || results[target]?.items || [];
+    if (items.length > 0) {
+      const item = items[0];
+      const id = item.id || item.recording_id || item.program_id;
+      return playback('play', { system: target, id, title });
+    }
+    // Fallback: try playing by title directly
+    return playback('play', { system: target, title });
+  }
+
   async function system(action, params = {}) {
     return request(`${baseUrl}/api/system`, 'POST', { action, payload: params });
   }
@@ -65,7 +79,7 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, playback, search, system, health,
+    query, playback, search, playTitle, system, health,
     listDevices, addDevice, deleteDevice, setDefaultDevice,
     resolveSession, listSessions,
     get baseUrl() { return baseUrl; },

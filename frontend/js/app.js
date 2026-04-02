@@ -74,6 +74,31 @@
       else Voice.start();
     });
 
+    // Episode card clicks — search + play on bound device
+    document.getElementById('messages').addEventListener('click', async (e) => {
+      const card = e.target.closest('.episode-card');
+      if (!card) return;
+      const title = card.dataset.title;
+      const system = card.dataset.system || State.get().system;
+      if (!title) return;
+
+      card.classList.add('loading');
+      UI.addMessage(`Playing "${title}" on ${system}…`, 'assistant');
+
+      try {
+        const result = await API.playTitle(title, system);
+        if (result && result.error) {
+          UI.addMessage('Playback error: ' + result.error, 'error');
+        } else {
+          State.refreshSession();
+        }
+      } catch (err) {
+        UI.addMessage('Playback error: ' + err.message, 'error');
+      } finally {
+        card.classList.remove('loading');
+      }
+    });
+
     // Footer buttons
     document.getElementById('btn-settings').addEventListener('click', () => UI.openSettings());
     document.getElementById('btn-admin').addEventListener('click', () => UI.openAdmin());
@@ -167,8 +192,14 @@
 
     try {
       const data = await API.query(text);
-      const response = data.response || data.error || JSON.stringify(data);
+      const response = data.response || data.llm_response || data.error || JSON.stringify(data);
       UI.addMessage(response, 'assistant');
+
+      // Render clickable episode cards if transcript results were returned
+      const results = data.transcript_results;
+      if (results && results.length > 0) {
+        UI.addEpisodeCards(results);
+      }
     } catch (e) {
       UI.addMessage('Error: ' + e.message, 'error');
     }

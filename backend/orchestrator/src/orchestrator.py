@@ -198,8 +198,31 @@ class Orchestrator:
         """Run a text query through the LLM pipeline with transcript context."""
         logger.info("run_query (synthesize=%s)", synthesize)
         try:
+            # Search transcripts for relevant content
+            transcript_results = await self.search.transcript_search(prompt)
+            transcript_hits = []
+            if isinstance(transcript_results, dict):
+                data = transcript_results.get("data", transcript_results)
+                transcript_hits = data.get("results", [])
+
             # Inject transcript context if available
-            transcript_context = await self.search.inject_transcript_context(prompt)
+            transcript_context = ""
+            if transcript_hits:
+                lines = []
+                for r in transcript_hits[:5]:
+                    title = r.get("title", "Unknown")
+                    ep = r.get("episode_title", "")
+                    start = r.get("start_time", 0)
+                    snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
+                    mins = int(start // 60)
+                    secs = int(start % 60)
+                    time_str = f"{mins}:{secs:02d}"
+                    if ep:
+                        lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                    else:
+                        lines.append(f'From "{title}" at {time_str}: {snippet}')
+                transcript_context = "\n".join(lines)
+
             if transcript_context:
                 enriched_prompt = (
                     f"Relevant transcript excerpts:\n{transcript_context}\n\n"
@@ -208,9 +231,15 @@ class Orchestrator:
             else:
                 enriched_prompt = prompt
 
-            return await self.pipeline.run_text_query(
+            llm_result = await self.pipeline.run_text_query(
                 enriched_prompt, synthesize=synthesize, metadata=metadata,
             )
+
+            # Attach transcript hits to the response for the frontend
+            if isinstance(llm_result, dict):
+                llm_result["transcript_results"] = transcript_hits
+
+            return llm_result
         except Exception as exc:
             logger.exception("run_query failed")
             return {"error": str(exc)}
