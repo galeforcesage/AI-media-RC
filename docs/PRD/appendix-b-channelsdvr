@@ -1,0 +1,237 @@
+=========================================
+Appendix B — ChannelsDVR Capability Dictionary
+=========================================
+This appendix defines the complete, authoritative capability dictionary for ChannelsDVR, mirroring the structure and rigor of Appendix A (SageTV).
+It is designed explicitly for GitHub Copilot to generate:
+* The ChannelsDVR MCP server
+* The orchestrator routing logic
+* The HTML5 remote integration
+* The Unified Session Manager’s session resolution logic
+* The LLM’s structured intent mapping
+ChannelsDVR is treated as a firstclass system, equal to SageTV.
+
+B.1 Overview
+ChannelsDVR exposes a modern, JSONbased HTTP API with:
+* Playback control
+* Recording scheduling
+* Commercial skip
+* EPG search
+* Client enumeration
+* Job status
+* Storage usage
+* Metadata queries
+This capability dictionary defines:
+1. Entities
+2. State
+3. Actions
+4. Resources
+5. Tools
+6. Safety levels
+7. Session model
+8. Playback context model
+This is the only surface the LLM is allowed to use for ChannelsDVR.
+
+B.2 Entity Model
+B.2.1 Media Entities
+EntityDescriptionFieldsRecordingA completed DVR recordingid, title, episode, season, channel, start_time, end_time, file_path, commercial_markersScheduledRecordingA future scheduled recordingid, title, channel, start_time, end_timeProgramEPG program metadataid, title, description, actors, year, ratingChannelA TV channelid, number, name, HD, lineupJobA DVR job (recording, commercial detection, transcoding)id, type, status, progress
+B.2.2 Playback Entities
+EntityDescriptionFieldsPlaybackSessionActive playback instancesession_id, device_id, media_id, position, duration, stateClientChannelsDVR playback clientid, name, ip, platform, last_seen
+B.2.3 System Entities
+EntityDescriptionFieldsStorageStorage volumepath, free_space, total_spaceServerChannelsDVR server infoversion, platform, uptime
+B.3 ReadOnly State (LLMVisible)
+The LLM may read:
+* Active playback sessions
+* Playback position
+* Playback state
+* Recordings
+* Scheduled recordings
+* EPG search results
+* Channels
+* Commercial markers
+* Storage usage
+* Job status
+* Connected clients
+* Device registry entries
+The LLM may not read:
+* OSlevel details
+* Credentials
+* Network configuration
+* Raw file system paths outside ChannelsDVR
+
+B.4 Actions (LLMCallable)
+Actions are grouped by safety level.
+
+B.4.1 SAFE Actions (No Confirmation Required)
+Playback
+* pause_playback
+* resume_playback
+* stop_playback
+* seek_relative
+* seek_absolute
+* skip_commercial
+* previous_commercial
+* next_commercial
+* set_playback_speed
+* set_volume (if supported by client)
+Queries
+* get_now_playing
+* get_recordings
+* get_scheduled_recordings
+* get_channels
+* search_epg
+* get_storage_status
+* get_jobs
+* get_clients
+Recording
+* schedule_recording
+* schedule_series_recording
+
+B.4.2 CONFIRM Actions (User Confirmation Required)
+Recording Management
+* cancel_scheduled_recording
+* delete_recording
+Commercial Skip
+* regenerate_commercial_markers
+
+B.4.3 DANGEROUS Actions (Explicit Confirmation Required)
+Destructive
+* delete_recording_file
+* delete_series_rule
+These actions must:
+* Be confirmed
+* Be logged
+* Include a safety explanation
+
+B.4.4 OWNER Actions (Authentication Required)
+Administrative
+* restart_channelsdvr_service
+* clear_cache
+* rebuild_index
+These require:
+* “server owner wants you to:” prefix
+* Authentication
+* Elevated session (15 minutes)
+
+B.5 MCP Resources (Read Endpoints)
+Resource URIDescriptionBacking APIchannels://recordingsAll recordings/dvr/fileschannels://recordings/{id}Recording details/dvr/files/{id}channels://scheduledScheduled recordings/dvr/ruleschannels://epg/search/{query}EPG search/dvr/search?query=channels://channelsChannel list/devices + /lineupschannels://clientsConnected clients/clientschannels://now-playingActive playback sessions/sessionschannels://jobsDVR jobs/dvr/jobschannels://storageStorage usage/dvr/storage
+B.6 MCP Tools (Write Endpoints)
+Below is the complete tool registry for ChannelsDVR.
+Each tool includes:
+* Name
+* Parameters
+* Backing API
+* Safety level
+* Return schema
+
+B.6.1 Playback Tools
+pause_playback
+* API: /sessions/{session_id}/pause
+* Params: session_id
+* Safety: SAFE
+resume_playback
+* API: /sessions/{session_id}/play
+* Params: session_id
+* Safety: SAFE
+stop_playback
+* API: /sessions/{session_id}/stop
+* Params: session_id
+* Safety: SAFE
+seek_relative
+* API: /sessions/{session_id}/seek?offset={seconds}
+* Params: seconds: integer
+* Safety: SAFE
+seek_absolute
+* API: /sessions/{session_id}/seek?position={seconds}
+* Params: position_seconds: integer
+* Safety: SAFE
+skip_commercial
+* API: /sessions/{session_id}/commercial/next
+* Params: none
+* Safety: SAFE
+previous_commercial
+* API: /sessions/{session_id}/commercial/prev
+* Params: none
+* Safety: SAFE
+set_playback_speed
+* API: /sessions/{session_id}/speed?rate={rate}
+* Params: rate: float
+* Safety: SAFE
+
+B.6.2 Recording Tools
+schedule_recording
+* API: /dvr/rules
+* Params: program_id, channel, start_time, end_time
+* Safety: SAFE
+schedule_series_recording
+* API: /dvr/rules
+* Params: series_id, channel, options
+* Safety: SAFE
+cancel_scheduled_recording
+* API: /dvr/rules/{id}
+* Params: id
+* Safety: CONFIRM
+delete_recording
+* API: /dvr/files/{id}
+* Params: id
+* Safety: CONFIRM
+delete_recording_file
+* API: /dvr/files/{id}?delete=true
+* Params: id
+* Safety: DANGEROUS
+
+B.6.3 Commercial Tools
+regenerate_commercial_markers
+* API: /dvr/files/{id}/commercials/rebuild
+* Params: id
+* Safety: CONFIRM
+
+B.6.4 System Tools
+restart_channelsdvr_service
+* API: Linux MCP ? systemctl
+* Params: none
+* Safety: OWNER
+clear_cache
+* API: /dvr/cache/clear
+* Params: none
+* Safety: OWNER
+rebuild_index
+* API: /dvr/index/rebuild
+* Params: none
+* Safety: OWNER
+
+B.7 Session Resolution Model
+The Unified Session Manager resolves the active playback session by:
+1. Querying ChannelsDVR MCP for active sessions (/sessions)
+2. Matching device_id to client_id
+3. Returning: 
+o session_id
+o media_id
+o position
+o duration
+o state
+This ensures commands always target the correct playback session.
+
+B.8 Playback Context Model
+The LLM receives a structured context block:
+{
+  "device_id": "livingroom-shield",
+  "session_id": "channels-123",
+  "media": {
+    "id": "rec-98765",
+    "title": "The Office",
+    "episode": "S03E14",
+    "position": 1420,
+    "duration": 1800,
+    "state": "playing",
+    "commercial_markers": [120, 480, 900, 1320]
+  }
+}
+This allows the LLM to:
+* Interpret commands
+* Resolve ambiguity
+* Provide natural responses
+* Trigger commercial skip correctly
+
+Appendix B Complete
+Next up: Appendix C — MCP Architecture (3 Servers).
+

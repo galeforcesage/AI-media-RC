@@ -1,0 +1,20 @@
+{
+    "http_port": 8000,
+    "mcp_port": 8765,
+    "debug": false,
+    "llm": {
+        "model_path": "models/llm"
+    },
+    "whisper": {
+        "model_path": "models/whisper",
+        "model_size": "base"
+    },
+    "tts": {
+        "model_path": "models/tts",
+        "output_dir": "/tmp/tts_output"
+    },
+    "voice": {
+        "max_history": 20,
+        "session_ttl": 1800
+    }
+}
