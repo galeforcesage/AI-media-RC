@@ -17,23 +17,24 @@ const API = (() => {
 
   // Orchestrator endpoints
   async function query(text) {
-    return request(`${baseUrl}/query`, 'POST', { text });
+    return request(`${baseUrl}/api/query`, 'POST', { prompt: text });
   }
 
   async function playback(action, params = {}) {
-    return request(`${baseUrl}/playback`, 'POST', { action, ...params });
+    const target = params.system || 'sagetv';
+    return request(`${baseUrl}/api/playback`, 'POST', { action, target, payload: params });
   }
 
   async function search(query) {
-    return request(`${baseUrl}/search`, 'POST', { query });
+    return request(`${baseUrl}/api/search?q=${encodeURIComponent(query)}`);
   }
 
   async function system(action, params = {}) {
-    return request(`${baseUrl}/system`, 'POST', { action, ...params });
+    return request(`${baseUrl}/api/system`, 'POST', { action, payload: params });
   }
 
   async function health() {
-    return request(`${baseUrl}/health`);
+    return request(`${baseUrl}/api/health`);
   }
 
   // Session Manager endpoints

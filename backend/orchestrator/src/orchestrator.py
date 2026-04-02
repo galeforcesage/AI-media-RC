@@ -195,11 +195,21 @@ class Orchestrator:
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Run a text query through the LLM pipeline."""
+        """Run a text query through the LLM pipeline with transcript context."""
         logger.info("run_query (synthesize=%s)", synthesize)
         try:
+            # Inject transcript context if available
+            transcript_context = await self.search.inject_transcript_context(prompt)
+            if transcript_context:
+                enriched_prompt = (
+                    f"Relevant transcript excerpts:\n{transcript_context}\n\n"
+                    f"User query: {prompt}"
+                )
+            else:
+                enriched_prompt = prompt
+
             return await self.pipeline.run_text_query(
-                prompt, synthesize=synthesize, metadata=metadata,
+                enriched_prompt, synthesize=synthesize, metadata=metadata,
             )
         except Exception as exc:
             logger.exception("run_query failed")

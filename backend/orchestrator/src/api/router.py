@@ -66,3 +66,93 @@ async def execute_command(request: ExecuteRequest):
         raise HTTPException(status_code=422, detail=result["error"])
 
     return result
+
+
+class QueryRequest(BaseModel):
+    """Request body for /query."""
+    text: str
+    synthesize: bool = False
+
+
+class SearchRequest(BaseModel):
+    """Request body for /search."""
+    query: str
+    target: Optional[str] = None
+
+
+class PlaybackRequest(BaseModel):
+    """Request body for /playback."""
+    action: str
+    system: Optional[str] = "sagetv"
+    device_id: Optional[str] = None
+    position: Optional[float] = None
+    level: Optional[int] = None
+    seconds: Optional[float] = None
+
+
+class SystemRequest(BaseModel):
+    """Request body for /system."""
+    action: str
+    container: Optional[str] = None
+    service: Optional[str] = None
+
+
+@router.post("/query")
+async def query(request: QueryRequest):
+    """Natural-language query with LLM reasoning over transcripts + metadata."""
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    result = await _orchestrator.run_query(request.text, synthesize=request.synthesize)
+    return {"response": result.get("response", result.get("error", str(result)))}
+
+
+@router.post("/search")
+async def search(request: SearchRequest):
+    """Search programs and transcripts."""
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+
+    # Search transcripts for cross-metadata queries
+    transcript_results = await _orchestrator.search.transcript_search(request.query)
+    program_results = await _orchestrator.run_search(request.query, target=request.target)
+
+    return {
+        "programs": program_results,
+        "transcripts": transcript_results,
+    }
+
+
+@router.post("/playback")
+async def playback(request: PlaybackRequest):
+    """Execute a playback action."""
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    payload = {}
+    if request.position is not None:
+        payload["position"] = request.position
+    if request.level is not None:
+        payload["level"] = request.level
+    if request.seconds is not None:
+        payload["seconds"] = request.seconds
+    if request.device_id:
+        payload["device_id"] = request.device_id
+    return await _orchestrator.run_playback(request.action, target=request.system or "sagetv", payload=payload)
+
+
+@router.post("/system")
+async def system(request: SystemRequest):
+    """Execute a system command."""
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    payload = {}
+    if request.container:
+        payload["container"] = request.container
+    if request.service:
+        payload["service"] = request.service
+    return await _orchestrator.run_system(request.action, payload=payload)
+
+
+@router.get("/health")
+async def health():
+    """Health check."""
+    return {"status": "ok"}

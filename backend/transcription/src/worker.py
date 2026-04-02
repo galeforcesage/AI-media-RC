@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from .enrichment import MetadataEnrichmentPipeline
 from .extractor import AudioExtractor
 from .models import TranscriptMetadata, TranscriptionJob
 from .queue import TranscriptionQueue
@@ -37,6 +38,7 @@ class TranscriptionWorker:
         self.store = store
         self.extractor = extractor
         self.engine = engine
+        self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
         self._running = False
@@ -112,9 +114,27 @@ class TranscriptionWorker:
 
         # Step 5: Store
         self.store.save(meta)
+
+        # Step 6: Enrich (populate transcript index with chunks, actors, metadata)
+        if self.enrichment:
+            try:
+                await self.enrichment.enrich({
+                    "recording_id": job.recording_id,
+                    "system": job.system,
+                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", "")} for s in segments],
+                    "transcript_text": full_text,
+                    "word_count": len(full_text.split()),
+                    "language": info.get("language", "en"),
+                    "confidence": info.get("language_probability", 0.0),
+                    "model": self.engine.model_name,
+                    "file_path": job.file_path,
+                })
+            except Exception:
+                logger.exception("Enrichment failed for %s (non-blocking)", job.job_id)
+
         self.queue.update_status(job.job_id, "done", duration=info.get("duration", 0))
 
-        # Step 6: Cleanup
+        # Step 7: Cleanup
         self.extractor.cleanup(audio_path)
 
         logger.info("Job %s complete: %d words, %.0fs audio",

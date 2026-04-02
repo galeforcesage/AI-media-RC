@@ -27,6 +27,9 @@ from src.store import MetadataStore
 from src.watcher import FileWatcher
 from src.whisper_engine import WhisperEngine
 from src.worker import TranscriptionWorker
+from src.enrichment import MetadataEnrichmentPipeline
+from src.transcript_index import TranscriptIndex
+from src.sidecar import TranscriptSidecar
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +59,8 @@ async def run(args: argparse.Namespace) -> None:
 
     # MCP server
     server = TranscriptionServer(
-        config={"mcp_host": args.host, "mcp_port": args.port},
+        config={"mcp_host": args.host, "mcp_port": args.port,
+                "index_db": "transcript_index.db", "sidecar_dir": "sidecars"},
         queue=queue,
         store=store,
     )
@@ -86,6 +90,13 @@ async def run(args: argparse.Namespace) -> None:
             extractor=extractor,
             engine=engine,
             concurrency=args.concurrency,
+        )
+        # Wire enrichment pipeline so worker populates the transcript index
+        worker.enrichment = MetadataEnrichmentPipeline(
+            index=server.index,
+            sidecar=server.sidecar,
+            sagetv_url="127.0.0.1:8766",
+            channels_url="127.0.0.1:8767",
         )
         tasks.append(asyncio.create_task(worker.start()))
 
