@@ -1,72 +1,90 @@
 """
 client.py
-MCP client for SageTV integration.
+MCP client adapter for the orchestrator to connect to the SageTV MCP server.
 
-Responsibilities:
-- Manage connection lifecycle
-- Provide async command execution
-- Normalize responses for the Orchestrator
+The orchestrator uses this to send JSON-RPC requests to the SageTV MCP server,
+which in turn calls the sagex-api REST endpoint.
 """
 
 from __future__ import annotations
 import asyncio
+import json
+import logging
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class SageTVClient:
+    """Async JSON-RPC client that connects to the SageTV MCP server."""
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.host = config.get("host", "localhost")
-        self.port = config.get("port", 9000)
+        self.host = config.get("host", "127.0.0.1")
+        self.port = config.get("port", 8766)
         self.connected = False
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
+        self._req_id = 0
 
     async def connect(self) -> None:
-        """Establish connection to SageTV backend."""
-        # Placeholder for real connection logic
-        await asyncio.sleep(0.05)
+        self._reader, self._writer = await asyncio.open_connection(
+            self.host, self.port
+        )
         self.connected = True
+        # Send initialize
+        await self._rpc("initialize", {})
+        logger.info("Connected to SageTV MCP server at %s:%d", self.host, self.port)
 
     async def disconnect(self) -> None:
-        """Close connection to SageTV backend."""
-        await asyncio.sleep(0.05)
+        if self._writer:
+            self._writer.close()
+            await self._writer.wait_closed()
         self.connected = False
 
+    async def list_tools(self) -> list:
+        result = await self._rpc("tools/list", {})
+        return result.get("tools", [])
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
+        content = result.get("content", [])
+        if content and content[0].get("type") == "text":
+            return json.loads(content[0]["text"])
+        return result
+
+    async def list_resources(self) -> list:
+        result = await self._rpc("resources/list", {})
+        return result.get("resources", [])
+
+    async def read_resource(self, uri: str) -> Any:
+        result = await self._rpc("resources/read", {"uri": uri})
+        contents = result.get("contents", [])
+        if contents and "text" in contents[0]:
+            return json.loads(contents[0]["text"])
+        return result
+
     async def execute(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute a SageTV command.
+        """Legacy execute interface — maps to call_tool with sagetv_ prefix."""
+        tool_name = f"sagetv_{action}" if not action.startswith("sagetv_") else action
+        return await self.call_tool(tool_name, payload)
 
-        Args:
-            action: Command name (e.g., "play", "pause", "seek")
-            payload: Command parameters
-
-        Returns:
-            Dict containing result or error.
-        """
-        if not self.connected:
-            return {"error": "SageTV client not connected"}
-
+    async def _rpc(self, method: str, params: Dict) -> Dict:
         async with self._lock:
-            try:
-                handler = getattr(self, f"_cmd_{action}", None)
-                if handler is None:
-                    return {"error": f"Unknown SageTV command '{action}'"}
-
-                return await handler(payload)
-
-            except Exception as exc:
-                return {"error": str(exc)}
-
-    # -------------------------
-    # Command Handlers (stubs)
-    # -------------------------
-
-    async def _cmd_play(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return {"status": "ok", "action": "play", "payload": payload}
-
-    async def _cmd_pause(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return {"status": "ok", "action": "pause", "payload": payload}
-
-    async def _cmd_seek(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        position = payload.get("position")
-        return {"status": "ok", "action": "seek", "position": position}
+            self._req_id += 1
+            request = {
+                "jsonrpc": "2.0",
+                "id": self._req_id,
+                "method": method,
+                "params": params,
+            }
+            self._writer.write((json.dumps(request) + "\n").encode())
+            await self._writer.drain()
+            line = await self._reader.readline()
+            if not line:
+                raise ConnectionError("MCP server closed connection")
+            resp = json.loads(line.decode())
+            if "error" in resp:
+                raise RuntimeError(resp["error"].get("message", str(resp["error"])))
+            return resp.get("result", {})
