@@ -7,7 +7,7 @@ Supports per-backend queries, fan-out search, and ranked result merging.
 from __future__ import annotations
 import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -78,3 +78,67 @@ class SearchService:
 
         merged.sort(key=lambda r: r.get("score", 0), reverse=True)
         return merged[:limit]
+
+    # ------------------------------------------------------------------
+    # Transcript cross-metadata search (PRD Section 13)
+    # ------------------------------------------------------------------
+
+    async def transcript_search(
+        self, query: str, filters: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Search transcripts via the transcription MCP server's
+        transcript_cross_search tool.
+        """
+        logger.info("Transcript search: query=%s filters=%s", query, filters)
+        try:
+            args = {"query": query}
+            if filters:
+                args.update(filters)
+            return await self.orchestrator.execute(
+                "transcription.transcript_cross_search", args
+            )
+        except Exception as exc:
+            logger.exception("transcript_search failed")
+            return {"error": str(exc)}
+
+    async def inject_transcript_context(
+        self, query: str, max_chunks: int = 5
+    ) -> str:
+        """
+        Search transcripts for relevant content and format as an LLM
+        context string. Called by the LLM service before generating a response.
+        """
+        logger.info("Injecting transcript context for: %s", query)
+        try:
+            result = await self.transcript_search(query, filters=None)
+            data = result.get("data", result)
+            results = data.get("results", [])
+            if not results:
+                return ""
+
+            lines = []
+            for r in results[:max_chunks]:
+                title = r.get("title", "Unknown")
+                ep = r.get("episode_title", "")
+                start = r.get("start_time", 0)
+                snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
+                time_str = self._format_time(start)
+                if ep:
+                    lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                else:
+                    lines.append(f'From "{title}" at {time_str}: {snippet}')
+
+            return "\n".join(lines)
+        except Exception:
+            logger.exception("inject_transcript_context failed")
+            return ""
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        s = int(seconds)
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"

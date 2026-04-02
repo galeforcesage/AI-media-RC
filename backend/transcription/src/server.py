@@ -16,6 +16,9 @@ from typing import Any, Dict, Optional
 from .models import TranscriptMetadata
 from .queue import TranscriptionQueue
 from .store import MetadataStore
+from .search_service import TranscriptSearchService
+from .transcript_index import TranscriptIndex
+from .sidecar import TranscriptSidecar
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,13 @@ class TranscriptionServer:
         self.queue = queue
         self.store = store
         self._server: Optional[asyncio.AbstractServer] = None
+
+        # Cross-metadata reasoning layer
+        index_path = config.get("index_db", "transcript_index.db")
+        sidecar_dir = config.get("sidecar_dir", "sidecars")
+        self.index = TranscriptIndex(index_path)
+        self.sidecar = TranscriptSidecar(sidecar_dir)
+        self.search_service = TranscriptSearchService(self.index)
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -159,6 +169,57 @@ class TranscriptionServer:
             "description": "Get transcription subsystem statistics.",
             "inputSchema": {"type": "object", "properties": {}},
         },
+        {
+            "name": "transcript_cross_search",
+            "description": "Cross-metadata transcript search. Search transcript text with optional filters for actor, genre, channel, date range, and system.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Full-text search query"},
+                    "actor": {"type": "string", "description": "Filter by actor name"},
+                    "genre": {"type": "string", "description": "Filter by genre"},
+                    "channel": {"type": "string", "description": "Filter by channel name or number"},
+                    "date_from": {"type": "string", "description": "Filter from date (Unix epoch or ISO)"},
+                    "date_to": {"type": "string", "description": "Filter to date (Unix epoch or ISO)"},
+                    "system": {"type": "string", "description": "Filter by system (sagetv/channelsdvr)"},
+                    "limit": {"type": "integer", "description": "Max results (default 20)"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "transcript_actors",
+            "description": "Find recordings featuring a specific actor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_name": {"type": "string", "description": "Actor name to search for"},
+                    "limit": {"type": "integer", "description": "Max results (default 20)"},
+                },
+                "required": ["actor_name"],
+            },
+        },
+        {
+            "name": "transcript_recording_summary",
+            "description": "Get full enriched summary for a recording (metadata + actors + transcript summary).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recording_id": {"type": "string"},
+                },
+                "required": ["recording_id"],
+            },
+        },
+        {
+            "name": "transcript_reindex",
+            "description": "Reindex all transcript sidecar files. Safety level: CONFIRM.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "description": "Directory to scan (default: sidecar dir)"},
+                },
+            },
+        },
     ]
 
     async def _tools_list(self, p):
@@ -192,7 +253,41 @@ class TranscriptionServer:
         elif name == "transcript_stats":
             store_stats = self.store.stats()
             queue_stats = self.queue.stats()
-            return self._tool_ok({**store_stats, "queue": queue_stats})
+            index_stats = self.index.get_stats()
+            return self._tool_ok({**store_stats, "queue": queue_stats, "index": index_stats})
+
+        elif name == "transcript_cross_search":
+            query = args.get("query", "")
+            if not query:
+                return self._tool_err("query is required")
+            filters = {}
+            for key in ("actor", "genre", "channel", "date_from", "date_to", "system"):
+                if args.get(key):
+                    filters[key] = args[key]
+            limit = args.get("limit", 20)
+            result = self.search_service.search(query, filters=filters, limit=limit)
+            return self._tool_ok(result)
+
+        elif name == "transcript_actors":
+            actor_name = args.get("actor_name", "")
+            if not actor_name:
+                return self._tool_err("actor_name is required")
+            result = self.search_service.search_actor(actor_name, limit=args.get("limit", 20))
+            return self._tool_ok(result)
+
+        elif name == "transcript_recording_summary":
+            recording_id = args.get("recording_id", "")
+            if not recording_id:
+                return self._tool_err("recording_id is required")
+            result = self.search_service.get_recording_summary(recording_id)
+            if "error" in result:
+                return self._tool_err(result["error"])
+            return self._tool_ok(result)
+
+        elif name == "transcript_reindex":
+            directory = args.get("directory", str(self.sidecar.output_dir))
+            count = self.sidecar.reindex_all(directory, self.index)
+            return self._tool_ok({"reindexed": count, "directory": directory})
 
         return self._tool_err(f"Unknown tool: {name}")
 

@@ -1,5 +1,5 @@
 =========================================
-01-prd.md — Unified Product Requirements Document
+01-prd.md ï¿½ Unified Product Requirements Document
 =========================================
 LLM Remote Control System for SageTV + ChannelsDVR
 Version: 1.0
@@ -195,15 +195,101 @@ Search
 * Dockerbased deployment
 * High maintainability
 
-13. Appendices
-* Appendix A — SageTV Capability Dictionary
-* Appendix B — ChannelsDVR Capability Dictionary
-* Appendix C — MCP Architecture
-* Appendix D — Transcription Subsystem
-* Appendix E — Device Registry
-* Appendix F — HTML5 Remote UI Spec
-* Appendix G — MCP Tool Definitions
-* Appendix H — LLM Prompt Specification
+13. Transcript Indexing and Cross-Metadata Reasoning Layer
+
+13.1 Purpose
+Extend the transcription subsystem with a structured index that links transcript
+segments to recording metadata (actors, genres, channels, air dates, ratings) from
+both SageTV and ChannelsDVR. This enables the LLM to answer cross-domain
+natural-language queries such as:
+* "Which episodes mention climate change?"
+* "Find scenes with Bryan Cranston talking about chemistry"
+* "What did the host say about the budget on channel 1045 last Tuesday?"
+* "Show all comedies recorded this week where someone says 'vacation'"
+
+13.2 Components
+1. Transcript Index (SQLite + FTS5)
+   * recordings table: normalized recording metadata from both systems
+   * actors table: per-recording actor/cast list
+   * transcript_chunks table: timestamped transcript segments (30s windows)
+   * FTS5 virtual table over transcript_chunks for full-text search
+   * See Appendix X for complete SQL schema
+
+2. JSON Sidecar Files
+   * One .transcript.json per recording, written alongside the .txt and .vtt
+   * Contains raw transcript, cleaned transcript, timestamps, speaker tags,
+     LLM-generated summary, chunk boundaries, and optional embeddings
+   * See Appendix Y for JSON schema
+
+3. Metadata Enrichment Pipeline
+   * After transcription completes, the pipeline:
+     a. Fetches recording metadata from the appropriate MCP server
+     b. Extracts actor/cast list
+     c. Splits transcript into 30-second chunks with timestamps
+     d. Writes the JSON sidecar
+     e. Inserts into the transcript index (recordings + actors + chunks)
+   * Pipeline runs as a post-transcription hook in the worker
+
+4. Cross-Metadata Search Service
+   * Accepts structured queries combining transcript text + metadata filters
+   * Supports: text search, actor filter, genre filter, channel filter, date range
+   * Returns ranked results with snippet context and timestamps
+   * Exposed via MCP tools:
+     - transcript_search(query, filters) -> ranked chunks with metadata
+     - transcript_actors(actor_name) -> recordings featuring actor
+     - transcript_summary(recording_id) -> full enriched summary
+
+5. LLM Reasoning Integration
+   * The orchestrator injects search results as context for the LLM
+   * The LLM can chain: parse intent -> search transcripts -> filter by metadata
+     -> format response with timestamps and episode references
+   * See Appendix Z for Copilot prompt pack
+
+13.3 Data Flow
+[Transcription Complete]
+   |
+[Metadata Enrichment Pipeline]
+   |
+   +-- Fetch metadata from MCP SageTV / MCP ChannelsDVR
+   +-- Extract actors, genre, channel, air date
+   +-- Split transcript into 30s chunks
+   +-- Write JSON sidecar
+   +-- Insert into transcript index
+   |
+[Cross-Metadata Search Service]
+   |
+   +-- FTS5 text search over chunks
+   +-- JOIN with recordings + actors for metadata filters
+   +-- Return ranked results with snippets
+   |
+[LLM Orchestrator]
+   |
+   +-- Inject search results as context
+   +-- Generate natural-language response
+
+13.4 Performance Requirements
+* Index insert: < 500ms per recording (excluding transcription time)
+* FTS5 search: < 200ms for typical queries
+* Metadata fetch: use cached MCP responses where available
+* Sidecar write: async, non-blocking to transcription pipeline
+
+13.5 Test Plan
+See Appendix AA for the complete test plan covering ingestion, indexing,
+search, actor filtering, cross-metadata reasoning, and edge cases.
+
+14. Appendices
+* Appendix A -- SageTV Capability Dictionary
+* Appendix B -- ChannelsDVR Capability Dictionary
+* Appendix C -- MCP Architecture
+* Appendix D -- Transcription Subsystem
+* Appendix E -- Device Registry
+* Appendix F -- HTML5 Remote UI Spec
+* Appendix G -- MCP Tool Definitions
+* Appendix H -- LLM Prompt Specification
+* Appendix X -- Transcript Index SQL Schema
+* Appendix Y -- Transcript JSON Sidecar Schema
+* Appendix Z -- Copilot Prompt Pack for Transcript Modules
+* Appendix AA -- Test Plan for Transcript-Metadata Reasoning
 
 End of PRD
 

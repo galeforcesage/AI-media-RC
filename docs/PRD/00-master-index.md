@@ -1,5 +1,5 @@
 =========================================
-MASTER INDEX — Unified LLM Remote Control System
+MASTER INDEX ï¿½ Unified LLM Remote Control System
 =========================================
 This index ties together the entire PRD and all appendices.
 0. Executive Summary
@@ -24,22 +24,30 @@ Authentication, authorization, Responsible AI.
 Docker, local LLM, local STT/TTS.
 
 Appendices
-Appendix A — SageTV Capability Dictionary
+Appendix A ï¿½ SageTV Capability Dictionary
 Entities, actions, resources, tools, safety levels.
-Appendix B — ChannelsDVR Capability Dictionary
+Appendix B ï¿½ ChannelsDVR Capability Dictionary
 Entities, actions, resources, tools, safety levels.
-Appendix C — MCP Architecture
+Appendix C ï¿½ MCP Architecture
 Three servers + orchestrator.
-Appendix D — Transcription Subsystem
+Appendix D ï¿½ Transcription Subsystem
 Watchers, queue, Whisper, metadata, MCP exposure.
-Appendix E — Device Registry & Pairing Protocol
+Appendix E ï¿½ Device Registry & Pairing Protocol
 Device metadata, pairing, admin panel.
-Appendix F — HTML5 Remote UI Specification
+Appendix F -- HTML5 Remote UI Specification
 Layout, controls, states, admin panel.
-Appendix G — MCP Tool Definitions
+Appendix G -- MCP Tool Definitions
 Full tool registry for SageTV, ChannelsDVR, Linux.
-Appendix H — LLM Prompt Specification
+Appendix H -- LLM Prompt Specification
 System prompt, context injection, output schema.
+Appendix X -- Transcript Index SQL Schema
+SQLite schema for recordings, actors, transcript_chunks, FTS5.
+Appendix Y -- Transcript JSON Sidecar Schema
+Per-recording JSON sidecar with chunks, timestamps, summaries.
+Appendix Z -- Copilot Prompt Pack for Transcript Modules
+Prompt templates for generating transcript indexing code.
+Appendix AA -- Test Plan for Transcript-Metadata Reasoning
+Ingestion, indexing, search, actor filter, cross-metadata, edge cases.
 
 =========================================
 GITHUB REPOSITORY STRUCTURE
@@ -151,13 +159,13 @@ See /docs/PRD/00-master-index.md.
 Quick Start
 docker compose up --build
 Components
-* /backend/orchestrator — LLM Gateway + tool routing
-* /backend/mcp-sagetv — SageTV MCP server
-* /backend/mcp-channels — ChannelsDVR MCP server
-* /backend/mcp-linux — Linux MCP server
-* /backend/session-manager — Device + session resolution
-* /backend/transcription — Whisper + metadata
-* /frontend/html5-remote — UI
+* /backend/orchestrator ï¿½ LLM Gateway + tool routing
+* /backend/mcp-sagetv ï¿½ SageTV MCP server
+* /backend/mcp-channels ï¿½ ChannelsDVR MCP server
+* /backend/mcp-linux ï¿½ Linux MCP server
+* /backend/session-manager ï¿½ Device + session resolution
+* /backend/transcription ï¿½ Whisper + metadata
+* /frontend/html5-remote ï¿½ UI
 License
 MIT
 
@@ -266,7 +274,7 @@ Backup:
 Everything is now complete.
 You now have:
 * Full PRD
-* All appendices (A–H)
+* All appendices (Aï¿½H)
 * Master index
 * GitHub repo structure
 * README.md
