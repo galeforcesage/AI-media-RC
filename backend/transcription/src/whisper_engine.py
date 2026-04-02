@@ -1,0 +1,140 @@
+"""
+whisper_engine.py
+Whisper transcription engine using faster-whisper (CTranslate2).
+
+Supports automatic model selection based on available RAM.
+Outputs timestamped segments.
+"""
+
+from __future__ import annotations
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def _get_available_ram_gb() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return kb / (1024 * 1024)
+    except Exception:
+        return 8.0  # safe default
+    return 8.0
+
+
+def select_model(preferred: str = "large-v3") -> str:
+    """Select Whisper model based on available RAM."""
+    ram = _get_available_ram_gb()
+    logger.info("Available RAM: %.1f GB, preferred model: %s", ram, preferred)
+
+    if preferred == "large-v3" and ram >= 10:
+        return "large-v3"
+    elif ram >= 6:
+        return "medium"
+    elif ram >= 3:
+        return "small"
+    else:
+        return "base"
+
+
+class WhisperEngine:
+    """Async-friendly wrapper around faster-whisper."""
+
+    def __init__(self, model_name: str = "auto", device: str = "auto", compute_type: str = "auto"):
+        self._model_name = model_name
+        self._device = device
+        self._compute_type = compute_type
+        self._model = None
+
+    def load(self) -> None:
+        """Load the Whisper model (call once at startup)."""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            logger.error("faster-whisper not installed. Install with: pip install faster-whisper")
+            raise
+
+        if self._model_name == "auto":
+            self._model_name = select_model()
+
+        logger.info("Loading Whisper model: %s (device=%s, compute=%s)",
+                     self._model_name, self._device, self._compute_type)
+        start = time.time()
+        self._model = WhisperModel(
+            self._model_name,
+            device=self._device,
+            compute_type=self._compute_type,
+        )
+        logger.info("Whisper model loaded in %.1fs", time.time() - start)
+
+    def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
+        """Transcribe an audio file.
+
+        Returns:
+            (full_text, segments, info)
+            segments: list of {start, end, text}
+            info: {language, duration, language_probability}
+        """
+        if self._model is None:
+            self.load()
+
+        logger.info("Transcribing: %s", audio_path)
+        start = time.time()
+
+        segments_iter, info = self._model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+
+        full_text_parts = []
+        segments = []
+        for seg in segments_iter:
+            full_text_parts.append(seg.text.strip())
+            segments.append({
+                "start": round(seg.start, 2),
+                "end": round(seg.end, 2),
+                "text": seg.text.strip(),
+            })
+
+        elapsed = time.time() - start
+        full_text = " ".join(full_text_parts)
+        transcription_info = {
+            "language": info.language,
+            "language_probability": round(info.language_probability, 3),
+            "duration": round(info.duration, 2),
+            "model": self._model_name,
+            "elapsed_seconds": round(elapsed, 1),
+            "realtime_factor": round(elapsed / max(info.duration, 1), 2),
+        }
+
+        logger.info("Transcription complete: %.0fs audio in %.0fs (%.2fx realtime), %d segments",
+                     info.duration, elapsed, elapsed / max(info.duration, 1), len(segments))
+
+        return full_text, segments, transcription_info
+
+    def segments_to_vtt(self, segments: List[Dict]) -> str:
+        """Convert segments to WebVTT subtitle format."""
+        lines = ["WEBVTT", ""]
+        for i, seg in enumerate(segments):
+            start = self._format_time(seg["start"])
+            end = self._format_time(seg["end"])
+            lines.append(str(i + 1))
+            lines.append(f"{start} --> {end}")
+            lines.append(seg["text"])
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = seconds % 60
+        return f"{h:02d}:{m:02d}:{s:06.3f}"
