@@ -24,7 +24,7 @@ MEDIA_EXTENSIONS = {".mpg", ".ts", ".mkv", ".mp4", ".avi"}
 # Debounce: wait this long after last modification before processing
 DEBOUNCE_SECONDS = 30
 # Poll interval
-POLL_INTERVAL = 15
+POLL_INTERVAL = 30
 
 
 class FileWatcher:
