@@ -8,8 +8,10 @@ Allowlists are enforced at this layer.
 
 from __future__ import annotations
 import asyncio
+import fnmatch
 import logging
 import os
+import time
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -289,6 +291,147 @@ async def file_info(path: str) -> Dict:
         "size": st.st_size,
         "modified": st.st_mtime,
         "readable": os.access(real, os.R_OK),
+    }
+
+
+# ------------------------------------------------------------------
+# Recursive file scanning
+# ------------------------------------------------------------------
+
+_MAX_SCAN_FILES = 100_000  # safety cap on files walked
+_PAGE_SIZE = 15
+_MAX_PAGES = 5
+
+
+async def find_large_files(
+    root: str,
+    sort_by: str = "size",
+    page: int = 1,
+    extension: str = "",
+) -> Dict:
+    """
+    Recursively scan an allowed root for files, sorted by size (desc)
+    or age (oldest first).  Returns 15 results per page, up to 5 pages.
+    """
+    real = os.path.realpath(root)
+    if not _is_under_allowed_root(real):
+        return {"error": "Path not under allowed roots", "allowed": list(ALLOWED_BROWSE_ROOTS)}
+    if not os.path.isdir(real):
+        return {"error": f"Not a directory: {real}"}
+    if page < 1 or page > _MAX_PAGES:
+        return {"error": f"Page must be 1-{_MAX_PAGES}"}
+    if sort_by not in ("size", "age"):
+        return {"error": "sort_by must be 'size' or 'age'"}
+
+    ext_filter = extension.lower().lstrip(".") if extension else ""
+    files: List[Dict] = []
+    scanned = 0
+
+    for dirpath, _dirnames, filenames in os.walk(real):
+        for fname in filenames:
+            scanned += 1
+            if scanned > _MAX_SCAN_FILES:
+                break
+            if ext_filter and not fname.lower().endswith(f".{ext_filter}"):
+                continue
+            full = os.path.join(dirpath, fname)
+            try:
+                st = os.stat(full)
+                files.append({
+                    "path": full,
+                    "name": fname,
+                    "size": st.st_size,
+                    "modified": st.st_mtime,
+                    "age_days": round((time.time() - st.st_mtime) / 86400, 1),
+                })
+            except OSError:
+                continue
+        if scanned > _MAX_SCAN_FILES:
+            break
+
+    # Sort
+    if sort_by == "size":
+        files.sort(key=lambda f: f["size"], reverse=True)
+    else:  # age — oldest first
+        files.sort(key=lambda f: f["modified"])
+
+    total = len(files)
+    total_pages = min((total + _PAGE_SIZE - 1) // _PAGE_SIZE, _MAX_PAGES)
+    start = (page - 1) * _PAGE_SIZE
+    end = start + _PAGE_SIZE
+    page_files = files[start:end]
+
+    return {
+        "root": real,
+        "sort_by": sort_by,
+        "extension_filter": ext_filter or None,
+        "total_files": total,
+        "total_scanned": scanned,
+        "page": page,
+        "total_pages": total_pages,
+        "page_size": _PAGE_SIZE,
+        "files": page_files,
+    }
+
+
+async def count_files_by_extension(root: str, pattern: str) -> Dict:
+    """
+    Recursively count files matching a glob pattern (e.g. '*.ts', '*.vprj')
+    under an allowed root.  Also returns total size of matched files.
+    """
+    real = os.path.realpath(root)
+    if not _is_under_allowed_root(real):
+        return {"error": "Path not under allowed roots", "allowed": list(ALLOWED_BROWSE_ROOTS)}
+    if not os.path.isdir(real):
+        return {"error": f"Not a directory: {real}"}
+    if not pattern or not pattern.startswith("*."):
+        return {"error": "Pattern must be a glob like '*.ts' or '*.vprj'"}
+
+    pat = pattern.lower()
+    count = 0
+    total_size = 0
+    smallest = None
+    largest = None
+    oldest = None
+    newest = None
+    scanned = 0
+
+    for dirpath, _dirnames, filenames in os.walk(real):
+        for fname in filenames:
+            scanned += 1
+            if scanned > _MAX_SCAN_FILES:
+                break
+            if not fnmatch.fnmatch(fname.lower(), pat):
+                continue
+            full = os.path.join(dirpath, fname)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            count += 1
+            total_size += st.st_size
+            entry = {"path": full, "name": fname, "size": st.st_size, "modified": st.st_mtime}
+            if smallest is None or st.st_size < smallest["size"]:
+                smallest = entry
+            if largest is None or st.st_size > largest["size"]:
+                largest = entry
+            if oldest is None or st.st_mtime < oldest["modified"]:
+                oldest = entry
+            if newest is None or st.st_mtime > newest["modified"]:
+                newest = entry
+        if scanned > _MAX_SCAN_FILES:
+            break
+
+    return {
+        "root": real,
+        "pattern": pattern,
+        "count": count,
+        "total_size": total_size,
+        "total_scanned": scanned,
+        "smallest": smallest,
+        "largest": largest,
+        "oldest": oldest,
+        "newest": newest,
     }
 
 

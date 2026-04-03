@@ -156,6 +156,43 @@ async def _file_info(args: Dict) -> Dict:
 
 
 # ==================================================================
+# Recursive file scanning handlers
+# ==================================================================
+
+async def _find_large_files(args: Dict) -> Dict:
+    root = args.get("root", "")
+    if not root:
+        return _fail("missing_param", "root is required")
+    sort_by = args.get("sort_by", "size")
+    page = int(args.get("page", 1))
+    extension = args.get("extension", "")
+    result = await system.find_large_files(root, sort_by=sort_by, page=page, extension=extension)
+    if "error" in result:
+        return _fail("not_allowed", result["error"])
+    files = result.get("files", [])
+    total = result.get("total_files", 0)
+    pg = result.get("page", 1)
+    tp = result.get("total_pages", 1)
+    return _ok(data=result, message=f"{len(files)} files (page {pg}/{tp}, {total} total)")
+
+
+async def _count_files(args: Dict) -> Dict:
+    root = args.get("root", "")
+    pattern = args.get("pattern", "")
+    if not root:
+        return _fail("missing_param", "root is required")
+    if not pattern:
+        return _fail("missing_param", "pattern is required (e.g. '*.ts')")
+    result = await system.count_files_by_extension(root, pattern)
+    if "error" in result:
+        return _fail("not_allowed", result["error"])
+    count = result.get("count", 0)
+    total_size = result.get("total_size", 0)
+    size_gb = total_size / (1024**3)
+    return _ok(data=result, message=f"{count} files matching '{pattern}' ({size_gb:.2f} GB total)")
+
+
+# ==================================================================
 # Privileged: reboot / shutdown / nginx
 # ==================================================================
 
@@ -309,6 +346,36 @@ TOOL_REGISTRY = {
         },
         "safety": Safety.SAFE,
         "handler": _file_info,
+    },
+
+    # --- Recursive file scanning ---
+    "linux_find_large_files": {
+        "description": "Recursively scan an allowlisted directory for files, sorted by size (largest first) or age (oldest first). Returns 15 results per page, up to 5 pages. Optionally filter by file extension.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Root directory to scan (must be under an allowed root, e.g. /var/media/tv)"},
+                "sort_by": {"type": "string", "enum": ["size", "age"], "description": "Sort order: 'size' (largest first) or 'age' (oldest first). Default: size"},
+                "page": {"type": "integer", "description": "Page number (1-5). Default: 1"},
+                "extension": {"type": "string", "description": "Optional file extension filter (e.g. 'ts', 'mpg', 'mkv'). Omit for all files"},
+            },
+            "required": ["root"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _find_large_files,
+    },
+    "linux_count_files": {
+        "description": "Recursively count files matching a glob pattern (e.g. '*.ts', '*.vprj', '*.mpg') under an allowlisted directory. Returns count, total size, plus the smallest/largest/oldest/newest matching files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Root directory to scan (must be under an allowed root)"},
+                "pattern": {"type": "string", "description": "Glob pattern like '*.ts', '*.vprj', '*.mpg'"},
+            },
+            "required": ["root", "pattern"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _count_files,
     },
 
     # --- Privileged: server power ---

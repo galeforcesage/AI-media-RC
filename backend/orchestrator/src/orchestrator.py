@@ -433,6 +433,8 @@ class Orchestrator:
         "tail_log": "linux_tail_log",
         "list_directory": "linux_list_directory",
         "file_info": "linux_file_info",
+        "find_large_files": "linux_find_large_files",
+        "count_files": "linux_count_files",
         "reboot": "linux_reboot_server",
         "shutdown": "linux_shutdown_server",
         "service_status": "linux_service_status",
