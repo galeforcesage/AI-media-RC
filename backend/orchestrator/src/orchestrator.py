@@ -113,6 +113,12 @@ class Orchestrator:
             name="channels",
         )
 
+        self._linux = MCPClient(
+            host=mcp.get("linux_host", "127.0.0.1"),
+            port=mcp.get("linux_port", 8768),
+            name="linux",
+        )
+
         # Session manager URL for device → session_id resolution
         self._session_url = config.get("session_manager_url", "http://127.0.0.1:8769")
 
@@ -145,6 +151,7 @@ class Orchestrator:
         await self.llm.unload()
         await self._sagetv.close()
         await self._channels.close()
+        await self._linux.close()
 
         logger.info("Orchestrator shutdown complete")
 
@@ -329,10 +336,10 @@ class Orchestrator:
             return {"error": str(exc)}
 
     async def run_system(self, action: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        """Execute a system command."""
+        """Execute a system command via MCP Linux."""
         logger.info("run_system: %s", action)
         try:
-            return await self.system.execute(action, payload or {})
+            return await self._execute_linux(action, payload or {})
         except Exception as exc:
             logger.exception("run_system failed")
             return {"error": str(exc)}
@@ -408,6 +415,37 @@ class Orchestrator:
         except ConnectionError as exc:
             logger.warning("ChannelsDVR MCP unavailable: %s", exc)
             return {"error": f"ChannelsDVR MCP unavailable: {exc}"}
+
+    # Maps short system action names to MCP Linux tool names
+    _LINUX_TOOL_MAP = {
+        "info": "linux_uptime",
+        "diagnostics": "linux_memory_info",
+        "disk_usage": "linux_disk_usage",
+        "memory": "linux_memory_info",
+        "uptime": "linux_uptime",
+        "network": "linux_network_info",
+        "docker_status": "linux_docker_ps",
+        "docker_restart": "linux_docker_restart",
+        "docker_logs": "linux_docker_logs",
+        "restart_service": "linux_restart_service",
+        "restart_container": "linux_docker_restart",
+        "restart_nginx": "linux_restart_nginx",
+        "tail_log": "linux_tail_log",
+        "list_directory": "linux_list_directory",
+        "file_info": "linux_file_info",
+        "reboot": "linux_reboot_server",
+        "shutdown": "linux_shutdown_server",
+        "service_status": "linux_service_status",
+    }
+
+    async def _execute_linux(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Route system/Linux commands through the MCP Linux client."""
+        tool_name = self._LINUX_TOOL_MAP.get(action, f"linux_{action}")
+        try:
+            return await self._linux.call_tool(tool_name, payload)
+        except ConnectionError as exc:
+            logger.warning("Linux MCP unavailable: %s", exc)
+            return {"error": f"Linux MCP unavailable: {exc}"}
 
     # ------------------------------------------------------------------
     # Session resolution

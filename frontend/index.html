@@ -83,6 +83,7 @@
     <button id="btn-settings" class="footer-btn" aria-label="Settings">⚙ Settings</button>
     <button id="btn-admin" class="footer-btn" aria-label="Admin Panel">🛠 Admin</button>
     <span class="footer-status" id="footer-status">Disconnected</span>
+    <button id="btn-logout" class="footer-btn" aria-label="Logout">🚪 Logout</button>
   </footer>
 
   <!-- Settings Modal -->
@@ -132,6 +133,24 @@
     <div class="dialog-actions">
       <button id="btn-close-admin">Close</button>
     </div>
+  </dialog>
+
+  <!-- Admin Auth Dialog -->
+  <dialog id="sudo-dialog">
+    <h2>Admin Login</h2>
+    <p id="sudo-prompt-text">This action requires admin authentication.</p>
+    <form id="sudo-form" method="dialog">
+      <label>Username:
+        <input type="text" id="admin-username" required autocomplete="username" value="admin">
+      </label>
+      <label>Password:
+        <input type="password" id="sudo-password" required autocomplete="current-password">
+      </label>
+      <div class="dialog-actions">
+        <button type="submit" value="ok">Login</button>
+        <button type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
   </dialog>
 
   <!-- Add Device Dialog -->

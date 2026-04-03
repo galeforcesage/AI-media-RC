@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Remote — Login</title>
+<style>
+:root {
+  --bg: #121212;
+  --surface: #1e1e1e;
+  --surface2: #2a2a2a;
+  --primary: #4fc3f7;
+  --primary-dark: #0288d1;
+  --danger: #ef5350;
+  --text: #e0e0e0;
+  --text-muted: #9e9e9e;
+  --border: #333;
+  --radius: 8px;
+  --shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-card {
+  background: var(--surface);
+  padding: 2rem;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: 90%;
+  max-width: 360px;
+  text-align: center;
+}
+.login-card h1 {
+  font-size: 1.5rem;
+  color: var(--primary);
+  margin-bottom: 0.3rem;
+}
+.login-card .subtitle {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 1.5rem;
+}
+.login-card input[type="password"] {
+  width: 100%;
+  padding: 0.7rem 1rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 1rem;
+  margin-bottom: 1rem;
+}
+.login-card input[type="password"]:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+.login-card button {
+  width: 100%;
+  padding: 0.7rem;
+  background: var(--primary-dark);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.login-card button:hover { background: var(--primary); color: #000; }
+.login-card button:disabled { opacity: 0.5; cursor: not-allowed; }
+.error-msg {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+  min-height: 1.2em;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fafafa; --surface: #fff; --surface2: #f0f0f0;
+    --text: #212121; --text-muted: #757575; --border: #ddd;
+  }
+}
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>LLM Remote</h1>
+    <p class="subtitle">Enter the access password to continue.</p>
+    <div class="error-msg" id="error-msg"></div>
+    <form id="login-form">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" autofocus required>
+      <button type="submit" id="login-btn">Sign In</button>
+    </form>
+  </div>
+  <script>
+    const origin = window.location.origin;
+    const sessionUrl = `${origin}/session`;
+
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('login-btn');
+      const errEl = document.getElementById('error-msg');
+      const password = document.getElementById('password').value;
+      errEl.textContent = '';
+      btn.disabled = true;
+      btn.textContent = 'Signing in…';
+
+      try {
+        const resp = await fetch(`${sessionUrl}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ password }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+          window.location.href = '/';
+        } else {
+          errEl.textContent = 'Incorrect password.';
+        }
+      } catch (err) {
+        errEl.textContent = 'Connection error. Try again.';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sign In';
+      }
+    });
+  </script>
+</body>
+</html>

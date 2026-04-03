@@ -2,18 +2,46 @@
  * api.js — HTTP client for the orchestrator and session manager.
  */
 const API = (() => {
-  const hostOrigin = window.location.hostname || '127.0.0.1';
-  let baseUrl = localStorage.getItem('api_url') || `http://${hostOrigin}:8000`;
-  let sessionUrl = localStorage.getItem('session_url') || `http://${hostOrigin}:8769`;
+  const origin = window.location.origin;  // e.g. https://10.0.0.10
+  let baseUrl = localStorage.getItem('api_url') || origin;
+  let sessionUrl = localStorage.getItem('session_url') || `${origin}/session`;
 
   function setBaseUrl(url) { baseUrl = url; localStorage.setItem('api_url', url); }
   function setSessionUrl(url) { sessionUrl = url; localStorage.setItem('session_url', url); }
 
   async function request(url, method = 'GET', body = null) {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    const opts = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'include' };
     if (body) opts.body = JSON.stringify(body);
     const resp = await fetch(url, opts);
+    if (resp.status === 401) {
+      // Not authenticated — redirect to login
+      window.location.href = '/login.html';
+      throw new Error('unauthorized');
+    }
     return resp.json();
+  }
+
+  // Auth
+  async function authCheck() {
+    const resp = await fetch(`${sessionUrl}/auth/check`, { credentials: 'include' });
+    return resp.json();
+  }
+
+  async function authLogout() {
+    return request(`${sessionUrl}/auth/logout`, 'POST');
+  }
+
+  async function adminLogin(username, password) {
+    return request(`${sessionUrl}/auth/admin/login`, 'POST', { username, password });
+  }
+
+  async function adminCheck() {
+    const resp = await fetch(`${sessionUrl}/auth/admin/check`, { credentials: 'include' });
+    return resp.json();
+  }
+
+  async function adminLogout() {
+    return request(`${sessionUrl}/auth/admin/logout`, 'POST');
   }
 
   // Orchestrator endpoints
@@ -97,6 +125,7 @@ const API = (() => {
     query, playback, search, playTitle, system, health,
     listDevices, addDevice, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
+    authCheck, authLogout, adminLogin, adminCheck, adminLogout,
     get baseUrl() { return baseUrl; },
     get sessionUrl() { return sessionUrl; },
   };

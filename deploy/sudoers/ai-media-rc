@@ -1,0 +1,21 @@
+# /etc/sudoers.d/ai-media-rc
+# Passwordless sudo for the sagetv user — strictly limited to
+# the commands used by the MCP Linux server.
+# Deployed by scripts/setup-auth.sh
+
+# Service management (systemctl restart only)
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart sagetv
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart channels-dvr
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart docker
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart transcription
+sagetv ALL=(root) NOPASSWD: /usr/bin/systemctl restart session-manager
+
+# Docker operations (only for allowlisted containers)
+sagetv ALL=(root) NOPASSWD: /usr/bin/docker restart sagetv-server
+sagetv ALL=(root) NOPASSWD: /usr/bin/docker restart samsung-tvplus-for-channels
+sagetv ALL=(root) NOPASSWD: /usr/bin/docker restart nextcloud-redis
+
+# Server power
+sagetv ALL=(root) NOPASSWD: /usr/sbin/reboot
+sagetv ALL=(root) NOPASSWD: /usr/sbin/shutdown -h now

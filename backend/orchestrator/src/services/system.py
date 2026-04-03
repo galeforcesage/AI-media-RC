@@ -2,7 +2,9 @@
 system.py
 System diagnostics and control service.
 Provides CPU, RAM, disk, GPU availability, and system-level commands
-such as volume, reboot, and shutdown.
+such as volume, reboot, and shutdown.  Privileged commands accept an
+optional sudo_password which is fed to ``sudo -S`` via stdin so
+the frontend can prompt interactively.
 """
 
 from __future__ import annotations
@@ -17,12 +19,43 @@ from models.system import SystemDiagnostics, SystemInfo
 
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------
+# Allowlists  (mirrors mcp-linux for defense-in-depth)
+# ------------------------------------------------------------------
+ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "nextcloud-redis"}
+ALLOWED_SERVICES = {"sagetv", "channels-dvr", "docker"}
+
 
 class SystemService:
     """System-level commands and diagnostics."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _run(cmd: list[str], timeout: int = 30,
+                   stdin_data: str | None = None) -> tuple[int, str, str]:
+        """Execute a subprocess, optionally feeding stdin (for sudo -S)."""
+        logger.debug("Executing: %s", " ".join(cmd))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin_data else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            input_bytes = (stdin_data + "\n").encode() if stdin_data else None
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=input_bytes), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            return -1, "", "Command timed out"
+        return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
     async def execute(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -124,11 +157,79 @@ class SystemService:
     async def _cmd_reboot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Initiate system reboot."""
         logger.warning("Reboot requested")
-        # In production: os.system("sudo reboot")
+        password = payload.get("sudo_password")
+        if not password:
+            return {"error": "Server password required for reboot"}
+        rc, out, err = await self._run(
+            ["sudo", "-S", "reboot"], timeout=15, stdin_data=password,
+        )
+        if rc != 0:
+            return {"error": f"Reboot failed: {err.strip()}"}
         return {"status": "ok", "action": "reboot"}
 
     async def _cmd_shutdown(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Initiate system shutdown."""
         logger.warning("Shutdown requested")
-        # In production: os.system("sudo shutdown -h now")
+        password = payload.get("sudo_password")
+        if not password:
+            return {"error": "Server password required for shutdown"}
+        rc, out, err = await self._run(
+            ["sudo", "-S", "shutdown", "-h", "now"], timeout=15, stdin_data=password,
+        )
+        if rc != 0:
+            return {"error": f"Shutdown failed: {err.strip()}"}
         return {"status": "ok", "action": "shutdown"}
+
+    # ------------------------------------------------------------------
+    # Docker / Service Management
+    # ------------------------------------------------------------------
+
+    async def _cmd_docker_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """List running Docker containers."""
+        rc, out, err = await self._run(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
+        )
+        if rc != 0:
+            return {"error": f"docker ps failed: {err.strip()}"}
+        containers = []
+        for line in out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                containers.append({
+                    "name": parts[0], "status": parts[1], "image": parts[2],
+                })
+        return {"status": "ok", "action": "docker_status", "containers": containers}
+
+    async def _cmd_restart_container(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Restart a Docker container (may need sudo)."""
+        container = payload.get("container", "")
+        if container not in ALLOWED_DOCKER_CONTAINERS:
+            return {"error": f"Container '{container}' not in allowlist",
+                    "allowed": sorted(ALLOWED_DOCKER_CONTAINERS)}
+        password = payload.get("sudo_password")
+        if password:
+            cmd = ["sudo", "-S", "docker", "restart", container]
+            rc, out, err = await self._run(cmd, timeout=60, stdin_data=password)
+        else:
+            cmd = ["docker", "restart", container]
+            rc, out, err = await self._run(cmd, timeout=60)
+        if rc != 0:
+            return {"error": f"Restart failed: {err.strip()}"}
+        return {"status": "ok", "action": "restart_container", "container": container}
+
+    async def _cmd_restart_service(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Restart a systemd service (requires sudo password)."""
+        service = payload.get("service", "")
+        if service not in ALLOWED_SERVICES:
+            return {"error": f"Service '{service}' not in allowlist",
+                    "allowed": sorted(ALLOWED_SERVICES)}
+        password = payload.get("sudo_password")
+        if not password:
+            return {"error": "Server password required to restart services"}
+        rc, out, err = await self._run(
+            ["sudo", "-S", "systemctl", "restart", service],
+            timeout=30, stdin_data=password,
+        )
+        if rc != 0:
+            return {"error": f"Restart failed (rc={rc}): {err.strip()}"}
+        return {"status": "ok", "action": "restart_service", "service": service}

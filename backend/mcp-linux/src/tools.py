@@ -132,6 +132,55 @@ async def _docker_logs(args: Dict) -> Dict:
 
 
 # ==================================================================
+# File browsing handlers (non-privileged)
+# ==================================================================
+
+async def _list_directory(args: Dict) -> Dict:
+    path = args.get("path", "")
+    if not path:
+        return _fail("missing_param", "path is required")
+    result = await system.list_directory(path)
+    if "error" in result:
+        return _fail("not_allowed", result["error"])
+    return _ok(data=result, message=f"{result.get('count', 0)} entries in {path}")
+
+
+async def _file_info(args: Dict) -> Dict:
+    path = args.get("path", "")
+    if not path:
+        return _fail("missing_param", "path is required")
+    result = await system.file_info(path)
+    if "error" in result:
+        return _fail("not_allowed", result["error"])
+    return _ok(data=result, message=f"{result.get('type', '?')}: {path}")
+
+
+# ==================================================================
+# Privileged: reboot / shutdown / nginx
+# ==================================================================
+
+async def _reboot_server(args: Dict) -> Dict:
+    result = await system.reboot_server()
+    if "error" in result:
+        return _fail("reboot_failed", result["error"])
+    return _ok(data=result, message="Server reboot initiated")
+
+
+async def _shutdown_server(args: Dict) -> Dict:
+    result = await system.shutdown_server()
+    if "error" in result:
+        return _fail("shutdown_failed", result["error"])
+    return _ok(data=result, message="Server shutdown initiated")
+
+
+async def _restart_nginx(args: Dict) -> Dict:
+    result = await system.restart_nginx()
+    if "error" in result:
+        return _fail("restart_failed", result["error"])
+    return _ok(data=result, message="Nginx restarted")
+
+
+# ==================================================================
 # Tool registry
 # ==================================================================
 
@@ -150,11 +199,11 @@ TOOL_REGISTRY = {
         "handler": _service_status,
     },
     "linux_restart_service": {
-        "description": "Restart an allowlisted system service.",
+        "description": "Restart an allowlisted system service. Uses passwordless sudo.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "service_name": {"type": "string", "description": "Service name (sagetv, channels-dvr, docker)"},
+                "service_name": {"type": "string", "description": "Service name (sagetv, channels-dvr, docker, nginx, transcription, session-manager)"},
             },
             "required": ["service_name"],
         },
@@ -211,7 +260,7 @@ TOOL_REGISTRY = {
         "handler": _docker_ps,
     },
     "linux_docker_restart": {
-        "description": "Restart an allowlisted Docker container.",
+        "description": "Restart an allowlisted Docker container. Uses passwordless sudo.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -234,5 +283,60 @@ TOOL_REGISTRY = {
         },
         "safety": Safety.OWNER,
         "handler": _docker_logs,
+    },
+
+    # --- File browsing (non-privileged) ---
+    "linux_list_directory": {
+        "description": "List files and directories under an allowlisted path (recording folders, project dir, transcription output).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path (must be under an allowed root)"},
+            },
+            "required": ["path"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _list_directory,
+    },
+    "linux_file_info": {
+        "description": "Get file/directory metadata (size, modified time, type) for an allowlisted path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File or directory path (must be under an allowed root)"},
+            },
+            "required": ["path"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _file_info,
+    },
+
+    # --- Privileged: server power ---
+    "linux_reboot_server": {
+        "description": "Reboot the entire Linux server. Uses passwordless sudo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+        "safety": Safety.DANGEROUS,
+        "handler": _reboot_server,
+    },
+    "linux_shutdown_server": {
+        "description": "Shut down the entire Linux server. Uses passwordless sudo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+        "safety": Safety.DANGEROUS,
+        "handler": _shutdown_server,
+    },
+    "linux_restart_nginx": {
+        "description": "Restart the nginx reverse proxy. Uses passwordless sudo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+        "safety": Safety.OWNER,
+        "handler": _restart_nginx,
     },
 }

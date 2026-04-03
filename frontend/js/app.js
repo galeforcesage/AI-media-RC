@@ -6,7 +6,19 @@
 
   // ─── Boot ─────────────────────────────────────────────────
 
-  document.addEventListener('DOMContentLoaded', () => {
+  document.addEventListener('DOMContentLoaded', async () => {
+    // Auth gate: check if logged in, redirect if not
+    try {
+      const check = await API.authCheck();
+      if (!check.authenticated) {
+        window.location.href = '/login.html';
+        return;
+      }
+    } catch (_) {
+      window.location.href = '/login.html';
+      return;
+    }
+
     UI.cacheElements();
     bindEvents();
     Voice.init(handleVoiceResult);
@@ -22,6 +34,52 @@
     UI.updateStatus(state.connected);
     UI.updateDevicePicker(state.devices, state.deviceId);
     UI.updateNowPlaying(state.session);
+  }
+
+  // ─── Admin Auth Helper ──────────────────────────────────
+
+  async function ensureAdmin(actionLabel) {
+    /**
+     * Ensure the user has a valid admin session.
+     * Returns true if authenticated, false if they cancelled.
+     */
+    const check = await API.adminCheck();
+    if (check.authenticated) return true;
+
+    // Show admin login dialog
+    return new Promise((resolve) => {
+      const dlg = document.getElementById('sudo-dialog');
+      const pwdInput = document.getElementById('sudo-password');
+      const userInput = document.getElementById('admin-username');
+      document.getElementById('sudo-prompt-text').textContent =
+        `"${actionLabel}" requires admin authentication.`;
+      if (userInput) userInput.value = '';
+      pwdInput.value = '';
+      dlg.showModal();
+      dlg.addEventListener('close', async function handler() {
+        dlg.removeEventListener('close', handler);
+        if (dlg.returnValue === 'ok') {
+          const username = userInput ? userInput.value.trim() : 'admin';
+          const password = pwdInput.value;
+          pwdInput.value = '';
+          try {
+            const result = await API.adminLogin(username, password);
+            if (result.success) {
+              resolve(true);
+            } else {
+              UI.renderSystemOutput('Admin login failed.');
+              resolve(false);
+            }
+          } catch (err) {
+            UI.renderSystemOutput('Admin login error: ' + err.message);
+            resolve(false);
+          }
+        } else {
+          pwdInput.value = '';
+          resolve(false);
+        }
+      });
+    });
   }
 
   // ─── Event Binding ────────────────────────────────────────
@@ -105,6 +163,10 @@
     document.getElementById('btn-close-admin').addEventListener('click', () => {
       document.getElementById('admin-dialog').close();
     });
+    document.getElementById('btn-logout').addEventListener('click', async () => {
+      await API.authLogout();
+      window.location.href = '/login.html';
+    });
 
     // Settings save
     document.getElementById('settings-dialog').addEventListener('close', (e) => {
@@ -184,6 +246,7 @@
     });
     document.getElementById('btn-restart-sagetv').addEventListener('click', async () => {
       if (!confirm('Restart SageTV container?')) return;
+      if (!await ensureAdmin('Restart SageTV container')) return;
       try {
         const data = await API.system('restart_container', { container: 'sagetv-server' });
         UI.renderSystemOutput(JSON.stringify(data, null, 2));
@@ -193,6 +256,7 @@
     });
     document.getElementById('btn-restart-channels').addEventListener('click', async () => {
       if (!confirm('Restart Channels DVR service?')) return;
+      if (!await ensureAdmin('Restart Channels DVR service')) return;
       try {
         const data = await API.system('restart_service', { service: 'channels-dvr' });
         UI.renderSystemOutput(JSON.stringify(data, null, 2));

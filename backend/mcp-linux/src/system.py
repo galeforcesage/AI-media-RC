@@ -18,33 +18,61 @@ logger = logging.getLogger(__name__)
 # Allowlists — strictly enforced
 # ------------------------------------------------------------------
 
-ALLOWED_SERVICES = {"sagetv", "channels-dvr", "docker"}
+ALLOWED_SERVICES = {
+    "sagetv", "channels-dvr", "docker", "nginx",
+    "transcription", "session-manager",
+}
 
 ALLOWED_LOG_PATHS = {
     "/var/log/syslog",
     "/var/log/auth.log",
     "/var/log/kern.log",
     "/var/log/docker.log",
+    "/var/log/nginx/error.log",
+    "/var/log/nginx/access.log",
     "/opt/sagetv/server/logs/sagetv.log",
+    "/tmp/orchestrator.log",
+    "/tmp/transcription.log",
+    "/tmp/session-manager.log",
+    "/tmp/mcp-sagetv.log",
+    "/tmp/mcp-channels.log",
+    "/tmp/mcp-linux.log",
 }
 
 ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "nextcloud-redis"}
 
+ALLOWED_BROWSE_ROOTS = {
+    "/var/media/tv",
+    "/var/media/channels",
+    "/home/sagetv/AI-media-RC",
+    "/tmp/transcription",
+}
 
-async def _run(cmd: List[str], timeout: int = 15) -> tuple[int, str, str]:
+
+async def _run(cmd: List[str], timeout: int = 15, stdin_data: Optional[str] = None) -> tuple[int, str, str]:
     """Run a command and return (returncode, stdout, stderr)."""
     logger.debug("Executing: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=stdin_data.encode() if stdin_data else None),
+            timeout=timeout,
+        )
     except asyncio.TimeoutError:
         proc.kill()
         return -1, "", "Command timed out"
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def _run_sudo(cmd: List[str], timeout: int = 30) -> tuple[int, str, str]:
+    """Run a command with sudo (passwordless via sudoers config)."""
+    full_cmd = ["sudo", "-n"] + cmd
+    return await _run(full_cmd, timeout=timeout)
 
 
 # ------------------------------------------------------------------
@@ -69,9 +97,11 @@ async def service_status(name: str) -> Dict:
 async def restart_service(name: str) -> Dict:
     if name not in ALLOWED_SERVICES:
         return {"error": f"Service '{name}' not in allowlist", "allowed": list(ALLOWED_SERVICES)}
-    rc, out, err = await _run(["sudo", "systemctl", "restart", name], timeout=30)
+    rc, out, err = await _run_sudo(["systemctl", "restart", name], timeout=30)
     if rc != 0:
-        return {"error": f"Restart failed (rc={rc}): {err.strip()}"}
+        # Strip sudo prompt noise from stderr
+        err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
+        return {"error": f"Restart failed (rc={rc}): {err_clean.strip()}"}
     return {"service": name, "action": "restarted"}
 
 
@@ -192,9 +222,10 @@ async def docker_restart(container: str) -> Dict:
     if container not in ALLOWED_DOCKER_CONTAINERS:
         return {"error": f"Container '{container}' not in allowlist",
                 "allowed": list(ALLOWED_DOCKER_CONTAINERS)}
-    rc, out, err = await _run(["docker", "restart", container], timeout=60)
+    rc, out, err = await _run_sudo(["docker", "restart", container], timeout=60)
     if rc != 0:
-        return {"error": f"Restart failed: {err.strip()}"}
+        err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
+        return {"error": f"Restart failed: {err_clean.strip()}"}
     return {"container": container, "action": "restarted"}
 
 
@@ -206,3 +237,87 @@ async def docker_logs(container: str, lines: int = 50) -> Dict:
     # Docker logs often go to stderr
     log_text = out or err
     return {"container": container, "lines": log_text.strip().splitlines()[-min(lines, 500):]}
+
+
+# ------------------------------------------------------------------
+# File browsing (non-privileged)
+# ------------------------------------------------------------------
+
+def _is_under_allowed_root(path: str) -> bool:
+    """Check if a resolved path is under an allowed browse root."""
+    real = os.path.realpath(path)
+    return any(real == root or real.startswith(root + "/") for root in ALLOWED_BROWSE_ROOTS)
+
+
+async def list_directory(path: str) -> Dict:
+    """List files/dirs in an allowlisted directory."""
+    real = os.path.realpath(path)
+    if not _is_under_allowed_root(real):
+        return {"error": f"Path not under allowed roots", "allowed": list(ALLOWED_BROWSE_ROOTS)}
+    if not os.path.isdir(real):
+        return {"error": f"Not a directory: {real}"}
+    entries = []
+    try:
+        for name in sorted(os.listdir(real)):
+            full = os.path.join(real, name)
+            try:
+                st = os.stat(full)
+                entries.append({
+                    "name": name,
+                    "type": "dir" if os.path.isdir(full) else "file",
+                    "size": st.st_size,
+                    "modified": st.st_mtime,
+                })
+            except OSError:
+                entries.append({"name": name, "type": "unknown", "size": 0, "modified": 0})
+    except PermissionError:
+        return {"error": f"Permission denied: {real}"}
+    return {"path": real, "entries": entries, "count": len(entries)}
+
+
+async def file_info(path: str) -> Dict:
+    """Get file metadata for an allowlisted path."""
+    real = os.path.realpath(path)
+    if not _is_under_allowed_root(real):
+        return {"error": f"Path not under allowed roots", "allowed": list(ALLOWED_BROWSE_ROOTS)}
+    if not os.path.exists(real):
+        return {"error": f"Path not found: {real}"}
+    st = os.stat(real)
+    return {
+        "path": real,
+        "type": "dir" if os.path.isdir(real) else "file",
+        "size": st.st_size,
+        "modified": st.st_mtime,
+        "readable": os.access(real, os.R_OK),
+    }
+
+
+# ------------------------------------------------------------------
+# Privileged: reboot / shutdown
+# ------------------------------------------------------------------
+
+async def reboot_server() -> Dict:
+    """Reboot the entire Linux server."""
+    rc, out, err = await _run_sudo(["reboot"], timeout=15)
+    if rc != 0:
+        err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
+        return {"error": f"Reboot failed: {err_clean.strip()}"}
+    return {"action": "reboot", "status": "initiated"}
+
+
+async def shutdown_server() -> Dict:
+    """Shut down the entire Linux server."""
+    rc, out, err = await _run_sudo(["shutdown", "-h", "now"], timeout=15)
+    if rc != 0:
+        err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
+        return {"error": f"Shutdown failed: {err_clean.strip()}"}
+    return {"action": "shutdown", "status": "initiated"}
+
+
+async def restart_nginx() -> Dict:
+    """Restart nginx specifically (common operation)."""
+    rc, out, err = await _run_sudo(["systemctl", "restart", "nginx"], timeout=30)
+    if rc != 0:
+        err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
+        return {"error": f"Nginx restart failed: {err_clean.strip()}"}
+    return {"service": "nginx", "action": "restarted"}
