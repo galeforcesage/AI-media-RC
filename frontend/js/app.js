@@ -110,11 +110,7 @@
     document.getElementById('settings-dialog').addEventListener('close', (e) => {
       if (e.target.returnValue === 'save') {
         const sys = document.getElementById('setting-default-system').value;
-        const url = document.getElementById('setting-api-url').value;
-        const sessUrl = document.getElementById('setting-session-url').value;
         State.set({ system: sys });
-        if (url) API.setBaseUrl(url);
-        if (sessUrl) API.setSessionUrl(sessUrl);
       }
     });
 
