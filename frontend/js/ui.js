@@ -50,9 +50,8 @@ const UI = (() => {
       el['np-duration'].textContent = formatTime(session.duration);
     }
 
-    // Show commercial skip for Channels DVR
-    const state = State.get();
-    el['btn-commercial-skip'].hidden = state.system !== 'channelsdvr';
+    // Show commercial skip for both SageTV (Comskip plugin) and Channels DVR
+    el['btn-commercial-skip'].hidden = false;
   }
 
   function formatTime(seconds) {

@@ -370,7 +370,7 @@ class Orchestrator:
         "set_property": "sagetv_set_media_file_property",
         "get_property": "sagetv_get_media_file_property",
         "play_pause": "sagetv_pause_playback",
-        "commercial_skip": "sagetv_skip_forward",
+        "commercial_skip": "sagetv_commercial_skip",
         "mute_toggle": "sagetv_mute",
     }
 
@@ -387,7 +387,7 @@ class Orchestrator:
         "play_pause": "channels_pause_playback",
         "skip_forward": "channels_skip_forward",
         "skip_back": "channels_skip_back",
-        "commercial_skip": "channels_skip_forward",
+        "commercial_skip": "channels_skip_commercial",
         "mute_toggle": "channels_mute",
     }
 

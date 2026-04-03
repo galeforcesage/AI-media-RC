@@ -303,6 +303,135 @@ async def sagetv_open_live_tv(client: SageXClient, args: Dict) -> Dict:
 
 
 # ==================================================================
+# COMMERCIAL SKIP TOOLS
+# ==================================================================
+
+async def sagetv_commercial_skip(client: SageXClient, args: Dict) -> Dict:
+    """Skip to the end of the current commercial break using Comskip markers."""
+    ctx = args.get("session_id", "")
+
+    # Get what's currently playing
+    media = await client.call("MediaPlayerAPI.GetCurrentMediaFile", context=ctx)
+    if not media:
+        return _fail("nothing_playing", "Nothing is currently playing")
+
+    # Get current position in ms
+    current_ms = await client.call("MediaPlayerAPI.GetMediaTime", context=ctx)
+    current_ms = int(current_ms or 0)
+
+    # Try to get the Airing to access commercial data
+    airing_id = None
+    if isinstance(media, dict):
+        airing = media.get("Airing") or media.get("airing") or {}
+        airing_id = str(airing.get("AiringID") or airing.get("airingID") or
+                        media.get("AiringID") or media.get("airingID") or "")
+
+    if not airing_id:
+        # Fallback: just skip forward 30s
+        new_pos = current_ms + 30000
+        await client.call("MediaPlayerAPI.Seek", [str(new_pos)], context=ctx)
+        return _ok(data={"position_ms": new_pos, "method": "skip_30s"},
+                   message="No commercial data available — skipped 30s")
+
+    # Get commercial break segments from the Comskip plugin
+    # SageTV stores these as segment data on the Airing
+    # Format varies: try RealStartTime-based segments first
+    try:
+        segments = await client.call("GetMediaFileMetadata", [
+            str(media.get("MediaFileID") or media.get("mediaFileID") or ""),
+            "commercial_segments"
+        ])
+    except Exception:
+        segments = None
+
+    if segments and isinstance(segments, str) and segments.strip():
+        # Parse commercial segments: format is "start1-end1;start2-end2;..." in seconds
+        try:
+            breaks = []
+            for seg in segments.split(";"):
+                seg = seg.strip()
+                if "-" in seg:
+                    parts = seg.split("-", 1)
+                    start_s = float(parts[0]) * 1000  # convert to ms
+                    end_s = float(parts[1]) * 1000
+                    breaks.append((int(start_s), int(end_s)))
+
+            # Find the commercial break we're currently in (or the next one)
+            for start_ms, end_ms in breaks:
+                if start_ms <= current_ms <= end_ms:
+                    # We're in a commercial — seek to end of it
+                    await client.call("MediaPlayerAPI.Seek", [str(end_ms)], context=ctx)
+                    skipped = (end_ms - current_ms) / 1000
+                    return _ok(data={"position_ms": end_ms, "skipped_seconds": skipped,
+                                     "method": "comskip_segment"},
+                               message=f"Skipped commercial ({skipped:.0f}s)")
+
+            # Not in a commercial — skip to end of next upcoming commercial
+            for start_ms, end_ms in breaks:
+                if start_ms > current_ms:
+                    await client.call("MediaPlayerAPI.Seek", [str(end_ms)], context=ctx)
+                    skipped = (end_ms - current_ms) / 1000
+                    return _ok(data={"position_ms": end_ms, "skipped_seconds": skipped,
+                                     "method": "comskip_next"},
+                               message=f"Jumped past next commercial ({skipped:.0f}s)")
+
+            return _ok(data={"position_ms": current_ms, "method": "no_more_commercials"},
+                       message="No more commercials in this recording")
+        except (ValueError, IndexError):
+            pass
+
+    # Fallback: try SageTV's built-in chapter skip (works when STV supports it)
+    try:
+        await client.call("SageCommand", ["NextChapter"], context=ctx)
+        new_pos = await client.call("MediaPlayerAPI.GetMediaTime", context=ctx)
+        new_pos = int(new_pos or 0)
+        if new_pos > current_ms:
+            skipped = (new_pos - current_ms) / 1000
+            return _ok(data={"position_ms": new_pos, "skipped_seconds": skipped,
+                             "method": "chapter_skip"},
+                       message=f"Skipped to next chapter ({skipped:.0f}s)")
+    except Exception:
+        pass
+
+    # Last resort: skip forward 30s
+    new_pos = current_ms + 30000
+    await client.call("MediaPlayerAPI.Seek", [str(new_pos)], context=ctx)
+    return _ok(data={"position_ms": new_pos, "method": "skip_30s"},
+               message="No commercial data — skipped 30s")
+
+
+async def sagetv_get_commercial_segments(client: SageXClient, args: Dict) -> Dict:
+    """Get commercial break segments for a recording (from Comskip plugin)."""
+    media_file_id = str(args.get("media_file_id", ""))
+    if not media_file_id:
+        return _fail("missing_media_file_id", "MediaFile ID is required")
+
+    segments_str = await client.call("GetMediaFileMetadata", [media_file_id, "commercial_segments"])
+    comskip_done = await client.call("GetMediaFileMetadata", [media_file_id, "comskip_done"])
+
+    segments = []
+    if segments_str and isinstance(segments_str, str) and segments_str.strip():
+        try:
+            for seg in segments_str.split(";"):
+                seg = seg.strip()
+                if "-" in seg:
+                    parts = seg.split("-", 1)
+                    segments.append({
+                        "start": float(parts[0]),
+                        "end": float(parts[1]),
+                    })
+        except (ValueError, IndexError):
+            pass
+
+    return _ok(data={
+        "media_file_id": media_file_id,
+        "comskip_done": comskip_done in ("true", "True", "1", True),
+        "segments": segments,
+        "segment_count": len(segments),
+    }, message=f"{len(segments)} commercial segments found")
+
+
+# ==================================================================
 # ENTITY LOOKUP TOOLS
 # ==================================================================
 
@@ -742,6 +871,22 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "input_schema": _session_id_schema(),
         "safety": Safety.SAFE,
         "handler": sagetv_open_live_tv,
+    },
+
+    # ---- Commercial Skip ----
+    "sagetv_commercial_skip": {
+        "description": "Skip the current commercial break using Comskip data. Reads commercial segment markers, finds the current or next break, and seeks past it. Falls back to chapter skip or 30s skip if no Comskip data is available.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_commercial_skip,
+    },
+    "sagetv_get_commercial_segments": {
+        "description": "Get the commercial break segments for a recording (from Comskip plugin). Returns start/end times of each commercial break.",
+        "input_schema": {"type": "object", "properties": {
+            "media_file_id": {"type": "string", "description": "The MediaFile ID"},
+        }, "required": ["media_file_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_commercial_segments,
     },
 
     # ---- Entity Lookup ----
