@@ -68,7 +68,7 @@ def _load_pipeline():
         start = time.time()
         _pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=token,
+            token=token,
         )
         logger.info("Diarization pipeline loaded in %.1fs", time.time() - start)
         return _pipeline
@@ -77,6 +77,26 @@ def _load_pipeline():
         logger.exception("Failed to load diarization pipeline. Diarization disabled.")
         _pipeline_failed = True
         return None
+
+
+def _load_audio_as_waveform(audio_path: str) -> dict:
+    """Load audio file as a waveform dict that pyannote can consume directly.
+
+    This bypasses pyannote's built-in audio loading which requires torchcodec.
+    Returns: {"waveform": Tensor(channel, time), "sample_rate": int}
+    """
+    import torch
+    import soundfile as sf
+    import numpy as np
+
+    data, sample_rate = sf.read(audio_path, dtype="float32")
+    # soundfile returns (samples,) for mono or (samples, channels) for stereo
+    if data.ndim == 1:
+        data = data[np.newaxis, :]  # (1, samples)
+    else:
+        data = data.T  # (channels, samples)
+    waveform = torch.from_numpy(data)
+    return {"waveform": waveform, "sample_rate": sample_rate}
 
 
 def diarize(audio_path: str) -> List[Dict[str, Any]]:
@@ -93,12 +113,17 @@ def diarize(audio_path: str) -> List[Dict[str, Any]]:
 
     logger.info("Running diarization on %s", audio_path)
     start = time.time()
-    diarization = pipeline(audio_path)
+    # Load audio ourselves to bypass torchcodec AudioDecoder issue
+    audio_input = _load_audio_as_waveform(audio_path)
+    result = pipeline(audio_input)
     elapsed = time.time() - start
     logger.info("Diarization complete in %.1fs", elapsed)
 
+    # Newer pyannote returns DiarizeOutput wrapper; extract Annotation
+    annotation = getattr(result, "speaker_diarization", result)
+
     turns = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
         turns.append({
             "speaker": speaker,
             "start": round(turn.start, 2),

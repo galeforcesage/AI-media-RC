@@ -66,6 +66,9 @@ class MetadataEnrichmentPipeline:
             if metadata is None:
                 metadata = {"title": recording_id}
                 logger.warning("No metadata found for %s, using recording_id as title", recording_id)
+            # Ensure title is present (required by sidecar)
+            if not metadata.get("title"):
+                metadata["title"] = recording_id
 
             # 2. Extract actors
             actors = metadata.get("actors", [])
@@ -225,10 +228,16 @@ class MetadataEnrichmentPipeline:
         """Fetch recording metadata from the appropriate MCP server via JSON-RPC."""
         if system == "sagetv":
             host, port = self._parse_addr(self.sagetv_url)
-            tool = "get_recording_metadata"
+            tool = "sagetv_get_recording"
+            # SageTV filenames: {Title}-{MediaFileID}-{Segment}.ext
+            # Extract the MediaFileID from the recording_id
+            parts = recording_id.rsplit("-", 2)
+            media_file_id = parts[-2] if len(parts) >= 3 else recording_id
+            arguments = {"media_file_id": media_file_id}
         elif system == "channelsdvr":
             host, port = self._parse_addr(self.channels_url)
-            tool = "get_recording_details"
+            tool = "channels_get_recording"
+            arguments = {"recording_id": recording_id}
         else:
             logger.error("Unknown system: %s", system)
             return None
@@ -241,7 +250,7 @@ class MetadataEnrichmentPipeline:
                 "method": "tools/call",
                 "params": {
                     "name": tool,
-                    "arguments": {"recording_id": recording_id},
+                    "arguments": arguments,
                 },
             }) + "\n"
             writer.write(request.encode())
@@ -260,13 +269,58 @@ class MetadataEnrichmentPipeline:
             # MCP tools return {content: [{type: "text", text: "..."}]}
             content = result.get("content", [])
             if content and content[0].get("type") == "text":
-                return json.loads(content[0]["text"])
+                raw = json.loads(content[0]["text"])
+                # Normalize SageTV response structure
+                if system == "sagetv":
+                    return self._normalize_sagetv_metadata(raw)
+                return raw
 
             return result
 
         except Exception:
             logger.exception("Failed to fetch metadata from %s for %s", system, recording_id)
             return None
+
+    @staticmethod
+    def _normalize_sagetv_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize SageTV API response into standard metadata dict."""
+        data = raw.get("data") or raw
+        airing = data.get("Airing") or data.get("airing") or {}
+        show = airing.get("Show") or airing.get("show") or {}
+        channel = airing.get("Channel") or airing.get("channel") or {}
+
+        # Extract cast/actors — SageTV returns them in the Show object
+        people = show.get("People") or show.get("people") or []
+        roles = show.get("Roles") or show.get("roles") or []
+        actors = []
+        for i, person in enumerate(people):
+            name = person if isinstance(person, str) else str(person)
+            role = roles[i] if i < len(roles) and roles[i] else None
+            # Use role as "character name" when it looks like a character (not "Actor"/"Host")
+            actors.append({
+                "name": name,
+                "role": role if role and role not in ("Actor", "Guest", "Host", "Narrator", "Judge") else None,
+                "billing_order": i,
+            })
+
+        return {
+            "title": show.get("Title") or show.get("title") or "",
+            "episode_title": show.get("EpisodeTitle") or show.get("episodeTitle"),
+            "season": show.get("SeasonNumber") or show.get("seasonNumber"),
+            "episode": show.get("EpisodeNumber") or show.get("episodeNumber"),
+            "genre": show.get("Category") or show.get("category") or show.get("Genre") or [],
+            "channel": channel.get("CallSign") or channel.get("callSign"),
+            "channel_number": channel.get("ChannelNumber") or channel.get("channelNumber"),
+            "air_date": airing.get("StartTime") or airing.get("startTime"),
+            "record_date": data.get("StartTime") or data.get("startTime"),
+            "duration": data.get("Duration") or data.get("duration"),
+            "file_path": data.get("SegmentFiles") or data.get("segmentFiles"),
+            "file_size": data.get("Size") or data.get("size"),
+            "description": show.get("Description") or show.get("description"),
+            "rating": show.get("Rated") or show.get("ParentalRating") or show.get("rated"),
+            "source_id": show.get("ExternalID") or show.get("externalID"),
+            "actors": actors,
+        }
 
     @staticmethod
     def _parse_addr(addr: str) -> tuple[str, int]:
