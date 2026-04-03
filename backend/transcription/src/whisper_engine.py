@@ -51,6 +51,10 @@ class WhisperEngine:
         self._compute_type = compute_type
         self._model = None
 
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
     def load(self) -> None:
         """Load the Whisper model (call once at startup)."""
         try:
@@ -121,14 +125,21 @@ class WhisperEngine:
         return full_text, segments, transcription_info
 
     def segments_to_vtt(self, segments: List[Dict]) -> str:
-        """Convert segments to WebVTT subtitle format."""
+        """Convert segments to WebVTT subtitle format with optional speaker labels."""
         lines = ["WEBVTT", ""]
+        prev_speaker = None
         for i, seg in enumerate(segments):
             start = self._format_time(seg["start"])
             end = self._format_time(seg["end"])
             lines.append(str(i + 1))
             lines.append(f"{start} --> {end}")
-            lines.append(seg["text"])
+            speaker = seg.get("speaker")
+            text = seg["text"]
+            if speaker:
+                if speaker != prev_speaker:
+                    text = f"<v {speaker}>{text}"
+                    prev_speaker = speaker
+            lines.append(text)
             lines.append("")
         return "\n".join(lines)
 

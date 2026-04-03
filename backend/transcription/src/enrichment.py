@@ -21,6 +21,7 @@ import aiohttp
 
 from .transcript_index import TranscriptIndex
 from .sidecar import TranscriptSidecar
+from . import diarization
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,16 @@ class MetadataEnrichmentPipeline:
             # 2. Extract actors
             actors = metadata.get("actors", [])
 
-            # 3. Split transcript into 30s chunks
+            # 2.5 Map anonymous speaker labels to character/role names
             segments = job.get("segments", [])
+            speaker_map = {}
+            has_speakers = any(s.get("speaker") for s in segments)
+            if has_speakers and actors:
+                speaker_map, segments = diarization.map_speakers_to_characters(
+                    segments, actors
+                )
+
+            # 3. Split transcript into 30s chunks (with speaker labels propagated)
             chunks = self.chunk_transcript(segments, window=30)
 
             # 4. Build transcript dict
@@ -82,6 +91,7 @@ class MetadataEnrichmentPipeline:
                 "confidence": job.get("confidence", 0.0),
                 "model": job.get("model", "unknown"),
                 "transcribed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "speaker_map": speaker_map if speaker_map else None,
             }
 
             # 5. Write JSON sidecar
@@ -142,8 +152,8 @@ class MetadataEnrichmentPipeline:
         """
         Group Whisper segments into windows of `window` seconds.
 
-        Each segment has: {start: float, end: float, text: str}
-        Returns: [{index, start_time, end_time, text, word_count}, ...]
+        Each segment has: {start: float, end: float, text: str, speaker?: str}
+        Returns: [{index, start_time, end_time, text, word_count, speaker}, ...]
         """
         if not segments:
             return []
@@ -153,37 +163,58 @@ class MetadataEnrichmentPipeline:
         chunk_start = 0.0
         chunk_end = float(window)
         current_texts: list[str] = []
+        current_speakers: list[str] = []
+
+        def _flush():
+            if current_texts:
+                text = " ".join(current_texts)
+                # Determine dominant speaker in this chunk
+                speaker = None
+                if current_speakers:
+                    from collections import Counter
+                    counts = Counter(s for s in current_speakers if s)
+                    if counts:
+                        speaker = counts.most_common(1)[0][0]
+                chunks.append({
+                    "index": chunk_idx,
+                    "start_time": chunk_start,
+                    "end_time": chunk_end,
+                    "text": text,
+                    "word_count": len(text.split()),
+                    "speaker": speaker,
+                })
 
         for seg in segments:
             seg_mid = (seg["start"] + seg["end"]) / 2.0
 
             # If this segment belongs to the next window
             while seg_mid >= chunk_end:
-                if current_texts:
-                    text = " ".join(current_texts)
-                    chunks.append({
-                        "index": chunk_idx,
-                        "start_time": chunk_start,
-                        "end_time": chunk_end,
-                        "text": text,
-                        "word_count": len(text.split()),
-                    })
+                _flush()
                 chunk_idx += 1
                 chunk_start = chunk_end
                 chunk_end = chunk_start + window
                 current_texts = []
+                current_speakers = []
 
             current_texts.append(seg["text"].strip())
+            current_speakers.append(seg.get("speaker"))
 
         # Flush remaining
         if current_texts:
             text = " ".join(current_texts)
+            speaker = None
+            if current_speakers:
+                from collections import Counter
+                counts = Counter(s for s in current_speakers if s)
+                if counts:
+                    speaker = counts.most_common(1)[0][0]
             chunks.append({
                 "index": chunk_idx,
                 "start_time": chunk_start,
                 "end_time": max(chunk_end, segments[-1]["end"]),
                 "text": text,
                 "word_count": len(text.split()),
+                "speaker": speaker,
             })
 
         return chunks

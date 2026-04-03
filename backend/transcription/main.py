@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
+    p.add_argument("--no-live", action="store_true", help="Disable live/incremental transcription during recording")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
@@ -110,13 +111,13 @@ async def run(args: argparse.Namespace) -> None:
         # Start watchers for each discovered directory
         for i, d in enumerate(sagetv_dirs):
             name = f"sagetv-{i}" if len(sagetv_dirs) > 1 else "sagetv"
-            watcher = FileWatcher(name, d, "sagetv", queue)
+            watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching SageTV dir: %s", d)
 
         for i, d in enumerate(channels_dirs):
             name = f"channels-{i}" if len(channels_dirs) > 1 else "channels"
-            watcher = FileWatcher(name, d, "channelsdvr", queue)
+            watcher = FileWatcher(name, d, "channelsdvr", queue, enable_live=not args.no_live)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching Channels DVR dir: %s", d)
 

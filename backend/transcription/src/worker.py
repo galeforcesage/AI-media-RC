@@ -9,6 +9,7 @@ generates metadata, and stores results.
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,7 @@ from .models import TranscriptMetadata, TranscriptionJob
 from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .whisper_engine import WhisperEngine
+from . import diarization
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +76,31 @@ class TranscriptionWorker:
     async def _process(self, job: TranscriptionJob) -> None:
         logger.info("Processing job %s: %s (%s)", job.job_id, job.recording_id, job.file_path)
 
+        # Check if this is an incremental/live transcription job
+        is_incremental = getattr(job, "_incremental", False)
+        offset = getattr(job, "_offset", 0)
+        is_final = getattr(job, "_final", False)
+        base_recording_id = getattr(job, "_base_recording_id", job.recording_id)
+
+        # For incremental jobs, compute a time offset from byte offset
+        start_seconds = None
+        if is_incremental and offset > 0:
+            try:
+                total_duration = await self.extractor.get_duration(job.file_path)
+                file_size = os.path.getsize(job.file_path)
+                if file_size > 0 and total_duration > 0:
+                    start_seconds = (offset / file_size) * total_duration
+                    logger.info("Incremental job: byte offset %d -> %.1fs of %.1fs",
+                                offset, start_seconds, total_duration)
+            except Exception:
+                logger.warning("Could not compute time offset for incremental job, extracting full")
+
         # Step 1: Extract audio
         try:
             self.queue.update_status(job.job_id, "extracting")
-            audio_path = await self.extractor.extract(job.file_path, job.recording_id)
+            audio_path = await self.extractor.extract(
+                job.file_path, job.recording_id, start_seconds=start_seconds,
+            )
             self.queue.update_status(job.job_id, "processing", temp_audio_path=audio_path)
         except Exception as e:
             logger.error("Extraction failed for %s: %s", job.job_id, e)
@@ -97,14 +120,40 @@ class TranscriptionWorker:
             self.extractor.cleanup(audio_path)
             return
 
+        # For incremental jobs, shift segment timestamps to absolute time
+        if is_incremental and start_seconds and start_seconds > 0:
+            for seg in segments:
+                seg["start"] = round(seg["start"] + start_seconds, 2)
+                seg["end"] = round(seg["end"] + start_seconds, 2)
+
+        # Step 2.5: Speaker diarization (optional — runs if pyannote is available)
+        # Skip diarization for non-final incremental jobs (will run on complete file)
+        diarization_turns = []
+        if diarization.is_available() and not (is_incremental and not is_final):
+            try:
+                diarization_turns = await loop.run_in_executor(
+                    None, diarization.diarize, audio_path
+                )
+                if diarization_turns:
+                    # For final incremental, shift diarization timestamps too
+                    if is_incremental and is_final and start_seconds and start_seconds > 0:
+                        for turn in diarization_turns:
+                            turn["start"] = round(turn["start"] + start_seconds, 2)
+                            turn["end"] = round(turn["end"] + start_seconds, 2)
+                    diarization.align_speakers_to_segments(segments, diarization_turns)
+                    logger.info("Speaker labels assigned to %d segments", len(segments))
+            except Exception:
+                logger.exception("Diarization failed for %s (non-blocking, continuing without speakers)", job.job_id)
+
         # Step 3: Generate VTT
         vtt = self.engine.segments_to_vtt(segments)
 
         # Step 4: Build metadata
+        store_id = base_recording_id if is_incremental else job.recording_id
         meta = TranscriptMetadata(
-            recording_id=job.recording_id,
+            recording_id=store_id,
             system=job.system,
-            title=job.recording_id,  # Will be enriched later via MCP
+            title=store_id,  # Will be enriched later via MCP
             duration=info.get("duration", 0),
             word_count=len(full_text.split()),
             transcript=full_text,
@@ -112,16 +161,17 @@ class TranscriptionWorker:
             vtt=vtt,
         )
 
-        # Step 5: Store
+        # Step 5: Store (append for incremental, overwrite otherwise)
         self.store.save(meta)
 
-        # Step 6: Enrich (populate transcript index with chunks, actors, metadata)
-        if self.enrichment:
+        # Step 6: Enrich (only for complete or final incremental jobs)
+        if self.enrichment and not (is_incremental and not is_final):
             try:
                 await self.enrichment.enrich({
-                    "recording_id": job.recording_id,
+                    "recording_id": store_id,
                     "system": job.system,
-                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", "")} for s in segments],
+                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in segments],
+                    "diarization_turns": diarization_turns,
                     "transcript_text": full_text,
                     "word_count": len(full_text.split()),
                     "language": info.get("language", "en"),
