@@ -2,8 +2,9 @@
  * api.js — HTTP client for the orchestrator and session manager.
  */
 const API = (() => {
-  let baseUrl = localStorage.getItem('api_url') || 'http://127.0.0.1:8000';
-  let sessionUrl = localStorage.getItem('session_url') || 'http://127.0.0.1:8769';
+  const hostOrigin = window.location.hostname || '127.0.0.1';
+  let baseUrl = localStorage.getItem('api_url') || `http://${hostOrigin}:8000`;
+  let sessionUrl = localStorage.getItem('session_url') || `http://${hostOrigin}:8769`;
 
   function setBaseUrl(url) { baseUrl = url; localStorage.setItem('api_url', url); }
   function setSessionUrl(url) { sessionUrl = url; localStorage.setItem('session_url', url); }
@@ -87,11 +88,15 @@ const API = (() => {
     return request(`${sessionUrl}/sessions`);
   }
 
+  async function whoami() {
+    return request(`${sessionUrl}/whoami`);
+  }
+
   return {
     setBaseUrl, setSessionUrl,
     query, playback, search, playTitle, system, health,
     listDevices, addDevice, deleteDevice, setDefaultDevice,
-    resolveSession, listSessions,
+    resolveSession, listSessions, whoami,
     get baseUrl() { return baseUrl; },
     get sessionUrl() { return sessionUrl; },
   };

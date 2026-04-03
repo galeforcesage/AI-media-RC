@@ -101,7 +101,10 @@
       <fieldset>
         <legend>Orchestrator</legend>
         <label>API URL:
-          <input type="text" id="setting-api-url" value="http://127.0.0.1:8000">
+          <input type="text" id="setting-api-url" placeholder="http://10.0.0.10:8000">
+        </label>
+        <label>Session Manager URL:
+          <input type="text" id="setting-session-url" placeholder="http://10.0.0.10:8769">
         </label>
       </fieldset>
       <div class="dialog-actions">
@@ -138,6 +141,43 @@
     <div class="dialog-actions">
       <button id="btn-close-admin">Close</button>
     </div>
+  </dialog>
+
+  <!-- Add Device Dialog -->
+  <dialog id="add-device-dialog">
+    <h2>Add Device</h2>
+    <form id="add-device-form" method="dialog">
+      <fieldset>
+        <label>Friendly Name:
+          <input type="text" id="device-name" required placeholder="e.g. Living Room Shield">
+        </label>
+        <label>System:
+          <select id="device-system">
+            <option value="sagetv">SageTV</option>
+            <option value="channelsdvr">Channels DVR</option>
+          </select>
+        </label>
+        <label>IP Address:
+          <input type="text" id="device-ip" placeholder="detecting...">
+        </label>
+        <label>Platform:
+          <select id="device-platform">
+            <option value="shield">NVIDIA Shield</option>
+            <option value="androidtv">Android TV</option>
+            <option value="chromecast">Chromecast</option>
+            <option value="miniclient">SageTV Mini Client</option>
+            <option value="browser">Web Browser</option>
+            <option value="pc">PC</option>
+            <option value="pi">Raspberry Pi</option>
+            <option value="unknown">Other</option>
+          </select>
+        </label>
+      </fieldset>
+      <div class="dialog-actions">
+        <button type="submit" value="save">Add</button>
+        <button type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
   </dialog>
 
   <script src="js/api.js"></script>

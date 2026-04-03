@@ -128,7 +128,7 @@ const UI = (() => {
     devices.forEach(d => {
       const opt = document.createElement('option');
       opt.value = d.device_id;
-      opt.textContent = d.name || d.device_id;
+      opt.textContent = d.friendly_name || d.device_id;
       if (d.device_id === selectedId) opt.selected = true;
       picker.appendChild(opt);
     });
@@ -166,9 +166,9 @@ const UI = (() => {
     devices.forEach(d => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${esc(d.name || d.device_id)}</td>
-        <td>${esc(d.type || '-')}</td>
-        <td>${esc(d.client_id || '-')}</td>
+        <td>${esc(d.friendly_name || d.device_id)}</td>
+        <td>${esc(d.platform || '-')}</td>
+        <td>${esc(d.system || '-')}</td>
         <td>${d.is_default ? '★' : ''}</td>
         <td>
           <button class="btn-tiny btn-danger" data-action="delete-device" data-id="${esc(d.device_id)}">✕</button>

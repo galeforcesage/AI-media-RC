@@ -111,8 +111,10 @@
       if (e.target.returnValue === 'save') {
         const sys = document.getElementById('setting-default-system').value;
         const url = document.getElementById('setting-api-url').value;
+        const sessUrl = document.getElementById('setting-session-url').value;
         State.set({ system: sys });
         if (url) API.setBaseUrl(url);
+        if (sessUrl) API.setSessionUrl(sessUrl);
       }
     });
 
@@ -143,11 +145,34 @@
       }
     });
 
-    // Add device
+    // Add device — open dialog with auto-detected IP
     document.getElementById('btn-add-device').addEventListener('click', async () => {
-      const name = prompt('Device name:');
+      const dlg = document.getElementById('add-device-dialog');
+      // Auto-detect client IP
+      try {
+        const info = await API.whoami();
+        if (info.ip) document.getElementById('device-ip').value = info.ip;
+      } catch (_) { /* leave blank */ }
+      dlg.showModal();
+    });
+
+    document.getElementById('add-device-form').addEventListener('close', async function () {
+      const dlg = document.getElementById('add-device-dialog');
+      if (dlg.returnValue !== 'save') return;
+    });
+
+    document.getElementById('add-device-form').addEventListener('submit', async function (e) {
+      const dlg = document.getElementById('add-device-dialog');
+      if (e.submitter && e.submitter.value === 'cancel') return;
+      const name = document.getElementById('device-name').value.trim();
       if (!name) return;
-      await API.addDevice({ name, type: 'web', client_id: State.get().system });
+      await API.addDevice({
+        friendly_name: name,
+        system: document.getElementById('device-system').value,
+        ip_address: document.getElementById('device-ip').value.trim(),
+        platform: document.getElementById('device-platform').value,
+      });
+      document.getElementById('device-name').value = '';
       UI.refreshAdminDevices();
       State.refreshDevices();
     });

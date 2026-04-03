@@ -22,6 +22,7 @@ from typing import Any, Dict
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from utils.config import load_config
 from utils.logger import get_logger
@@ -111,6 +112,13 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         title="LLM Remote Orchestrator",
         description="Unified control API for SageTV + ChannelsDVR + local AI",
         version="0.2.0",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     init_http_transport(orchestrator)

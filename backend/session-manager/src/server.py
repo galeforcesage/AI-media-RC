@@ -41,6 +41,21 @@ def create_app(config: Dict[str, Any]) -> web.Application:
     api = SessionManagerAPI(registry, resolver)
 
     # ------------------------------------------------------------------
+    # CORS middleware
+    # ------------------------------------------------------------------
+
+    @web.middleware
+    async def cors_middleware(request: web.Request, handler):
+        if request.method == "OPTIONS":
+            resp = web.Response(status=204)
+        else:
+            resp = await handler(request)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    # ------------------------------------------------------------------
     # Route wrappers
     # ------------------------------------------------------------------
 
@@ -65,11 +80,23 @@ def create_app(config: Dict[str, Any]) -> web.Application:
         return wrapped
 
     # ------------------------------------------------------------------
+    # Whoami — returns the client's IP as seen by the server
+    # ------------------------------------------------------------------
+
+    async def whoami(request: web.Request) -> web.Response:
+        remote = request.remote or ""
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        client_ip = forwarded.split(",")[0].strip() if forwarded else remote
+        return web.json_response({"ip": client_ip})
+
+    # ------------------------------------------------------------------
     # Routes
     # ------------------------------------------------------------------
 
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_route("OPTIONS", "/{path_info:.*}", lambda r: web.Response(status=204))
     app.router.add_get("/health", route(api.health))
+    app.router.add_get("/whoami", whoami)
 
     # Device management
     app.router.add_get("/devices", route(api.list_devices))
