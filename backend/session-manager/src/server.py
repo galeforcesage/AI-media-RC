@@ -118,6 +118,7 @@ def create_app(config: Dict[str, Any]) -> web.Application:
         except (json.JSONDecodeError, Exception):
             body = {}
         password = body.get("password", "")
+        logger.debug("Login attempt, password length=%d", len(password))
         if not auth.verify_app_password(password):
             return web.json_response(
                 {"success": False, "error": "invalid_password"},
