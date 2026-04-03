@@ -111,6 +111,7 @@
     <h2>Admin Panel</h2>
     <div class="admin-tabs">
       <button class="tab active" data-tab="devices">Devices</button>
+      <button class="tab" data-tab="services">Services</button>
       <button class="tab" data-tab="system">System</button>
       <button class="tab" data-tab="transcription">Transcription</button>
     </div>
@@ -119,9 +120,14 @@
         <div id="device-list"></div>
         <button id="btn-add-device" class="btn-small">+ Add Device</button>
       </div>
+      <div id="tab-services" class="tab-panel">
+        <div class="services-header">
+          <span class="services-title">AI Media RC Services</span>
+          <button id="btn-refresh-services" class="btn-tiny" title="Refresh">↻</button>
+        </div>
+        <div id="service-grid" class="service-grid"></div>
+      </div>
       <div id="tab-system" class="tab-panel">
-        <button id="btn-restart-sagetv" class="btn-small btn-danger">Restart SageTV</button>
-        <button id="btn-restart-channels" class="btn-small btn-danger">Restart Channels DVR</button>
         <button id="btn-docker-status" class="btn-small">Docker Status</button>
         <div id="system-output"></div>
       </div>
@@ -139,6 +145,7 @@
   <dialog id="sudo-dialog">
     <h2>Admin Login</h2>
     <p id="sudo-prompt-text">This action requires admin authentication.</p>
+    <p id="sudo-error" style="color:var(--danger);font-size:0.85rem;display:none;"></p>
     <form id="sudo-form" method="dialog">
       <label>Username:
         <input type="text" id="admin-username" required autocomplete="username" value="admin">

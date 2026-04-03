@@ -25,6 +25,19 @@ logger = logging.getLogger(__name__)
 ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "nextcloud-redis"}
 ALLOWED_SERVICES = {"sagetv", "channels-dvr", "docker"}
 
+# AI-media-RC component processes (not systemd) — keyed by service_id
+_RC_HOME = os.path.expanduser("~/AI-media-RC/backend")
+_RC_SERVICES: Dict[str, Dict[str, Any]] = {
+    "mcp-sagetv":      {"port": 8766, "cwd": f"{_RC_HOME}/mcp-sagetv",      "cmd": ".venv/bin/python main.py"},
+    "mcp-channels":    {"port": 8767, "cwd": f"{_RC_HOME}/mcp-channels",    "cmd": ".venv/bin/python main.py"},
+    "mcp-linux":       {"port": 8768, "cwd": f"{_RC_HOME}/mcp-linux",       "cmd": ".venv/bin/python main.py"},
+    "session-manager": {"port": 8769, "cwd": f"{_RC_HOME}/session-manager", "cmd": ".venv/bin/python main.py"},
+    "transcription":   {"port": 8770, "cwd": f"{_RC_HOME}/transcription",   "cmd": ".venv/bin/python main.py"},
+    "orchestrator":    {"port": 8000, "cwd": f"{_RC_HOME}/orchestrator",
+                        "cmd": ".venv/bin/python src/main.py --debug",
+                        "env": {"PYTHONPATH": "."}},
+}
+
 
 class SystemService:
     """System-level commands and diagnostics."""
@@ -233,3 +246,37 @@ class SystemService:
         if rc != 0:
             return {"error": f"Restart failed (rc={rc}): {err.strip()}"}
         return {"status": "ok", "action": "restart_service", "service": service}
+
+    async def _cmd_restart_rc_service(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Restart an AI-media-RC component process (kill by port + relaunch)."""
+        service = payload.get("service", "")
+        if service not in _RC_SERVICES:
+            return {"error": f"Unknown RC service '{service}'",
+                    "allowed": sorted(_RC_SERVICES.keys())}
+
+        spec = _RC_SERVICES[service]
+        port = spec["port"]
+
+        # 1. Kill existing process on the port
+        rc, _, err = await self._run(["fuser", "-k", f"{port}/tcp"], timeout=5)
+        if rc not in (0, 1):
+            logger.warning("fuser -k %s/tcp returned rc=%d: %s", port, rc, err.strip())
+
+        # Give the process a moment to die
+        await asyncio.sleep(1)
+
+        # 2. Re-launch with nohup
+        env_vars = spec.get("env", {})
+        env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
+        shell_cmd = f"cd {spec['cwd']} && {env_prefix + ' ' if env_prefix else ''}nohup {spec['cmd']} > /tmp/{service}.log 2>&1 &"
+        rc, out, err = await self._run(["bash", "-c", shell_cmd], timeout=10)
+        if rc != 0:
+            return {"error": f"Failed to start {service}: {err.strip()}"}
+
+        # 3. Verify it came back up
+        await asyncio.sleep(2)
+        rc_check, _, _ = await self._run(["fuser", f"{port}/tcp"], timeout=3)
+        if rc_check != 0:
+            return {"error": f"{service} started but not listening on port {port}"}
+
+        return {"status": "ok", "action": "restart_rc_service", "service": service, "port": port}

@@ -12,6 +12,7 @@ Responsibilities:
 from __future__ import annotations
 import asyncio
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from utils.logger import get_logger
@@ -336,13 +337,70 @@ class Orchestrator:
             return {"error": str(exc)}
 
     async def run_system(self, action: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        """Execute a system command via MCP Linux."""
+        """Execute a system command via MCP Linux (or locally for RC services)."""
         logger.info("run_system: %s", action)
         try:
+            if action == "restart_rc_service":
+                return await self._restart_rc_service(payload or {})
             return await self._execute_linux(action, payload or {})
         except Exception as exc:
             logger.exception("run_system failed")
             return {"error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # AI-media-RC service restart (local, not routed through MCP)
+    # ------------------------------------------------------------------
+
+    _RC_HOME = os.path.expanduser("~/AI-media-RC/backend")
+    _RC_SERVICES = {
+        "mcp-sagetv":      {"port": 8766, "cwd": f"{_RC_HOME}/mcp-sagetv",      "cmd": ".venv/bin/python main.py"},
+        "mcp-channels":    {"port": 8767, "cwd": f"{_RC_HOME}/mcp-channels",    "cmd": ".venv/bin/python main.py"},
+        "mcp-linux":       {"port": 8768, "cwd": f"{_RC_HOME}/mcp-linux",       "cmd": ".venv/bin/python main.py"},
+        "session-manager": {"port": 8769, "cwd": f"{_RC_HOME}/session-manager", "cmd": ".venv/bin/python main.py"},
+        "transcription":   {"port": 8770, "cwd": f"{_RC_HOME}/transcription",   "cmd": ".venv/bin/python main.py"},
+    }
+
+    async def _restart_rc_service(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Kill an AI-media-RC process by port and relaunch it."""
+        service = payload.get("service", "")
+        if service not in self._RC_SERVICES:
+            return {"error": f"Unknown RC service '{service}'",
+                    "allowed": sorted(self._RC_SERVICES.keys())}
+        spec = self._RC_SERVICES[service]
+        port = spec["port"]
+
+        # 1. Kill existing process
+        proc = await asyncio.create_subprocess_exec(
+            "fuser", "-k", f"{port}/tcp",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        await asyncio.sleep(1)
+
+        # 2. Relaunch — fully detach from this process
+        shell_cmd = (
+            f"cd {spec['cwd']} && "
+            f"nohup {spec['cmd']} > /tmp/{service}.log 2>&1 </dev/null &"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", shell_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=5)
+
+        # 3. Verify
+        await asyncio.sleep(2)
+        check = await asyncio.create_subprocess_exec(
+            "fuser", f"{port}/tcp",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await check.communicate()
+        if check.returncode != 0:
+            return {"error": f"{service} started but not listening on port {port}"}
+
+        return {"status": "ok", "service": service, "port": port}
 
     # ------------------------------------------------------------------
     # Backend execution via MCP

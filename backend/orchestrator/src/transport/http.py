@@ -181,3 +181,72 @@ async def system(request: SystemRequest):
 async def health():
     """Basic health check."""
     return {"status": "ok"}
+
+
+@router.get("/services")
+async def services():
+    """
+    Health-check all AI-media-RC services.
+    Returns a dict of service_id → { name, port, status, latency_ms }.
+    """
+    import aiohttp
+    import time
+
+    checks = {
+        "orchestrator": {"name": "Orchestrator", "port": 8000, "url": "http://127.0.0.1:8000/api/health"},
+        "mcp_sagetv":   {"name": "MCP SageTV",   "port": 8766, "url": None},
+        "mcp_channels": {"name": "MCP Channels",  "port": 8767, "url": None},
+        "mcp_linux":    {"name": "MCP Linux",     "port": 8768, "url": None},
+        "session_mgr":  {"name": "Session Manager","port": 8769, "url": "http://127.0.0.1:8769/health"},
+        "transcription":{"name": "Transcription",  "port": 8770, "url": None},
+    }
+
+    results = {}
+    timeout = aiohttp.ClientTimeout(total=3)
+
+    async def check_http(sid, info):
+        t0 = time.monotonic()
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(info["url"]) as resp:
+                    ms = round((time.monotonic() - t0) * 1000)
+                    results[sid] = {
+                        "name": info["name"],
+                        "port": info["port"],
+                        "status": "up" if resp.status == 200 else "degraded",
+                        "latency_ms": ms,
+                    }
+        except Exception:
+            ms = round((time.monotonic() - t0) * 1000)
+            results[sid] = {"name": info["name"], "port": info["port"], "status": "down", "latency_ms": ms}
+
+    async def check_tcp(sid, info):
+        """TCP connect check for MCP servers (JSON-RPC, no HTTP health route)."""
+        import asyncio
+        t0 = time.monotonic()
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", info["port"]), timeout=2
+            )
+            writer.close()
+            await writer.wait_closed()
+            ms = round((time.monotonic() - t0) * 1000)
+            results[sid] = {"name": info["name"], "port": info["port"], "status": "up", "latency_ms": ms}
+        except Exception:
+            ms = round((time.monotonic() - t0) * 1000)
+            results[sid] = {"name": info["name"], "port": info["port"], "status": "down", "latency_ms": ms}
+
+    import asyncio
+    tasks = []
+    for sid, info in checks.items():
+        if sid == "orchestrator":
+            # We're obviously up if serving this request
+            results[sid] = {"name": info["name"], "port": info["port"], "status": "up", "latency_ms": 0}
+            continue
+        if info["url"]:
+            tasks.append(check_http(sid, info))
+        else:
+            tasks.append(check_tcp(sid, info))
+
+    await asyncio.gather(*tasks)
+    return {"services": results}

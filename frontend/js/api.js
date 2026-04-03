@@ -32,7 +32,13 @@ const API = (() => {
   }
 
   async function adminLogin(username, password) {
-    return request(`${sessionUrl}/auth/admin/login`, 'POST', { username, password });
+    const resp = await fetch(`${sessionUrl}/auth/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ username, password }),
+    });
+    return resp.json();
   }
 
   async function adminCheck() {
@@ -90,6 +96,10 @@ const API = (() => {
     return request(`${baseUrl}/api/health`);
   }
 
+  async function services() {
+    return request(`${baseUrl}/api/services`);
+  }
+
   // Session Manager endpoints
   async function listDevices() {
     return request(`${sessionUrl}/devices`);
@@ -122,7 +132,7 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, playback, search, playTitle, system, health,
+    query, playback, search, playTitle, system, health, services,
     listDevices, addDevice, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,

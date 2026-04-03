@@ -46,17 +46,20 @@
     const check = await API.adminCheck();
     if (check.authenticated) return true;
 
-    // Show admin login dialog
+    // Show admin login dialog — retries on wrong password
     return new Promise((resolve) => {
       const dlg = document.getElementById('sudo-dialog');
       const pwdInput = document.getElementById('sudo-password');
       const userInput = document.getElementById('admin-username');
+      const errMsg = document.getElementById('sudo-error');
       document.getElementById('sudo-prompt-text').textContent =
         `"${actionLabel}" requires admin authentication.`;
-      if (userInput) userInput.value = '';
+      errMsg.style.display = 'none';
+      errMsg.textContent = '';
       pwdInput.value = '';
       dlg.showModal();
-      dlg.addEventListener('close', async function handler() {
+
+      async function handler() {
         dlg.removeEventListener('close', handler);
         if (dlg.returnValue === 'ok') {
           const username = userInput ? userInput.value.trim() : 'admin';
@@ -65,20 +68,28 @@
           try {
             const result = await API.adminLogin(username, password);
             if (result.success) {
+              errMsg.style.display = 'none';
               resolve(true);
-            } else {
-              UI.renderSystemOutput('Admin login failed.');
-              resolve(false);
+              return;
             }
+            // Wrong credentials — show error and re-open
+            errMsg.textContent = result.error || 'Invalid credentials. Try admin / admin.';
+            errMsg.style.display = 'block';
+            dlg.addEventListener('close', handler);
+            dlg.showModal();
           } catch (err) {
-            UI.renderSystemOutput('Admin login error: ' + err.message);
-            resolve(false);
+            errMsg.textContent = 'Login error: ' + err.message;
+            errMsg.style.display = 'block';
+            dlg.addEventListener('close', handler);
+            dlg.showModal();
           }
         } else {
           pwdInput.value = '';
+          errMsg.style.display = 'none';
           resolve(false);
         }
-      });
+      }
+      dlg.addEventListener('close', handler);
     });
   }
 
@@ -183,6 +194,7 @@
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        if (tab.dataset.tab === 'services') refreshServices();
       });
     });
 
@@ -244,26 +256,73 @@
         UI.renderSystemOutput('Error: ' + e.message);
       }
     });
-    document.getElementById('btn-restart-sagetv').addEventListener('click', async () => {
-      if (!confirm('Restart SageTV container?')) return;
-      if (!await ensureAdmin('Restart SageTV container')) return;
+
+    // Service grid: refresh button
+    document.getElementById('btn-refresh-services').addEventListener('click', refreshServices);
+
+    // Auto-refresh services when admin dialog opens
+    document.getElementById('admin-dialog').addEventListener('admin-opened', refreshServices);
+
+    // Service grid: restart delegation
+    document.getElementById('service-grid').addEventListener('click', async (e) => {
+      const btn = e.target.closest('.btn-restart[data-service-id]');
+      if (!btn) return;
+      const svcId = btn.dataset.serviceId;
+      const label = `Restart ${svcId}`;
+      if (!confirm(`${label}?`)) return;
+      if (!await ensureAdmin(label)) return;
+
+      btn.disabled = true;
+      btn.textContent = '⟳ …';
       try {
-        const data = await API.system('restart_container', { container: 'sagetv-server' });
-        UI.renderSystemOutput(JSON.stringify(data, null, 2));
-      } catch (e) {
-        UI.renderSystemOutput('Error: ' + e.message);
+        const restartMap = {
+          orchestrator:   { action: 'restart_rc_service', params: { service: 'orchestrator' } },
+          mcp_sagetv:     { action: 'restart_rc_service', params: { service: 'mcp-sagetv' } },
+          mcp_channels:   { action: 'restart_rc_service', params: { service: 'mcp-channels' } },
+          mcp_linux:      { action: 'restart_rc_service', params: { service: 'mcp-linux' } },
+          session_mgr:    { action: 'restart_rc_service', params: { service: 'session-manager' } },
+          transcription:  { action: 'restart_rc_service', params: { service: 'transcription' } },
+        };
+        const spec = restartMap[svcId];
+        if (!spec) throw new Error('Unknown service: ' + svcId);
+        const data = await API.system(spec.action, spec.params);
+        if (data.error) {
+          showServiceMessage(data.error, true);
+        } else {
+          showServiceMessage(`${svcId} restarted successfully`);
+        }
+        // Refresh grid after a short delay to let service come back
+        setTimeout(refreshServices, 3000);
+      } catch (err) {
+        showServiceMessage('Error: ' + err.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '↻ Restart';
       }
     });
-    document.getElementById('btn-restart-channels').addEventListener('click', async () => {
-      if (!confirm('Restart Channels DVR service?')) return;
-      if (!await ensureAdmin('Restart Channels DVR service')) return;
-      try {
-        const data = await API.system('restart_service', { service: 'channels-dvr' });
-        UI.renderSystemOutput(JSON.stringify(data, null, 2));
-      } catch (e) {
-        UI.renderSystemOutput('Error: ' + e.message);
-      }
-    });
+  }
+
+  async function refreshServices() {
+    try {
+      const data = await API.services();
+      if (data.services) UI.renderServiceGrid(data.services);
+    } catch (e) {
+      console.error('Failed to refresh services:', e);
+    }
+  }
+
+  function showServiceMessage(text, isError = false) {
+    const grid = document.getElementById('service-grid');
+    let msg = grid.parentElement.querySelector('.svc-message');
+    if (!msg) {
+      msg = document.createElement('p');
+      msg.className = 'svc-message';
+      grid.parentElement.insertBefore(msg, grid);
+    }
+    msg.textContent = text;
+    msg.style.color = isError ? 'var(--danger)' : '#66bb6a';
+    msg.style.display = 'block';
+    setTimeout(() => { msg.style.display = 'none'; }, 6000);
   }
 
   // ─── Send Helpers ─────────────────────────────────────────
