@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="64" fill="#121212"/>
+  <rect x="40" y="40" width="432" height="432" rx="48" fill="#1e1e1e"/>
+  <!-- Play triangle -->
+  <polygon points="180,140 370,256 180,372" fill="#4fc3f7"/>
+  <!-- AI circuit dots -->
+  <circle cx="130" cy="420" r="14" fill="#4fc3f7" opacity="0.5"/>
+  <circle cx="170" cy="440" r="10" fill="#4fc3f7" opacity="0.4"/>
+  <circle cx="382" cy="420" r="14" fill="#4fc3f7" opacity="0.5"/>
+  <circle cx="342" cy="440" r="10" fill="#4fc3f7" opacity="0.4"/>
+  <!-- Chat bubble hint -->
+  <path d="M340,100 h80 a20,20 0 0,1 20,20 v50 a20,20 0 0,1 -20,20 h-50 l-20,20 v-20 h-10 a20,20 0 0,1 -20,-20 v-50 a20,20 0 0,1 20,-20 z" fill="#4fc3f7" opacity="0.6"/>
+  <circle cx="355" cy="145" r="6" fill="#121212"/>
+  <circle cx="380" cy="145" r="6" fill="#121212"/>
+  <circle cx="405" cy="145" r="6" fill="#121212"/>
+</svg>

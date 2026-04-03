@@ -146,8 +146,12 @@ async def _search_epg(client, args: Dict) -> Dict:
 
 async def _get_storage_status(client, args: Dict) -> Dict:
     dvr = await client.dvr_info()
-    disk = dvr.get("disk", {})
-    return _ok(data=disk, message="Storage status retrieved")
+    return _ok(data={
+        "path": dvr.get("path", ""),
+        "extra_paths": dvr.get("extra_paths", []),
+        "disk": dvr.get("disk", {}),
+        "stats": dvr.get("stats", {}),
+    }, message="Storage status retrieved")
 
 
 async def _get_jobs(client, args: Dict) -> Dict:

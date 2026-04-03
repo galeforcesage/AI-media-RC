@@ -3,7 +3,9 @@
     "mcp_port": 8765,
     "debug": false,
     "llm": {
-        "model_path": "models/llm"
+        "model_path": "models/llm",
+        "base_url": "http://127.0.0.1:11434",
+        "model": "mistral:instruct"
     },
     "whisper": {
         "model_path": "models/whisper",

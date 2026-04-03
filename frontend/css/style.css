@@ -115,17 +115,22 @@ body {
   max-height: 300px;
   padding: 0.5rem 0;
 }
-.msg {
+.msg, .message {
   margin-bottom: 0.5rem;
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius);
   max-width: 85%;
   font-size: 0.9rem;
   line-height: 1.4;
+  word-wrap: break-word;
+  white-space: pre-wrap;
 }
-.msg.user { background: var(--primary-dark); margin-left: auto; }
-.msg.assistant { background: var(--surface2); }
-.msg.error { background: #4a1c1c; border: 1px solid var(--danger); }
+.msg.user, .message.user { background: var(--primary-dark); margin-left: auto; }
+.msg.assistant, .message.assistant { background: var(--surface2); }
+.msg.error, .message.error { background: #4a1c1c; border: 1px solid var(--danger); }
+.message.thinking { background: var(--surface2); color: var(--text-muted); font-style: italic; }
+.message.thinking::after { content: ''; animation: dots 1.5s steps(4,end) infinite; }
+@keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
 .msg .confirm-btns { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .msg .confirm-btns button {
   padding: 0.3rem 1rem;

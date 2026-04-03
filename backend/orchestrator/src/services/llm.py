@@ -1,46 +1,76 @@
 """
 llm.py
-Local LLM orchestration service.
-Handles model loading, prompt routing, model selection, and local inference.
-Streams tokens back via an async generator when streaming is requested.
+LLM service backed by Ollama (local inference via HTTP API).
 """
 
 from __future__ import annotations
 import asyncio
+import json
 import logging
 from typing import Any, AsyncIterator, Dict, Optional
 
-logger = logging.getLogger(__name__)
+import aiohttp
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+SYSTEM_PROMPT = """You are the AI Media Remote Control assistant. You help users manage their home media systems including SageTV DVR and Channels DVR.
+
+You can answer questions about:
+- Recorded shows, upcoming recordings, and program schedules
+- Playback control (play, pause, stop, skip, seek, volume)
+- System status, disk usage, and service health
+- Transcript search across recorded content
+
+When the user asks about recorded content, use the transcript excerpts provided in the context to give accurate, specific answers. Quote relevant timestamps and episode details when available.
+
+Keep responses concise and conversational. If you don't have enough information, say so clearly."""
 
 
 class LLMService:
-    """Local LLM inference service supporting load/unload lifecycle and generation."""
+    """LLM inference via Ollama HTTP API."""
 
-    def __init__(self, model_path: str = "models/llm") -> None:
+    def __init__(
+        self,
+        model_path: str = "models/llm",
+        base_url: str = "http://127.0.0.1:11434",
+        model: str = "mistral:instruct",
+    ) -> None:
         self.model_path = model_path
+        self.base_url = base_url.rstrip("/")
+        self.model = model
         self.loaded = False
-        self._model: Any = None
         self._lock = asyncio.Lock()
 
     async def load(self) -> None:
-        """Load the LLM model into memory."""
+        """Verify Ollama is reachable and the model is available."""
         async with self._lock:
             if self.loaded:
-                logger.info("LLM model already loaded from %s", self.model_path)
                 return
-            logger.info("Loading LLM model from %s …", self.model_path)
-            # Replace with actual model loading (llama-cpp-python, ctransformers, etc.)
-            await asyncio.sleep(0)  # yield to event loop
-            self._model = object()  # sentinel for loaded state
-            self.loaded = True
-            logger.info("LLM model loaded successfully")
+            logger.info("Connecting to Ollama at %s, model=%s", self.base_url, self.model)
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(f"{self.base_url}/api/tags") as resp:
+                        if resp.status != 200:
+                            logger.error("Ollama not reachable: HTTP %d", resp.status)
+                            return
+                        data = await resp.json()
+                        models = [m["name"] for m in data.get("models", [])]
+                        if self.model not in models:
+                            logger.warning("Model %s not found. Available: %s", self.model, models)
+                        else:
+                            logger.info("Model %s available", self.model)
+                self.loaded = True
+                logger.info("LLM service ready (Ollama)")
+            except Exception as exc:
+                logger.error("Failed to connect to Ollama: %s", exc)
 
     async def unload(self) -> None:
-        """Release the LLM model from memory."""
-        async with self._lock:
-            self._model = None
-            self.loaded = False
-            logger.info("LLM model unloaded")
+        """Mark service as unloaded."""
+        self.loaded = False
+        logger.info("LLM service unloaded")
 
     async def generate(
         self,
@@ -49,33 +79,103 @@ class LLMService:
         metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
-        Run a single-shot generation.
-
-        Args:
-            prompt: The text prompt.
-            params: Generation parameters (max_tokens, temperature, etc.).
-            metadata: Optional metadata for model selection or tagging.
+        Generate a response via Ollama.
 
         Returns:
-            Dict with status, prompt, response, and optional metadata.
+            Dict with status, prompt, response, and model.
         """
-        if not self.loaded:
-            logger.error("Generate called but LLM is not loaded")
-            return {"error": "LLM not loaded"}
-
         logger.info("LLM generating response (prompt length=%d)", len(prompt))
         try:
-            # Replace with actual inference call
-            await asyncio.sleep(0)  # yield
-            response_text = f"[LLM response to: {prompt[:80]}]"
+            payload = {
+                "model": self.model,
+                "system": SYSTEM_PROMPT,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 512,
+                },
+            }
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/generate", json=payload
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Ollama error %d: %s", resp.status, body[:200])
+                        return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
+                    data = await resp.json()
+
+            response_text = data.get("response", "").strip()
+            logger.info("LLM response (%d chars): %s", len(response_text), response_text[:100])
             return {
                 "status": "ok",
                 "prompt": prompt,
                 "response": response_text,
-                "model": self.model_path,
+                "model": self.model,
             }
+        except asyncio.TimeoutError:
+            logger.error("LLM generation timed out")
+            return {"error": "LLM generation timed out (120s)"}
         except Exception as exc:
             logger.exception("LLM generation error")
+            return {"error": str(exc)}
+
+    async def generate_chat(
+        self,
+        messages: list[Dict[str, Any]],
+        params: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Multi-turn chat via Ollama /api/chat.
+
+        Args:
+            messages: List of {"role": "system"|"user"|"assistant", "content": "..."}.
+            params: Optional override parameters.
+
+        Returns:
+            Dict with status, response, and model.
+        """
+        logger.info("LLM chat generation (%d messages)", len(messages))
+        try:
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 1024,
+                    "num_ctx": 8192,
+                },
+            }
+            timeout = aiohttp.ClientTimeout(total=180)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/chat", json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Ollama chat error %d: %s", resp.status, body[:200])
+                        return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
+                    data = await resp.json()
+
+            message = data.get("message", {})
+            response_text = message.get("content", "").strip()
+            logger.info(
+                "LLM chat response (%d chars): %s",
+                len(response_text), response_text[:100],
+            )
+            return {
+                "status": "ok",
+                "response": response_text,
+                "model": self.model,
+            }
+        except asyncio.TimeoutError:
+            logger.error("LLM chat generation timed out")
+            return {"error": "LLM generation timed out (180s)"}
+        except Exception as exc:
+            logger.exception("LLM chat generation error")
             return {"error": str(exc)}
 
     async def stream(
@@ -83,23 +183,36 @@ class LLMService:
         prompt: str,
         params: Dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
-        """
-        Stream tokens back as an async generator.
-
-        Args:
-            prompt: The text prompt.
-            params: Generation parameters.
-
-        Yields:
-            Individual token strings.
-        """
-        if not self.loaded:
-            logger.error("Stream called but LLM is not loaded")
-            return
-
+        """Stream tokens from Ollama as an async generator."""
         logger.info("LLM streaming response (prompt length=%d)", len(prompt))
-        # Replace with real streaming inference
-        tokens = f"[LLM response to: {prompt[:80]}]".split()
-        for token in tokens:
-            await asyncio.sleep(0)
-            yield token + " "
+        payload = {
+            "model": self.model,
+            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 512,
+            },
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/generate", json=payload
+                ) as resp:
+                    async for line in resp.content:
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("response", "")
+                            if token:
+                                yield token
+                            if chunk.get("done"):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as exc:
+            logger.exception("LLM streaming error")
+            yield f"[Error: {exc}]"

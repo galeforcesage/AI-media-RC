@@ -103,7 +103,7 @@ async def query(request: QueryRequest):
     if _orchestrator is None:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
     result = await _orchestrator.run_query(request.text, synthesize=request.synthesize)
-    return {"response": result.get("response", result.get("error", str(result)))}
+    return {"response": result.get("llm_response", result.get("response", result.get("error", str(result))))}
 
 
 @router.post("/search")

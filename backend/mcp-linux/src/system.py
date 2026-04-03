@@ -46,7 +46,8 @@ ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "ne
 ALLOWED_BROWSE_ROOTS = {
     "/var/media/tv",
     "/var/media/channels",
-    "/home/sagetv/AI-media-RC",
+    "/media/sagetv",
+    os.path.expanduser("~/AI-media-RC"),
     "/tmp/transcription",
 }
 

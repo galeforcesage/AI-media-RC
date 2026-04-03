@@ -29,6 +29,7 @@ from services.metadata import MetadataService
 from services.system import SystemService
 from services.voice_session import VoiceSessionManager
 from services.tool_router import ToolRouter
+from services.agent import AgentLoop
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -51,6 +52,8 @@ class Orchestrator:
         # Core AI services
         self.llm = LLMService(
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
+            base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
+            model=config.get("llm", {}).get("model", "mistral:instruct"),
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
@@ -95,6 +98,9 @@ class Orchestrator:
             playback=self.playback_controller,
             search=self.search,
         )
+
+        # Agentic tool-calling loop
+        self.agent = AgentLoop(orchestrator=self)
 
         # Transcription queue
         self.transcription_queue = TranscriptionQueue(
@@ -218,49 +224,57 @@ class Orchestrator:
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Run a text query through the LLM pipeline with transcript context."""
+        """Run a text query through the agentic tool-calling loop."""
         logger.info("run_query (synthesize=%s)", synthesize)
         try:
-            # Search transcripts for relevant content
-            transcript_results = await self.search.transcript_search(prompt)
-            transcript_hits = []
-            if isinstance(transcript_results, dict):
-                data = transcript_results.get("data", transcript_results)
-                transcript_hits = data.get("results", [])
-
-            # Inject transcript context if available
+            # Pre-fetch transcript context so the LLM has immediate context
             transcript_context = ""
-            if transcript_hits:
-                lines = []
-                for r in transcript_hits[:5]:
-                    title = r.get("title", "Unknown")
-                    ep = r.get("episode_title", "")
-                    start = r.get("start_time", 0)
-                    snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
-                    mins = int(start // 60)
-                    secs = int(start % 60)
-                    time_str = f"{mins}:{secs:02d}"
-                    if ep:
-                        lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
-                    else:
-                        lines.append(f'From "{title}" at {time_str}: {snippet}')
-                transcript_context = "\n".join(lines)
+            transcript_hits: list = []
+            try:
+                transcript_results = await self.search.transcript_search(prompt)
+                if isinstance(transcript_results, dict):
+                    data = transcript_results.get("data", transcript_results)
+                    transcript_hits = data.get("results", [])
+                if transcript_hits:
+                    lines = []
+                    for r in transcript_hits[:5]:
+                        title = r.get("title", "Unknown")
+                        ep = r.get("episode_title", "")
+                        start = r.get("start_time", 0)
+                        snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
+                        mins = int(start // 60)
+                        secs = int(start % 60)
+                        time_str = f"{mins}:{secs:02d}"
+                        if ep:
+                            lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                        else:
+                            lines.append(f'From "{title}" at {time_str}: {snippet}')
+                    transcript_context = "\n".join(lines)
+            except Exception:
+                logger.warning("Transcript pre-fetch failed, continuing without")
 
-            if transcript_context:
-                enriched_prompt = (
-                    f"Relevant transcript excerpts:\n{transcript_context}\n\n"
-                    f"User query: {prompt}"
-                )
-            else:
-                enriched_prompt = prompt
-
-            llm_result = await self.pipeline.run_text_query(
-                enriched_prompt, synthesize=synthesize, metadata=metadata,
+            # Run the agentic tool-calling loop
+            agent_result = await self.agent.run(
+                prompt, transcript_context=transcript_context,
             )
 
-            # Attach transcript hits to the response for the frontend
-            if isinstance(llm_result, dict):
-                llm_result["transcript_results"] = transcript_hits
+            # Build response in pipeline-compatible format
+            llm_result: Dict[str, Any] = {
+                "status": agent_result.get("status", "ok"),
+                "llm_response": agent_result.get("response", ""),
+                "iterations": agent_result.get("iterations", 1),
+            }
+
+            # Optional TTS synthesis
+            if synthesize and agent_result.get("status") == "ok":
+                response_text = agent_result.get("response", "")
+                if response_text:
+                    tts_result = await self.tts.synthesize(response_text)
+                    if tts_result.get("status") == "ok":
+                        llm_result["audio_path"] = tts_result["audio_path"]
+
+            # Attach transcript hits for the frontend
+            llm_result["transcript_results"] = transcript_hits
 
             return llm_result
         except Exception as exc:

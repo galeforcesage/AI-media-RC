@@ -46,3 +46,17 @@ logs/
 
 # Docker
 docker-build.log
+
+# Deployment scripts (contain server-specific paths)
+scripts/start_mcp.sh
+
+# Throwaway test/bench scripts
+check_api.py
+test_query.py
+scripts/bench.py
+scripts/bench2.py
+scripts/test_curl.sh
+scripts/test_ollama.py
+
+# Generated PWA icons (regenerate via frontend/icons/generate.py)
+frontend/icons/*.png

@@ -73,7 +73,7 @@
               return;
             }
             // Wrong credentials — show error and re-open
-            errMsg.textContent = result.error || 'Invalid credentials. Try admin / admin.';
+            errMsg.textContent = result.error || 'Invalid credentials.';
             errMsg.style.display = 'block';
             dlg.addEventListener('close', handler);
             dlg.showModal();
@@ -334,8 +334,17 @@
     input.value = '';
     UI.addMessage(text, 'user');
 
+    // Show thinking indicator
+    const thinking = document.createElement('div');
+    thinking.className = 'message thinking';
+    thinking.textContent = 'Thinking';
+    const msgContainer = document.getElementById('messages');
+    msgContainer.appendChild(thinking);
+    msgContainer.scrollTop = msgContainer.scrollHeight;
+
     try {
       const data = await API.query(text);
+      thinking.remove();
       const response = data.response || data.llm_response || data.error || JSON.stringify(data);
       UI.addMessage(response, 'assistant');
 
@@ -345,6 +354,7 @@
         UI.addEpisodeCards(results);
       }
     } catch (e) {
+      thinking.remove();
       UI.addMessage('Error: ' + e.message, 'error');
     }
   }
