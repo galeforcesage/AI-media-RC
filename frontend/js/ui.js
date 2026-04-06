@@ -5,7 +5,8 @@ const UI = (() => {
   // Element cache
   const el = {};
   const ids = [
-    'llm-focus', 'remote-system', 'device-picker',
+    'llm-focus', 'llm-focus-toggle', 'llm-focus-menu',
+    'remote-system', 'device-picker',
     'np-title', 'np-episode', 'np-channel', 'np-state',
     'np-position', 'np-duration', 'seek-slider',
     'play-pause-icon', 'mute-icon', 'volume-slider',
@@ -126,6 +127,23 @@ const UI = (() => {
   function updatePicker(id, value) {
     const picker = el[id];
     if (picker && picker.value !== value) picker.value = value;
+  }
+
+  function updateLLMFocusCheckboxes(systems) {
+    const menu = el['llm-focus-menu'];
+    if (!menu) return;
+    menu.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      cb.checked = systems.includes(cb.value);
+    });
+    updateLLMFocusLabel(systems);
+  }
+
+  function updateLLMFocusLabel(systems) {
+    const toggle = el['llm-focus-toggle'];
+    if (!toggle) return;
+    if (systems.length === 2) toggle.textContent = 'Both ▾';
+    else if (systems.includes('sagetv')) toggle.textContent = 'SageTV ▾';
+    else toggle.textContent = 'Channels ▾';
   }
 
   // ─── Device Picker ────────────────────────────────────────
@@ -266,7 +284,8 @@ const UI = (() => {
   return {
     cacheElements, updateNowPlaying, formatTime,
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
-    updatePicker, updateDevicePicker, updateStatus,
+    updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
+    updateDevicePicker, updateStatus,
     renderDeviceList, renderServiceGrid, renderSystemOutput, renderTranscriptionStats,
     openSettings, openAdmin, refreshAdminDevices,
     el: () => el,

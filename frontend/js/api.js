@@ -60,8 +60,8 @@ const API = (() => {
   }
 
   // Orchestrator endpoints
-  async function query(text, system) {
-    return request(`${baseUrl}/api/query`, 'POST', { prompt: text, system: system || undefined });
+  async function query(text, systems) {
+    return request(`${baseUrl}/api/query`, 'POST', { prompt: text, systems: systems || undefined });
   }
 
   async function playback(action, params = {}) {

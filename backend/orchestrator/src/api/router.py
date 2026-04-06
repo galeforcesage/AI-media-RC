@@ -72,7 +72,8 @@ class QueryRequest(BaseModel):
     """Request body for /query."""
     text: str = ""
     prompt: str = ""
-    system: Optional[str] = None
+    systems: Optional[list[str]] = None
+    system: Optional[str] = None  # Legacy single-system field
     synthesize: bool = False
 
 
@@ -107,7 +108,9 @@ async def query(request: QueryRequest):
     text = request.text or request.prompt
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' or 'prompt' field")
-    result = await _orchestrator.run_query(text, synthesize=request.synthesize, system=request.system)
+    # Support both new multi-system and legacy single-system field
+    systems = request.systems or ([request.system] if request.system else None)
+    result = await _orchestrator.run_query(text, synthesize=request.synthesize, systems=systems)
     return {"response": result.get("llm_response", result.get("response", result.get("error", str(result))))}
 
 

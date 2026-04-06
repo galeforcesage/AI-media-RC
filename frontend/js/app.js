@@ -32,7 +32,7 @@
 
   function onStateChange(state) {
     UI.updateStatus(state.connected);
-    UI.updatePicker('llm-focus', state.llmFocus);
+    UI.updateLLMFocusCheckboxes(state.llmFocus);
     UI.updatePicker('remote-system', state.system);
     UI.updateDevicePicker(state.devices, state.deviceId);
     UI.updateNowPlaying(state.session);
@@ -98,9 +98,28 @@
   // ─── Event Binding ────────────────────────────────────────
 
   function bindEvents() {
-    // LLM Focus picker
-    document.getElementById('llm-focus').addEventListener('change', e => {
-      State.set({ llmFocus: e.target.value });
+    // LLM Focus checkbox dropdown
+    const llmToggle = document.getElementById('llm-focus-toggle');
+    const llmMenu = document.getElementById('llm-focus-menu');
+    llmToggle.addEventListener('click', () => {
+      const open = llmMenu.classList.toggle('open');
+      llmToggle.setAttribute('aria-expanded', open);
+    });
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#llm-focus')) {
+        llmMenu.classList.remove('open');
+        llmToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
+    llmMenu.addEventListener('change', () => {
+      const checked = [...llmMenu.querySelectorAll('input:checked')].map(cb => cb.value);
+      if (checked.length === 0) {
+        // Don't allow unchecking everything — re-check the one just unchecked
+        event.target.checked = true;
+        return;
+      }
+      State.set({ llmFocus: checked });
+      UI.updateLLMFocusLabel(checked);
     });
 
     // Remote Control system picker
@@ -190,7 +209,7 @@
     document.getElementById('settings-dialog').addEventListener('close', (e) => {
       if (e.target.returnValue === 'save') {
         const sys = document.getElementById('setting-default-system').value;
-        State.set({ llmFocus: sys, system: sys });
+        State.set({ llmFocus: [sys], system: sys });
       }
     });
 
@@ -351,6 +370,7 @@
 
     try {
       const data = await API.query(text, State.get().llmFocus);
+
       thinking.remove();
       const response = data.response || data.llm_response || data.error || 'No response from server.';
       UI.addMessage(response, data.error ? 'error' : 'assistant');
