@@ -99,28 +99,31 @@ async def discover_channels_dirs(host: str = "127.0.0.1", port: int = 8767) -> L
     dirs: List[str] = []
 
     # Try getting the DVR path from the Channels MCP server
-    result = await _mcp_call_tool(host, port, "channels_get_dvr_path", {})
-    if result and result.get("success"):
-        path_str = result.get("data", {}).get("path", "")
-        if path_str and Path(path_str).is_dir():
-            dirs.append(path_str)
-            logger.info("Channels DVR recording dir: %s", path_str)
-            return dirs
-
-    # Fallback: try getting storage info
-    result = await _mcp_call_tool(host, port, "channels_get_storage", {})
+    result = await _mcp_call_tool(host, port, "channels_get_storage_status", {})
     if result and result.get("success"):
         data = result.get("data", {})
-        # Channels DVR returns storage paths in various formats
-        for key in ("path", "recording_path", "dvr_path"):
-            path_str = data.get(key, "")
-            if path_str and Path(path_str).is_dir():
+        # Primary recording path
+        path_str = data.get("path", "")
+        if path_str:
+            # Channels stores TV recordings under <path>/TV
+            tv_path = Path(path_str) / "TV"
+            if tv_path.is_dir():
+                dirs.append(str(tv_path))
+                logger.info("Channels DVR TV dir: %s", tv_path)
+            elif Path(path_str).is_dir():
                 dirs.append(path_str)
                 logger.info("Channels DVR recording dir: %s", path_str)
-                return dirs
+        # Extra recording paths
+        for extra in data.get("extra_paths", []):
+            if extra and Path(extra).is_dir():
+                dirs.append(extra)
+                logger.info("Channels DVR extra dir: %s", extra)
+        if dirs:
+            return dirs
 
     # Fallback: try common Channels DVR paths
     default_paths = [
+        "/media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV",
         "/opt/channels-dvr/data/TV",
         "/var/channels-dvr/data/TV",
     ]
