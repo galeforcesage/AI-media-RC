@@ -61,14 +61,37 @@ class FileWatcher:
 
     async def start(self) -> None:
         self._running = True
-        logger.info("Watcher '%s' started: %s (%s, live=%s)",
-                     self.name, self.watch_dir, self.system, self.enable_live)
+        # Seed files older than 2 weeks as "known" so they are skipped.
+        # Files within the last 2 weeks will be treated as new and checked
+        # for missing transcriptions on the first scan.
+        self._seed_existing()
+        logger.info("Watcher '%s' started: %s (%s, live=%s, seeded=%d old files)",
+                     self.name, self.watch_dir, self.system, self.enable_live,
+                     len(self._known_files))
         while self._running:
             try:
                 self._scan()
             except Exception:
                 logger.exception("Watcher '%s' scan error", self.name)
             await asyncio.sleep(POLL_INTERVAL)
+
+    def _seed_existing(self) -> None:
+        """Mark files older than 2 weeks as already known so only recent files get queued."""
+        watch_path = Path(self.watch_dir)
+        if not watch_path.is_dir():
+            return
+        cutoff = time.time() - (14 * 86400)  # 2 weeks ago
+        for entry in watch_path.rglob("*"):
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() not in MEDIA_EXTENSIONS:
+                continue
+            try:
+                stat = entry.stat()
+                if stat.st_mtime < cutoff:
+                    self._known_files[str(entry)] = stat.st_mtime
+            except OSError:
+                continue
 
     def stop(self) -> None:
         self._running = False
@@ -163,6 +186,17 @@ class FileWatcher:
         final: bool = False,
     ) -> None:
         recording_id = Path(file_path).stem
+        # Skip if a transcript already exists for this recording
+        try:
+            existing = self.queue._conn.execute(
+                "SELECT recording_id FROM transcripts WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+            if existing:
+                logger.debug("Transcript already exists for %s, skipping", recording_id)
+                return
+        except Exception:
+            pass  # Table may not exist yet; let the queue handle dedup
         job = TranscriptionJob(
             system=self.system,
             recording_id=recording_id,
