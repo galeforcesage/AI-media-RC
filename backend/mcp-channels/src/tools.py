@@ -7,6 +7,7 @@ Tools are namespaced with channels_ prefix.
 """
 
 from __future__ import annotations
+import datetime
 import enum
 import logging
 from typing import Any, Dict
@@ -38,6 +39,44 @@ def _ok(data: Any = None, message: str = "OK") -> Dict[str, Any]:
 
 def _fail(error: str, message: str) -> Dict[str, Any]:
     return {"success": False, "error": error, "message": message}
+
+
+def _epoch_to_readable(epoch_sec: int) -> str:
+    """Convert epoch seconds to a human-readable date string."""
+    try:
+        dt = datetime.datetime.fromtimestamp(epoch_sec)
+        return dt.strftime("%Y-%m-%d %I:%M %p")
+    except (ValueError, OSError, TypeError):
+        return ""
+
+
+def _date_str_to_epoch(date_str: str, end_of_day: bool = False) -> int:
+    """Convert YYYY-MM-DD to epoch seconds."""
+    dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return int(dt.timestamp())
+
+
+def _enrich_channels_recording(rec: Dict) -> Dict:
+    """Add human-readable date fields to a Channels DVR recording."""
+    if not isinstance(rec, dict):
+        return rec
+    airing = rec.get("Airing") or {}
+    air_time = airing.get("Time")
+    if air_time:
+        airing["AirDate"] = _epoch_to_readable(int(air_time))
+    created = rec.get("CreatedAt")
+    if created:
+        rec["RecordedDate"] = _epoch_to_readable(int(created))
+    return rec
+
+
+def _enrich_channels_recordings(data: Any) -> Any:
+    """Enrich a list of Channels DVR recordings with readable dates."""
+    if isinstance(data, list):
+        return [_enrich_channels_recording(r) for r in data]
+    return data
 
 
 # ==================================================================
@@ -123,7 +162,58 @@ async def _get_now_playing(client, args: Dict) -> Dict:
 async def _get_recordings(client, args: Dict) -> Dict:
     recordings = await client.get_recordings()
     limit = args.get("limit", 50)
-    return _ok(data=recordings[:limit], message=f"{len(recordings)} recordings total, returning {min(limit, len(recordings))}")
+    return _ok(data=_enrich_channels_recordings(recordings[:limit]), message=f"{len(recordings)} recordings total, returning {min(limit, len(recordings))}")
+
+
+async def _search_recordings(client, args: Dict) -> Dict:
+    """Search Channels DVR recordings with filters."""
+    title = args.get("title", "")
+    channel = args.get("channel", "")
+    start_date = args.get("start_date")
+    end_date = args.get("end_date")
+    limit = int(args.get("limit", 50))
+
+    start_epoch = None
+    end_epoch = None
+    if start_date:
+        try:
+            start_epoch = _date_str_to_epoch(start_date, end_of_day=False)
+        except ValueError:
+            return _fail("invalid_date", f"Invalid start_date: {start_date}. Use YYYY-MM-DD.")
+    if end_date:
+        try:
+            end_epoch = _date_str_to_epoch(end_date, end_of_day=True)
+        except ValueError:
+            return _fail("invalid_date", f"Invalid end_date: {end_date}. Use YYYY-MM-DD.")
+
+    recordings = await client.get_recordings()
+    results = []
+    for rec in recordings:
+        airing = rec.get("Airing") or {}
+
+        if title:
+            rec_title = airing.get("Title", "")
+            ep_title = airing.get("EpisodeTitle", "")
+            combined = f"{rec_title} {ep_title}".lower()
+            if title.lower() not in combined:
+                continue
+
+        if channel:
+            rec_ch = str(airing.get("Channel", ""))
+            if channel.lower() not in rec_ch.lower():
+                continue
+
+        rec_time = airing.get("Time") or rec.get("CreatedAt") or 0
+        if start_epoch and int(rec_time) < start_epoch:
+            continue
+        if end_epoch and int(rec_time) > end_epoch:
+            continue
+
+        results.append(rec)
+        if len(results) >= limit:
+            break
+
+    return _ok(data=_enrich_channels_recordings(results), message=f"Found {len(results)} matching recordings")
 
 
 async def _get_scheduled_recordings(client, args: Dict) -> Dict:
@@ -352,6 +442,21 @@ TOOL_REGISTRY = {
         },
         "safety": Safety.SAFE,
         "handler": _get_recordings,
+    },
+    "channels_search_recordings": {
+        "description": "Search Channels DVR recordings with filters: title, channel, date range. Supports human-readable dates via start_date/end_date (YYYY-MM-DD).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
+                "channel": {"type": "string", "description": "Channel number filter"},
+                "start_date": {"type": "string", "description": "Minimum date (YYYY-MM-DD)"},
+                "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD)"},
+                "limit": {"type": "integer", "description": "Max results (default 50)"},
+            },
+        },
+        "safety": Safety.SAFE,
+        "handler": _search_recordings,
     },
     "channels_get_scheduled_recordings": {
         "description": "Get all recording rules (scheduled recordings).",

@@ -30,6 +30,12 @@ CHANNELS_DVR_URL = "http://localhost:8089"
 # How often to refresh the index (seconds)
 REFRESH_INTERVAL = 3600  # 1 hour
 
+# CPU throttling: limit threads used by sentence-transformers / PyTorch
+# so we don't starve DVR services, Ollama, or Whisper
+_MAX_ENCODE_THREADS = 2
+_ENCODE_BATCH_SIZE = 64  # smaller batches = less CPU spikes
+_STARTUP_DELAY = 30  # seconds to wait before first index build
+
 
 class SemanticIndex:
     """
@@ -61,10 +67,16 @@ class SemanticIndex:
 
     def _init_sync(self) -> None:
         """Synchronous init — loads model and ChromaDB (called in executor)."""
+        import torch
+        # Limit CPU threads so embedding doesn't starve the system
+        torch.set_num_threads(_MAX_ENCODE_THREADS)
+        os.environ["OMP_NUM_THREADS"] = str(_MAX_ENCODE_THREADS)
+        os.environ["MKL_NUM_THREADS"] = str(_MAX_ENCODE_THREADS)
+
         from sentence_transformers import SentenceTransformer
         import chromadb
 
-        logger.info("Loading embedding model: %s", EMBED_MODEL)
+        logger.info("Loading embedding model: %s (max %d threads)", EMBED_MODEL, _MAX_ENCODE_THREADS)
         self._embedder = SentenceTransformer(EMBED_MODEL)
 
         os.makedirs(CHROMA_DIR, exist_ok=True)
@@ -289,14 +301,15 @@ class SemanticIndex:
         airing = rec.get("Airing", rec)
         show = airing.get("Show", airing)
 
-        title = show.get("Title") or rec.get("title") or ""
+        title = show.get("ShowTitle") or show.get("Title") or rec.get("MediaTitle") or ""
         if not title:
             return None
 
-        episode = show.get("EpisodeTitle") or rec.get("episode_title") or ""
+        episode = show.get("ShowEpisode") or show.get("EpisodeTitle") or ""
+        description = show.get("ShowDescription") or ""
         channel_info = airing.get("Channel", {})
-        channel = channel_info.get("CallSign") or channel_info.get("ChannelNumber") or ""
-        start_time = rec.get("StartTime") or airing.get("StartTime") or ""
+        channel = channel_info.get("ChannelName") or channel_info.get("ChannelNumber") or ""
+        start_time = rec.get("FileStartTime") or airing.get("AiringStartTime") or ""
         media_id = str(rec.get("MediaFileID") or rec.get("id") or "")
 
         # Build text
@@ -312,6 +325,8 @@ class SemanticIndex:
                 parts.append(f"recorded {dt.strftime('%Y-%m-%d')}")
             except (ValueError, TypeError, OSError):
                 pass
+        if description:
+            parts.append(f"— {description[:150]}")
 
         text = " ".join(parts)
         meta = {
@@ -330,7 +345,8 @@ class SemanticIndex:
         if not docs:
             return self._collection.count()
 
-        batch_size = 256
+        import time
+        batch_size = _ENCODE_BATCH_SIZE
         for i in range(0, len(docs), batch_size):
             batch = docs[i:i + batch_size]
             ids = [d["id"] for d in batch]
@@ -345,12 +361,17 @@ class SemanticIndex:
                 embeddings=embeddings,
                 metadatas=metas,
             )
+            # Yield CPU between batches so DVR services stay responsive
+            time.sleep(0.5)
 
         return self._collection.count()
 
     async def _refresh_loop(self) -> None:
         """Background task: refresh index periodically."""
-        # Initial refresh on startup
+        # Delay initial refresh so the server finishes startup first
+        logger.info("Semantic index: delaying first refresh by %ds", _STARTUP_DELAY)
+        await asyncio.sleep(_STARTUP_DELAY)
+
         try:
             await self.refresh()
         except Exception as exc:

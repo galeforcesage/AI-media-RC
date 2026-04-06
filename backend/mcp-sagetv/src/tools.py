@@ -7,6 +7,7 @@ Tools are namespaced with sagetv_ prefix.
 """
 
 from __future__ import annotations
+import datetime
 import enum
 import logging
 from typing import Any, Callable, Coroutine, Dict
@@ -41,6 +42,57 @@ def _fail(error: str, message: str, suggestions: list | None = None) -> Dict[str
     if suggestions:
         r["suggestions"] = suggestions
     return r
+
+
+def _epoch_ms_to_readable(epoch_ms: int) -> str:
+    """Convert epoch milliseconds to a human-readable date string."""
+    try:
+        dt = datetime.datetime.fromtimestamp(epoch_ms / 1000.0)
+        return dt.strftime("%Y-%m-%d %I:%M %p")
+    except (ValueError, OSError, TypeError):
+        return ""
+
+
+def _date_str_to_epoch_ms(date_str: str, end_of_day: bool = False) -> int:
+    """Convert a YYYY-MM-DD string to epoch milliseconds.
+    If end_of_day=True, returns 23:59:59.999 of that day."""
+    dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+    return int(dt.timestamp() * 1000)
+
+
+def _enrich_recording(mf: Dict) -> Dict:
+    """Add human-readable date fields to a recording object so the LLM can read them."""
+    if not isinstance(mf, dict):
+        return mf
+    for field in ("FileStartTime", "FileStartTime"):
+        val = mf.get(field)
+        if val:
+            mf["StartDate"] = _epoch_ms_to_readable(int(val))
+            break
+    for field in ("FileEndTime", "FileEndTime"):
+        val = mf.get(field)
+        if val:
+            mf["EndDate"] = _epoch_ms_to_readable(int(val))
+            break
+    # Also enrich the airing start/end
+    airing = mf.get("Airing")
+    if airing and isinstance(airing, dict):
+        val = airing.get("AiringStartTime")
+        if val:
+            airing["AiringStartDate"] = _epoch_ms_to_readable(int(val))
+        val = airing.get("AiringEndTime")
+        if val:
+            airing["AiringEndDate"] = _epoch_ms_to_readable(int(val))
+    return mf
+
+
+def _enrich_recordings(data: Any) -> Any:
+    """Enrich a list of recordings with readable dates."""
+    if isinstance(data, list):
+        return [_enrich_recording(mf) for mf in data]
+    return data
 
 
 # ==================================================================
@@ -148,7 +200,7 @@ async def sagetv_get_recordings(client: SageXClient, args: Dict) -> Dict:
     size = int(args.get("limit", 50))
     start = int(args.get("offset", 0))
     data = await client.call("GetMediaFiles", ["T"], start=start, size=size)
-    return _ok(data=data, message="Recordings retrieved")
+    return _ok(data=_enrich_recordings(data), message="Recordings retrieved")
 
 
 async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -489,6 +541,19 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     channel = args.get("channel", "")
     start_time = args.get("start_time")
     end_time = args.get("end_time")
+    # Accept human-readable date strings (YYYY-MM-DD) and convert to epoch ms
+    start_date = args.get("start_date")
+    end_date = args.get("end_date")
+    if start_date and not start_time:
+        try:
+            start_time = _date_str_to_epoch_ms(start_date, end_of_day=False)
+        except ValueError:
+            return _fail("invalid_date", f"Invalid start_date format: {start_date}. Use YYYY-MM-DD.")
+    if end_date and not end_time:
+        try:
+            end_time = _date_str_to_epoch_ms(end_date, end_of_day=True)
+        except ValueError:
+            return _fail("invalid_date", f"Invalid end_date format: {end_date}. Use YYYY-MM-DD.")
     watched = args.get("watched")
     archived = args.get("archived")
     recording_state = args.get("recording_state")
@@ -500,43 +565,43 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
 
     results = []
     for mf in data:
-        airing = mf.get("Airing") or mf.get("airing") or {}
-        show = airing.get("Show") or airing.get("show") or {}
+        airing = mf.get("Airing") or {}
+        show = airing.get("Show") or {}
 
         if title:
-            mf_title = show.get("Title") or show.get("title") or ""
-            ep_title = show.get("EpisodeTitle") or show.get("episodeTitle") or ""
+            mf_title = show.get("ShowTitle", "")
+            ep_title = show.get("ShowEpisode", "")
             combined = f"{mf_title} {ep_title}".lower()
             if title.lower() not in combined:
                 continue
 
         if channel:
-            ch = airing.get("Channel") or airing.get("channel") or {}
-            ch_num = str(ch.get("ChannelNumber") or ch.get("channelNumber") or "")
-            ch_name = str(ch.get("CallSign") or ch.get("callSign") or "")
+            ch = airing.get("Channel") or {}
+            ch_num = str(ch.get("ChannelNumber", ""))
+            ch_name = str(ch.get("ChannelName", ""))
             if channel.lower() not in ch_num.lower() and channel.lower() not in ch_name.lower():
                 continue
 
-        mf_start = mf.get("StartTime") or mf.get("startTime") or 0
-        mf_end = mf.get("EndTime") or mf.get("endTime") or 0
+        mf_start = mf.get("FileStartTime") or airing.get("AiringStartTime") or 0
+        mf_end = mf.get("FileEndTime") or airing.get("AiringEndTime") or 0
         if start_time and int(mf_start) < int(start_time):
             continue
         if end_time and int(mf_end) > int(end_time):
             continue
 
         if watched is not None:
-            is_watched = mf.get("Watched") or mf.get("watched") or False
+            is_watched = airing.get("IsWatched", False)
             if bool(watched) != bool(is_watched):
                 continue
 
         if archived is not None:
-            is_lib = mf.get("IsLibraryFile") or mf.get("isLibraryFile") or False
+            is_lib = mf.get("IsLibraryFile", False)
             if bool(archived) != bool(is_lib):
                 continue
 
         if recording_state is not None:
-            is_complete = mf.get("IsCompleteRecording") or mf.get("isCompleteRecording")
-            currently_recording = not bool(is_complete) if is_complete is not None else False
+            is_complete = mf.get("IsCompleteRecording", False)
+            currently_recording = not bool(is_complete)
             if recording_state == "recording" and not currently_recording:
                 continue
             if recording_state == "complete" and currently_recording:
@@ -546,7 +611,7 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
         if len(results) >= limit:
             break
 
-    return _ok(data=results, message=f"Found {len(results)} matching recordings")
+    return _ok(data=_enrich_recordings(results), message=f"Found {len(results)} matching recordings")
 
 
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -556,7 +621,7 @@ async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
     if not data:
         return _ok(data=[], message="No recent recordings")
     items = data if isinstance(data, list) else []
-    return _ok(data=items, message=f"{len(items)} recent recordings")
+    return _ok(data=_enrich_recordings(items), message=f"{len(items)} recent recordings")
 
 
 async def sagetv_get_active_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -925,12 +990,14 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
     # ---- Recording Queries ----
     "sagetv_search_recordings": {
-        "description": "Search recordings with filters: title, channel, date range, watched, archived, recording state.",
+        "description": "Search recordings with filters: title, channel, date range, watched, archived, recording state. Supports human-readable dates via start_date/end_date (YYYY-MM-DD).",
         "input_schema": {"type": "object", "properties": {
             "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
-            "channel": {"type": "string", "description": "Channel number or call sign filter"},
-            "start_time": {"type": "integer", "description": "Minimum start time (epoch ms)"},
-            "end_time": {"type": "integer", "description": "Maximum end time (epoch ms)"},
+            "channel": {"type": "string", "description": "Channel number or name filter"},
+            "start_date": {"type": "string", "description": "Minimum date (YYYY-MM-DD). Preferred over start_time."},
+            "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD). Preferred over end_time."},
+            "start_time": {"type": "integer", "description": "Minimum start time (epoch ms). Use start_date instead."},
+            "end_time": {"type": "integer", "description": "Maximum end time (epoch ms). Use end_date instead."},
             "watched": {"type": "boolean", "description": "Filter by watched status"},
             "archived": {"type": "boolean", "description": "Filter by archived/library status"},
             "recording_state": {"type": "string", "enum": ["recording", "complete"], "description": "Filter by recording state"},

@@ -24,7 +24,7 @@ TOOL_DEFINITIONS = """
 ### SageTV DVR — Query & Metadata
 - **sagetv_get_now_playing**: What's currently playing on SageTV. Params: session_id (optional).
 - **sagetv_get_recordings**: List recordings with paging. Params: limit (int, optional), offset (int, optional).
-- **sagetv_search_recordings**: Search recordings by filters. Params: title (str, optional), channel (str, optional), start_time (str, optional), end_time (str, optional), watched (bool, optional), archived (bool, optional), recording_state (str, optional), limit (int, optional).
+- **sagetv_search_recordings**: Search recordings by filters. Params: title (str, optional), channel (str, optional), start_date (str YYYY-MM-DD, optional, preferred), end_date (str YYYY-MM-DD, optional, preferred), start_time (epoch ms, optional), end_time (epoch ms, optional), watched (bool, optional), archived (bool, optional), recording_state (str, optional), limit (int, optional).
 - **sagetv_get_recent_recordings**: Most recently completed recordings. Params: limit (int, optional).
 - **sagetv_get_active_recordings**: Recordings currently in progress. No params.
 - **sagetv_get_upcoming_recordings**: Scheduled future recordings. No params.
@@ -80,6 +80,7 @@ TOOL_DEFINITIONS = """
 ### Channels DVR — Query & Metadata
 - **channels_get_now_playing**: Active playback sessions on Channels DVR. No params.
 - **channels_get_recordings**: List DVR recordings. Params: limit (int, optional).
+- **channels_search_recordings**: Search Channels DVR recordings by filters. Params: title (str, optional), channel (str, optional), start_date (str YYYY-MM-DD, optional), end_date (str YYYY-MM-DD, optional), limit (int, optional).
 - **channels_search_epg**: Search the EPG. Params: query (str, required).
 - **channels_get_channels**: List all channels. No params.
 - **channels_get_storage_status**: DVR storage info including recording directory path. No params.
@@ -275,6 +276,39 @@ class AgentLoop:
             "9. Only use tools listed below. Do not invent tool names.\n"
             "10. NEVER use placeholder values like '<path from ...>'. Use only real values you know.\n"
             "11. If the DVR target is ambiguous (SageTV vs ChannelsDVR), ask the user.\n"
+            "12. NEVER output code blocks (```), import statements, or pseudo-code in your answer. "
+            "You are NOT a coding assistant — you are a media assistant.\n"
+            "13. NEVER describe your reasoning steps, filtering process, or methodology. "
+            "Just present the final result directly.\n"
+            "14. Do NOT say 'Here is how I will do it', 'Step 1', 'Let me filter', etc. "
+            "Just give the answer.\n\n"
+
+            # ---- RECORDING PRESENTATION ----
+            "RECORDING PRESENTATION:\n"
+            "When listing recordings, always include for each:\n"
+            "- Show title and episode title\n"
+            "- Season/episode number if available (e.g. S07E04)\n"
+            "- Air date or recording date (use the StartDate or AiringStartDate field which is human-readable)\n"
+            "- Episode description/synopsis\n"
+            "SageTV recording objects contain Airing → Show with fields: "
+            "ShowTitle, ShowEpisode (episode title), ShowDescription, ShowSeasonNumber, ShowEpisodeNumber, ShowExternalID. "
+            "Always check the ShowDescription field and present it as a brief summary of the episode.\n"
+            "Enriched recordings also include StartDate and EndDate as readable date strings.\n"
+            "Channels DVR recordings contain Airing with fields: "
+            "Title, EpisodeTitle, Summary, SeasonNumber, EpisodeNumber, Channel, Time. "
+            "Always present the Summary as a brief description.\n"
+            "Enriched Channels DVR recordings also include AirDate and RecordedDate as readable date strings.\n\n"
+
+            # ---- TIMESTAMP HINTS ----
+            "TIMESTAMP HINTS:\n"
+            "Recording objects now include human-readable date fields:\n"
+            "- SageTV: StartDate, EndDate, AiringStartDate (e.g. '2026-04-05 08:00 PM')\n"
+            "- Channels DVR: AirDate, RecordedDate (e.g. '2026-04-05 10:00 PM')\n"
+            "Use these to verify dates instead of trying to convert epoch values.\n"
+            "For both sagetv_search_recordings and channels_search_recordings, "
+            "use start_date and end_date parameters with YYYY-MM-DD format "
+            "(e.g. start_date='2026-04-05', end_date='2026-04-05' to find recordings from April 5). "
+            "Do NOT try to compute epoch values yourself.\n\n"
             + TOOL_DEFINITIONS
         )
 

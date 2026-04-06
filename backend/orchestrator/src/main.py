@@ -15,10 +15,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
 from typing import Any, Dict
+
+# Limit CPU threads for PyTorch/sentence-transformers BEFORE any imports
+# so the embedding model doesn't starve DVR services, Ollama, or Whisper
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 
 import uvicorn
 from fastapi import FastAPI
