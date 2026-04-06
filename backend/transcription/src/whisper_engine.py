@@ -42,13 +42,25 @@ def select_model(preferred: str = "large-v3") -> str:
         return "base"
 
 
+# Reserve CPU headroom for SageTV, Channels DVR, and other services.
+# On a 16-core box, 8 threads for Whisper leaves plenty for DVR playback.
+DEFAULT_CPU_THREADS = 8
+
+
 class WhisperEngine:
     """Async-friendly wrapper around faster-whisper."""
 
-    def __init__(self, model_name: str = "auto", device: str = "auto", compute_type: str = "auto"):
+    def __init__(
+        self,
+        model_name: str = "auto",
+        device: str = "auto",
+        compute_type: str = "auto",
+        cpu_threads: int = DEFAULT_CPU_THREADS,
+    ):
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
+        self._cpu_threads = cpu_threads
         self._model = None
 
     @property
@@ -66,13 +78,14 @@ class WhisperEngine:
         if self._model_name == "auto":
             self._model_name = select_model()
 
-        logger.info("Loading Whisper model: %s (device=%s, compute=%s)",
-                     self._model_name, self._device, self._compute_type)
+        logger.info("Loading Whisper model: %s (device=%s, compute=%s, threads=%d)",
+                     self._model_name, self._device, self._compute_type, self._cpu_threads)
         start = time.time()
         self._model = WhisperModel(
             self._model_name,
             device=self._device,
             compute_type=self._compute_type,
+            cpu_threads=self._cpu_threads,
         )
         logger.info("Whisper model loaded in %.1fs", time.time() - start)
 

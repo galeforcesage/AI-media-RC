@@ -17,11 +17,16 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+# Limit ffmpeg threads to avoid starving SageTV/Channels DVR.
+DEFAULT_FFMPEG_THREADS = 4
+
+
 class AudioExtractor:
     """Extracts audio from video files using ffmpeg."""
 
-    def __init__(self, ssd_temp_dir: str = "/tmp/transcription"):
+    def __init__(self, ssd_temp_dir: str = "/tmp/transcription", ffmpeg_threads: int = DEFAULT_FFMPEG_THREADS):
         self.ssd_temp_dir = ssd_temp_dir
+        self.ffmpeg_threads = ffmpeg_threads
         Path(ssd_temp_dir).mkdir(parents=True, exist_ok=True)
 
     async def extract(
@@ -44,7 +49,8 @@ class AudioExtractor:
             logger.debug("Audio already extracted: %s", output_path)
             return output_path
 
-        cmd = ["ffmpeg"]
+        # Use nice/ionice to lower extraction priority so DVR playback isn't affected.
+        cmd = ["nice", "-n", "15", "ionice", "-c", "3", "ffmpeg", "-threads", str(self.ffmpeg_threads)]
         if start_seconds is not None and start_seconds > 0:
             cmd += ["-ss", str(start_seconds)]
         cmd += [

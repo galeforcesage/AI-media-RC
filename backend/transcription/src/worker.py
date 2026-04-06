@@ -48,6 +48,13 @@ class TranscriptionWorker:
         self._semaphore: Optional[asyncio.Semaphore] = None
 
     async def start(self) -> None:
+        # Lower our own process priority so DVR playback/recording isn't starved.
+        try:
+            os.nice(10)
+            logger.info("Transcription worker nice level set to %d", os.nice(0))
+        except (OSError, AttributeError):
+            pass  # nice() not available on all platforms
+
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
         logger.info("Transcription worker started (concurrency=%d)", self.concurrency)

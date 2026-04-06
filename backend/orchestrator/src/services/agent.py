@@ -277,6 +277,7 @@ class AgentLoop:
         self,
         user_query: str,
         transcript_context: str = "",
+        semantic_context: str = "",
     ) -> Dict[str, Any]:
         """
         Run the agentic loop: send query to LLM, parse tool calls,
@@ -289,10 +290,19 @@ class AgentLoop:
             {"role": "system", "content": await self._build_system_prompt()},
         ]
 
+        # Build user message with pre-fetched context
+        context_parts = []
+        if semantic_context:
+            context_parts.append(semantic_context)
         if transcript_context:
-            user_content = (
+            context_parts.append(
                 "Relevant transcript excerpts (pre-searched for context):\n"
-                f"{transcript_context}\n\n"
+                f"{transcript_context}"
+            )
+
+        if context_parts:
+            user_content = (
+                "\n\n".join(context_parts) + "\n\n"
                 f"User question: {user_query}"
             )
         else:

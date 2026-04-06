@@ -30,6 +30,7 @@ from services.system import SystemService
 from services.voice_session import VoiceSessionManager
 from services.tool_router import ToolRouter
 from services.agent import AgentLoop
+from services.semantic_index import SemanticIndex
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -54,6 +55,7 @@ class Orchestrator:
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
             base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
             model=config.get("llm", {}).get("model", "mistral:instruct"),
+            num_threads=config.get("llm", {}).get("num_threads", 12),
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
@@ -99,6 +101,9 @@ class Orchestrator:
             search=self.search,
         )
 
+        # Semantic index for fast context retrieval
+        self.semantic_index = SemanticIndex(orchestrator=self)
+
         # Agentic tool-calling loop
         self.agent = AgentLoop(orchestrator=self)
 
@@ -143,6 +148,9 @@ class Orchestrator:
         await self.playback_state.start()
         await self.transcription_queue.start()
 
+        # Start semantic index (loads model + refreshes in background)
+        await self.semantic_index.start()
+
         self._register_default_commands()
 
         logger.info("Orchestrator initialized successfully")
@@ -158,6 +166,7 @@ class Orchestrator:
         await self.llm.unload()
         await self._sagetv.close()
         await self._channels.close()
+        await self.semantic_index.stop()
         await self._linux.close()
 
         logger.info("Orchestrator shutdown complete")
@@ -253,9 +262,22 @@ class Orchestrator:
             except Exception:
                 logger.warning("Transcript pre-fetch failed, continuing without")
 
+            # Pre-fetch semantic context from the vector index (sub-second)
+            semantic_context = ""
+            try:
+                if self.semantic_index.ready:
+                    hits = await self.semantic_index.search(prompt, n_results=10)
+                    semantic_context = self.semantic_index.format_context(hits)
+                    if semantic_context:
+                        logger.info("Semantic index returned %d hits", len(hits))
+            except Exception:
+                logger.warning("Semantic pre-fetch failed, continuing without")
+
             # Run the agentic tool-calling loop
             agent_result = await self.agent.run(
-                prompt, transcript_context=transcript_context,
+                prompt,
+                transcript_context=transcript_context,
+                semantic_context=semantic_context,
             )
 
             # Build response in pipeline-compatible format

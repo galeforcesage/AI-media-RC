@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ssd-temp", default="/tmp/transcription")
     p.add_argument("--whisper-model", default="auto")
     p.add_argument("--whisper-device", default="auto")
+    p.add_argument("--whisper-threads", type=int, default=8, help="CPU threads for Whisper inference (default: 8)")
+    p.add_argument("--ffmpeg-threads", type=int, default=4, help="CPU threads for ffmpeg extraction (default: 4)")
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
@@ -129,10 +131,11 @@ async def run(args: argparse.Namespace) -> None:
 
     # Transcription worker
     if not args.no_worker:
-        extractor = AudioExtractor(ssd_temp_dir=args.ssd_temp)
+        extractor = AudioExtractor(ssd_temp_dir=args.ssd_temp, ffmpeg_threads=args.ffmpeg_threads)
         engine = WhisperEngine(
             model_name=args.whisper_model,
             device=args.whisper_device,
+            cpu_threads=args.whisper_threads,
         )
         worker = TranscriptionWorker(
             queue=queue,

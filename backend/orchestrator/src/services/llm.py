@@ -28,6 +28,15 @@ When the user asks about recorded content, use the transcript excerpts provided 
 Keep responses concise and conversational. If you don't have enough information, say so clearly."""
 
 
+# Reserve CPU cores for MCP/playback/SSH — don't let Ollama use all of them.
+# On a 16-core box, 12 inference threads leaves 4 for everything else.
+DEFAULT_NUM_THREADS = 12
+
+# Only allow one LLM inference at a time so queries queue up rather than
+# compounding CPU pressure.
+MAX_CONCURRENT_LLM = 1
+
+
 class LLMService:
     """LLM inference via Ollama HTTP API."""
 
@@ -36,12 +45,15 @@ class LLMService:
         model_path: str = "models/llm",
         base_url: str = "http://127.0.0.1:11434",
         model: str = "mistral:instruct",
+        num_threads: int = DEFAULT_NUM_THREADS,
     ) -> None:
         self.model_path = model_path
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.num_threads = num_threads
         self.loaded = False
         self._lock = asyncio.Lock()
+        self._inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
     async def load(self) -> None:
         """Verify Ollama is reachable and the model is available."""
@@ -94,10 +106,12 @@ class LLMService:
                 "options": {
                     "temperature": 0.7,
                     "num_predict": 512,
+                    "num_thread": self.num_threads,
                 },
             }
             timeout = aiohttp.ClientTimeout(total=120)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with self._inference_semaphore:
+              async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{self.base_url}/api/generate", json=payload
                 ) as resp:
@@ -147,10 +161,12 @@ class LLMService:
                     "temperature": 0.7,
                     "num_predict": 1024,
                     "num_ctx": 8192,
+                    "num_thread": self.num_threads,
                 },
             }
-            timeout = aiohttp.ClientTimeout(total=180)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            timeout = aiohttp.ClientTimeout(total=300)
+            async with self._inference_semaphore:
+              async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{self.base_url}/api/chat", json=payload,
                 ) as resp:
@@ -173,7 +189,7 @@ class LLMService:
             }
         except asyncio.TimeoutError:
             logger.error("LLM chat generation timed out")
-            return {"error": "LLM generation timed out (180s)"}
+            return {"error": "LLM generation timed out (300s)"}
         except Exception as exc:
             logger.exception("LLM chat generation error")
             return {"error": str(exc)}
@@ -193,11 +209,13 @@ class LLMService:
             "options": {
                 "temperature": 0.7,
                 "num_predict": 512,
+                "num_thread": self.num_threads,
             },
         }
         try:
             timeout = aiohttp.ClientTimeout(total=120)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with self._inference_semaphore:
+              async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{self.base_url}/api/generate", json=payload
                 ) as resp:

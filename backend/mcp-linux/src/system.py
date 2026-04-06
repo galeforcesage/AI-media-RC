@@ -41,12 +41,11 @@ ALLOWED_LOG_PATHS = {
     "/tmp/mcp-linux.log",
 }
 
-ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "nextcloud-redis"}
+ALLOWED_DOCKER_CONTAINERS = {"sagetv-server"}
 
 ALLOWED_BROWSE_ROOTS = {
     "/var/media/tv",
     "/var/media/channels",
-    "/media/sagetv",
     os.path.expanduser("~/AI-media-RC"),
     "/tmp/transcription",
 }

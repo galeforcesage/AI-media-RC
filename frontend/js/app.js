@@ -345,8 +345,8 @@
     try {
       const data = await API.query(text);
       thinking.remove();
-      const response = data.response || data.llm_response || data.error || JSON.stringify(data);
-      UI.addMessage(response, 'assistant');
+      const response = data.response || data.llm_response || data.error || 'No response from server.';
+      UI.addMessage(response, data.error ? 'error' : 'assistant');
 
       // Render clickable episode cards if transcript results were returned
       const results = data.transcript_results;

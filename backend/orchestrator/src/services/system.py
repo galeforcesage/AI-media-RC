@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # Allowlists  (mirrors mcp-linux for defense-in-depth)
 # ------------------------------------------------------------------
-ALLOWED_DOCKER_CONTAINERS = {"sagetv-server", "samsung-tvplus-for-channels", "nextcloud-redis"}
+ALLOWED_DOCKER_CONTAINERS = {"sagetv-server"}
 ALLOWED_SERVICES = {"sagetv", "channels-dvr", "docker"}
 
 # AI-media-RC component processes (not systemd) — keyed by service_id

@@ -1,5 +1,5 @@
 =========================================
-Appendix A — SageTV Capability Dictionary
+Appendix A ï¿½ SageTV Capability Dictionary
 =========================================
 This appendix defines the complete, authoritative capability dictionary for SageTV as exposed to the LLM through the SageTV MCP Server. It is the contract between:
 * The LLM
@@ -16,20 +16,65 @@ GitHub Copilot will use this dictionary to generate:
 This dictionary is exhaustive, deterministic, and LLMsafe.
 A.1 Overview
 The SageTV Capability Dictionary defines:
-1. Entities — objects the LLM can reference
-2. State — readonly information
-3. Actions — commands the LLM may invoke
-4. Resources — MCPexposed read endpoints
-5. Tools — MCPexposed write endpoints
-6. Safety Levels — SAFE, CONFIRM, DANGEROUS, OWNER
-7. Session Model — how playback sessions are resolved
-8. Playback Context Model — what the LLM sees about “what’s playing”
+1. Entities ï¿½ objects the LLM can reference
+2. State ï¿½ readonly information
+3. Actions ï¿½ commands the LLM may invoke
+4. Resources ï¿½ MCPexposed read endpoints
+5. Tools ï¿½ MCPexposed write endpoints
+6. Safety Levels ï¿½ SAFE, CONFIRM, DANGEROUS, OWNER
+7. Session Model ï¿½ how playback sessions are resolved
+8. Playback Context Model ï¿½ what the LLM sees about ï¿½whatï¿½s playingï¿½
 This dictionary is the only surface the LLM is allowed to use.
 A.2 Entity Model
 A.2.1 Media Entities
-EntityDescriptionFieldsRecordingA recorded TV airingid, title, episode, season, channel, start_time, end_time, watched, file_pathAiringA scheduled or upcoming airingid, title, channel, start_time, end_time, is_recordingMediaFileAny media file (recording or imported video)id, type, title, metadata, duration, watchedFavoriteA series recording ruleid, title, channel, padding, quality, enabledShowEPG show metadataid, title, description, actors, year, ratingChannelA TV channelid, number, name, lineupPlaylistA user playlistid, name, itemsA.2.2 Playback Entities
-EntityDescriptionFieldsPlaybackSessionActive playback instancesession_id, device_id, media_file_id, position, duration, stateDeviceA playback devicedevice_id, name, ip, type, capabilitiesA.2.3 System Entities
-EntityDescriptionFieldsTunerCapture deviceid, name, statusDiskStorage volumepath, free_space, total_spaceClientConnected SageTV clientid, ip, type, last_seenA.3 ReadOnly State (LLMVisible)
+Entity
+Description
+Fields
+Recording
+A recorded TV airing
+id, title, episode, season, channel, start_time, end_time, watched, file_path
+Airing
+A scheduled or upcoming airing
+id, title, channel, start_time, end_time, is_recording
+MediaFile
+Any media file (recording or imported video)
+id, type, title, metadata, duration, watched
+Favorite
+A series recording rule
+id, title, channel, padding, quality, enabled
+Show
+EPG show metadata
+id, title, description, actors, year, rating
+Channel
+A TV channel
+id, number, name, lineup
+Playlist
+A user playlist
+id, name, items
+A.2.2 Playback Entities
+Entity
+Description
+Fields
+PlaybackSession
+Active playback instance
+session_id, device_id, media_file_id, position, duration, state
+Device
+A playback device
+device_id, name, ip, type, capabilities
+A.2.3 System Entities
+Entity
+Description
+Fields
+Tuner
+Capture device
+id, name, status
+Disk
+Storage volume
+path, free_space, total_space
+Client
+Connected SageTV client
+id, ip, type, last_seen
+A.3 ReadOnly State (LLMVisible)
 The LLM may read:
 * Now playing media
 * Playback position
@@ -100,11 +145,41 @@ Administrative
 * clear_cache
 * run_library_scan
 These require:
-* “server owner wants you to:” prefix
+* ï¿½server owner wants you to:ï¿½ prefix
 * Authentication
 * Elevated session (15 minutes)
 A.5 MCP Resources (Read Endpoints)
-Resource URIDescriptionBacking APIsagetv://media/recordingsAll recordingsMediaFileAPI.GetMediaFiles("T")sagetv://media/videosImported videosMediaFileAPI.GetMediaFiles("V")sagetv://media/now-playingCurrent playbackMediaPlayerAPI.GetCurrentMediaFilesagetv://media/{id}Media file detailsMediaFileAPI.GetMediaFileForIDsagetv://channelsAll channelsChannelAPI.GetAllChannelssagetv://epg/search/{query}EPG searchShowAPI.SearchShowsByTitlesagetv://recordings/scheduledScheduled recordingsAiringAPI.GetScheduledRecordingssagetv://favoritesFavoritesFavoriteAPI.GetFavoritessagetv://system/statusDisk + tuner + clientsMultiple APIsA.6 MCP Tools (Write Endpoints)
+Resource URI
+Description
+Backing API
+sagetv://media/recordings
+All recordings
+MediaFileAPI.GetMediaFiles("T")
+sagetv://media/videos
+Imported videos
+MediaFileAPI.GetMediaFiles("V")
+sagetv://media/now-playing
+Current playback
+MediaPlayerAPI.GetCurrentMediaFile
+sagetv://media/{id}
+Media file details
+MediaFileAPI.GetMediaFileForID
+sagetv://channels
+All channels
+ChannelAPI.GetAllChannels
+sagetv://epg/search/{query}
+EPG search
+ShowAPI.SearchShowsByTitle
+sagetv://recordings/scheduled
+Scheduled recordings
+AiringAPI.GetScheduledRecordings
+sagetv://favorites
+Favorites
+FavoriteAPI.GetFavorites
+sagetv://system/status
+Disk + tuner + clients
+Multiple APIs
+A.6 MCP Tools (Write Endpoints)
 Below is the complete tool registry for SageTV.
 Each tool includes:
 * Name
@@ -143,7 +218,7 @@ seek_absolute
 * Safety: SAFE
 set_volume
 * API: MediaPlayerAPI.SetVolume
-* Params: level: integer (0–100)
+* Params: level: integer (0ï¿½100)
 * Safety: SAFE
 tune_channel
 * API: MediaPlayerAPI.WatchLive
@@ -206,7 +281,7 @@ The LLM receives a structured context block:
 Code
 {
   "device_id": "livingroom-shield",
-  "session_id": "mc-192.168.1.44",
+  "session_id": "mc-192.0.2.10",
   "media": {
     "id": "12345",
     "title": "Jeopardy!",

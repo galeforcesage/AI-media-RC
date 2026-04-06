@@ -1,5 +1,5 @@
 =========================================
-Appendix H — LLM Prompt Specification
+Appendix H ï¿½ LLM Prompt Specification
 =========================================
 This appendix defines the complete prompt engineering specification for the LLM Gateway.
 It is written explicitly for GitHub Copilot to implement:
@@ -65,7 +65,7 @@ Before sending the prompt to the LLM, the LLM Gateway must inject:
 device_id: "livingroom-shield"
 system: "sagetv"
 2. Session Context
-session_id: "mc-192.168.1.44"
+session_id: "mc-192.0.2.10"
 3. Playback Context
 media: {
   id: "12345",
@@ -119,7 +119,7 @@ SAFE Action
   "response_text": "Skipping ahead 30 seconds.",
   "tool": "sagetv_seek_relative",
   "tool_args": {
-    "session_id": "mc-192.168.1.44",
+    "session_id": "mc-192.0.2.10",
     "seconds": 30
   },
   "confirmation_required": false
@@ -136,9 +136,9 @@ CONFIRM Action
 H.7 Confirmation Logic
 For CONFIRM and DANGEROUS actions:
 1. LLM must ask for confirmation
-2. User must reply “yes” or “confirm”
+2. User must reply ï¿½yesï¿½ or ï¿½confirmï¿½
 3. LLM then issues the tool call
-If user says “no”:
+If user says ï¿½noï¿½:
 * LLM must cancel the action
 * Respond with a naturallanguage acknowledgment
 
@@ -168,7 +168,7 @@ If the user asks for something impossible:
 If the LLM cannot interpret the command:
 {
   "intent": "clarification_needed",
-  "response_text": "I’m not sure what you want to do. Can you rephrase it?",
+  "response_text": "Iï¿½m not sure what you want to do. Can you rephrase it?",
   "tool": null,
   "tool_args": null,
   "confirmation_required": false
@@ -188,22 +188,22 @@ Every response must include:
 * Confirmation prompts when needed
 
 H.12 Examples
-Example 1 — Skip Ahead
-User: “Jump ahead 2 minutes.”
+Example 1 ï¿½ Skip Ahead
+User: ï¿½Jump ahead 2 minutes.ï¿½
 LLM Output:
 {
   "intent": "seek_relative",
   "response_text": "Skipping ahead 120 seconds.",
   "tool": "sagetv_seek_relative",
   "tool_args": {
-    "session_id": "mc-192.168.1.44",
+    "session_id": "mc-192.0.2.10",
     "seconds": 120
   },
   "confirmation_required": false
 }
 
-Example 2 — Delete Recording
-User: “Delete this recording.”
+Example 2 ï¿½ Delete Recording
+User: ï¿½Delete this recording.ï¿½
 LLM Output:
 {
   "intent": "delete_recording",

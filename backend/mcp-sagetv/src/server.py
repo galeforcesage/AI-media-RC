@@ -31,7 +31,7 @@ class SageTVMCPServer:
         self.sagex = SageXClient(
             base_url=config.get("sagex_url", "http://localhost:8080"),
             username=config.get("sagex_user", "sage"),
-            password=config.get("sagex_pass", "frey"),
+            password=config.get("sagex_pass", ""),
         )
         self._server: Optional[asyncio.AbstractServer] = None
         # Event subscription state

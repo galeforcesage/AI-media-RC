@@ -5,7 +5,7 @@ main.py — Entrypoint for the SageTV MCP Server.
 Usage:
     python -m src.main [--host 127.0.0.1] [--port 8766] \
         [--sagex-url http://localhost:8080] \
-        [--sagex-user sage] [--sagex-pass frey] \
+        [--sagex-user USER] [--sagex-pass PASS] \
         [--debug]
 """
 
@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=8766)
     p.add_argument("--sagex-url", default="http://localhost:8080")
     p.add_argument("--sagex-user", default="sage")
-    p.add_argument("--sagex-pass", default="frey")
+    p.add_argument("--sagex-pass", default="")
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 

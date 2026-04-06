@@ -121,7 +121,6 @@ async def discover_channels_dirs(host: str = "127.0.0.1", port: int = 8767) -> L
 
     # Fallback: try common Channels DVR paths
     default_paths = [
-        "/home/sagetv/channels-dvr/data/TV",
         "/opt/channels-dvr/data/TV",
         "/var/channels-dvr/data/TV",
     ]

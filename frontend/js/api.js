@@ -2,7 +2,7 @@
  * api.js — HTTP client for the orchestrator and session manager.
  */
 const API = (() => {
-  const origin = window.location.origin;  // e.g. https://10.0.0.10
+  const origin = window.location.origin;
   let baseUrl = localStorage.getItem('api_url') || origin;
   let sessionUrl = localStorage.getItem('session_url') || `${origin}/session`;
 
@@ -12,13 +12,22 @@ const API = (() => {
   async function request(url, method = 'GET', body = null) {
     const opts = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'include' };
     if (body) opts.body = JSON.stringify(body);
-    const resp = await fetch(url, opts);
+    let resp;
+    try {
+      resp = await fetch(url, opts);
+    } catch (err) {
+      return { error: 'Network error. Check your connection.' };
+    }
     if (resp.status === 401) {
-      // Not authenticated — redirect to login
       window.location.href = '/login.html';
       throw new Error('unauthorized');
     }
-    return resp.json();
+    const text = await resp.text();
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return { error: resp.ok ? 'Unexpected response from server.' : 'Server error (' + resp.status + '). Try again.' };
+    }
   }
 
   // Auth
