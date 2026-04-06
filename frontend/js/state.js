@@ -2,8 +2,19 @@
  * state.js — Application state management.
  */
 const State = (() => {
+  // Safely parse llm_focus — may be a JSON array or a legacy plain string
+  let _llmFocus;
+  try {
+    const raw = localStorage.getItem('llm_focus');
+    const parsed = raw ? JSON.parse(raw) : null;
+    _llmFocus = Array.isArray(parsed) ? parsed : [parsed || 'sagetv'];
+  } catch (_) {
+    const raw = localStorage.getItem('llm_focus');
+    _llmFocus = raw ? [raw] : ['sagetv', 'channelsdvr'];
+  }
+
   const state = {
-    llmFocus: JSON.parse(localStorage.getItem('llm_focus') || '["sagetv","channelsdvr"]'),
+    llmFocus: _llmFocus,
     system: localStorage.getItem('system') || 'sagetv',
     deviceId: localStorage.getItem('device_id') || '',
     sessionId: '',  // Resolved session_id from session manager

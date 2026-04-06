@@ -111,11 +111,11 @@
         llmToggle.setAttribute('aria-expanded', 'false');
       }
     });
-    llmMenu.addEventListener('change', () => {
+    llmMenu.addEventListener('change', (e) => {
       const checked = [...llmMenu.querySelectorAll('input:checked')].map(cb => cb.value);
       if (checked.length === 0) {
         // Don't allow unchecking everything — re-check the one just unchecked
-        event.target.checked = true;
+        e.target.checked = true;
         return;
       }
       State.set({ llmFocus: checked });
