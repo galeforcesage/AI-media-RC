@@ -181,12 +181,14 @@ class AgentLoop:
     async def _build_system_prompt(self) -> str:
         """Build the system prompt with dynamically discovered paths and unified routing rules."""
         import datetime
-        today = datetime.date.today().strftime("%A, %B %d, %Y")
+        now = datetime.datetime.now().astimezone()
+        today = now.strftime("%A, %B %d, %Y")
+        current_time = now.strftime("%I:%M %p %Z")
         channels_path_line = await self._discover_system_paths()
         # Use string concatenation to avoid .format() conflicts with JSON braces in the prompt
         return (
             "You are the AI Media Remote Control assistant.\n"
-            f"Today's date is {today}.\n"
+            f"Today is {today}. Current time is {current_time}.\n"
             "You control four MCP servers:\n"
             "1. SageTV MCP (DVR engine) — tools prefixed sagetv_\n"
             "2. ChannelsDVR MCP (DVR engine) — tools prefixed channels_\n"
