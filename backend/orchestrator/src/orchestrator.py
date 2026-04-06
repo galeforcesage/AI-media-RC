@@ -232,9 +232,15 @@ class Orchestrator:
         prompt: str,
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
+        system: str | None = None,
     ) -> Dict[str, Any]:
         """Run a text query through the agentic tool-calling loop."""
-        logger.info("run_query (synthesize=%s)", synthesize)
+        logger.info("run_query (synthesize=%s, system=%s)", synthesize, system)
+
+        # Prepend system focus hint so the LLM routes to the correct MCP backend
+        if system:
+            system_label = "Channels DVR" if system == "channelsdvr" else "SageTV"
+            prompt = f"[System: {system_label}] {prompt}"
         try:
             # Pre-fetch transcript context so the LLM has immediate context
             transcript_context = ""

@@ -3,6 +3,7 @@
  */
 const State = (() => {
   const state = {
+    llmFocus: localStorage.getItem('llm_focus') || 'sagetv',
     system: localStorage.getItem('system') || 'sagetv',
     deviceId: localStorage.getItem('device_id') || '',
     sessionId: '',  // Resolved session_id from session manager
@@ -18,6 +19,7 @@ const State = (() => {
 
   function set(updates) {
     Object.assign(state, updates);
+    if (updates.llmFocus !== undefined) localStorage.setItem('llm_focus', updates.llmFocus);
     if (updates.system !== undefined) localStorage.setItem('system', updates.system);
     if (updates.deviceId !== undefined) localStorage.setItem('device_id', updates.deviceId);
     listeners.forEach(fn => fn(state));

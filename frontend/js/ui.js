@@ -5,7 +5,7 @@ const UI = (() => {
   // Element cache
   const el = {};
   const ids = [
-    'system-picker', 'device-picker',
+    'llm-focus', 'remote-system', 'device-picker',
     'np-title', 'np-episode', 'np-channel', 'np-state',
     'np-position', 'np-duration', 'seek-slider',
     'play-pause-icon', 'mute-icon', 'volume-slider',
@@ -119,6 +119,13 @@ const UI = (() => {
 
   function clearMessages() {
     el['messages'].innerHTML = '';
+  }
+
+  // ─── Picker Sync ──────────────────────────────────────────
+
+  function updatePicker(id, value) {
+    const picker = el[id];
+    if (picker && picker.value !== value) picker.value = value;
   }
 
   // ─── Device Picker ────────────────────────────────────────
@@ -259,7 +266,7 @@ const UI = (() => {
   return {
     cacheElements, updateNowPlaying, formatTime,
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
-    updateDevicePicker, updateStatus,
+    updatePicker, updateDevicePicker, updateStatus,
     renderDeviceList, renderServiceGrid, renderSystemOutput, renderTranscriptionStats,
     openSettings, openAdmin, refreshAdminDevices,
     el: () => el,

@@ -20,10 +20,18 @@
       <h1 class="logo">LLM Remote</h1>
     </div>
     <div class="header-controls">
-      <select id="system-picker" aria-label="Select system">
-        <option value="sagetv">SageTV</option>
-        <option value="channelsdvr">Channels DVR</option>
-      </select>
+      <label class="picker-label">LLM Focus
+        <select id="llm-focus" aria-label="LLM Focus">
+          <option value="sagetv">SageTV</option>
+          <option value="channelsdvr">Channels DVR</option>
+        </select>
+      </label>
+      <label class="picker-label">Remote Control
+        <select id="remote-system" aria-label="Remote Control system">
+          <option value="sagetv">SageTV</option>
+          <option value="channelsdvr">Channels DVR</option>
+        </select>
+      </label>
       <select id="device-picker" aria-label="Select device">
         <option value="">Select device...</option>
       </select>

@@ -70,7 +70,9 @@ async def execute_command(request: ExecuteRequest):
 
 class QueryRequest(BaseModel):
     """Request body for /query."""
-    text: str
+    text: str = ""
+    prompt: str = ""
+    system: Optional[str] = None
     synthesize: bool = False
 
 
@@ -102,7 +104,10 @@ async def query(request: QueryRequest):
     """Natural-language query with LLM reasoning over transcripts + metadata."""
     if _orchestrator is None:
         raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    result = await _orchestrator.run_query(request.text, synthesize=request.synthesize)
+    text = request.text or request.prompt
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text' or 'prompt' field")
+    result = await _orchestrator.run_query(text, synthesize=request.synthesize, system=request.system)
     return {"response": result.get("llm_response", result.get("response", result.get("error", str(result))))}
 
 
