@@ -180,6 +180,20 @@ class SageTVMCPServer:
                 "isError": True,
             }
 
+        # Safety gate
+        if entry.get("safety") in (Safety.CONFIRM, Safety.DANGEROUS, Safety.OWNER):
+            confirmed = arguments.pop("_confirmed", False)
+            if not confirmed:
+                return {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "success": False,
+                        "error": "confirmation_required",
+                        "message": f"Tool '{tool_name}' requires confirmation (safety={entry['safety'].value}). Re-send with _confirmed=true.",
+                        "safety": entry["safety"].value,
+                    })}],
+                    "isError": False,
+                }
+
         try:
             result = await entry["handler"](self.sagex, arguments)
 

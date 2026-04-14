@@ -36,7 +36,7 @@ class MCPClient:
             return
         try:
             self._reader, self._writer = await asyncio.open_connection(
-                self.host, self.port,
+                self.host, self.port, limit=1024 * 1024,  # 1 MB readline limit
             )
             logger.info("MCPClient[%s] connected to %s:%d", self.name, self.host, self.port)
         except (OSError, ConnectionRefusedError) as exc:

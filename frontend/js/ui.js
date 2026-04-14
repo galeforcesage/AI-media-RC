@@ -7,10 +7,13 @@ const UI = (() => {
   const ids = [
     'llm-focus', 'llm-focus-toggle', 'llm-focus-menu',
     'remote-system', 'device-picker',
+    'remote-controls', 'now-playing', 'transport-wrapper', 'transport',
     'np-title', 'np-episode', 'np-channel', 'np-state',
     'np-position', 'np-duration', 'seek-slider',
     'play-pause-icon', 'mute-icon', 'volume-slider',
     'btn-commercial-skip',
+    'dpad-section', 'dpad-sagetv', 'dpad-channels',
+    'btn-ch-up', 'btn-ch-down', 'btn-toggle-cc',
     'messages', 'text-input',
     'footer-status',
     'settings-dialog', 'admin-dialog',
@@ -26,13 +29,18 @@ const UI = (() => {
 
   // ─── Now‑Playing ──────────────────────────────────────────
 
-  function updateNowPlaying(session) {
+  function updateNowPlaying(session, deviceId) {
+    const hasDevice = !!deviceId;
+    if (el['remote-controls']) el['remote-controls'].hidden = !hasDevice;
+    const slider = el['seek-slider'];
     if (!session || !session.title) {
       el['np-title'].textContent = 'No active playback';
       el['np-episode'].textContent = '';
       el['np-channel'].textContent = '';
       el['np-state'].textContent = '';
-      el['seek-slider'].value = 0;
+      slider.value = 0;
+      slider.disabled = true;
+      slider.classList.add('disabled');
       el['np-position'].textContent = '0:00';
       el['np-duration'].textContent = '0:00';
       el['play-pause-icon'].textContent = '▶';
@@ -47,9 +55,18 @@ const UI = (() => {
 
     if (session.duration > 0) {
       const pct = (session.position / session.duration) * 100;
-      el['seek-slider'].value = pct;
+      slider.value = pct;
+      slider.disabled = false;
+      slider.classList.remove('disabled');
       el['np-position'].textContent = formatTime(session.position);
       el['np-duration'].textContent = formatTime(session.duration);
+    } else {
+      // Live TV or unknown duration — show position only, disable seek
+      slider.value = 0;
+      slider.disabled = true;
+      slider.classList.add('disabled');
+      el['np-position'].textContent = session.position > 0 ? formatTime(session.position) : '0:00';
+      el['np-duration'].textContent = 'LIVE';
     }
 
     // Show commercial skip for both SageTV (Comskip plugin) and Channels DVR
@@ -70,7 +87,43 @@ const UI = (() => {
   function addMessage(text, sender = 'user') {
     const bubble = document.createElement('div');
     bubble.className = `message ${sender}`;
-    bubble.textContent = text;
+    if (sender === 'assistant') {
+      // Linkify quoted show titles — "Title" becomes clickable
+      // esc() may or may not convert " to &quot; depending on browser
+      const safe = esc(text);
+      // First pass: convert both &quot; and " forms to clickable links
+      let linked = safe
+        .replace(/&quot;([^&<>]+?)&quot;/g,
+          '<a href="#" class="show-link" data-title="$1">&ldquo;$1&rdquo;</a>')
+        .replace(/"([^"<>]+?)"/g,
+          '<a href="#" class="show-link" data-title="$1">&ldquo;$1&rdquo;</a>');
+      // Second pass: for each line/list-item with 2+ show-links,
+      // tag the 2nd+ links with data-show from the 1st link (episod context)
+      const temp = document.createElement('div');
+      temp.innerHTML = linked;
+      for (const li of temp.querySelectorAll('*')) {
+        // Only process text-bearing elements (li, p, div, or top-level text)
+      }
+      // Process each line (split by <br> or within list items)
+      const lines = temp.innerHTML.split(/(<br\s*\/?>|\n)/);
+      const rebuilt = lines.map(line => {
+        const matches = [...line.matchAll(/data-title="([^"]+)"/g)];
+        if (matches.length >= 2) {
+          const showName = matches[0][1];
+          // Tag all links after the first with data-show
+          let first = true;
+          line = line.replace(/(<a href="#" class="show-link" data-title="[^"]+")>/g,
+            (full, prefix) => {
+              if (first) { first = false; return full; }
+              return prefix + ' data-show="' + showName + '">';
+            });
+        }
+        return line;
+      });
+      bubble.innerHTML = rebuilt.join('');
+    } else {
+      bubble.textContent = text;
+    }
     el['messages'].appendChild(bubble);
     el['messages'].scrollTop = el['messages'].scrollHeight;
   }
@@ -148,16 +201,37 @@ const UI = (() => {
 
   // ─── Device Picker ────────────────────────────────────────
 
-  function updateDevicePicker(devices, selectedId) {
+  function updateDevicePicker(devices, selectedId, bridgeDevices, system) {
     const picker = el['device-picker'];
     picker.innerHTML = '<option value="">Select device...</option>';
-    devices.forEach(d => {
-      const opt = document.createElement('option');
-      opt.value = d.device_id;
-      opt.textContent = d.friendly_name || d.device_id;
-      if (d.device_id === selectedId) opt.selected = true;
-      picker.appendChild(opt);
-    });
+
+    // Show registered session-manager devices
+    if (devices && devices.length > 0) {
+      devices.forEach(d => {
+        const opt = document.createElement('option');
+        opt.value = d.device_id;
+        opt.textContent = d.friendly_name || d.device_id;
+        if (d.device_id === selectedId) opt.selected = true;
+        picker.appendChild(opt);
+      });
+    }
+
+    // When Channels DVR is selected, show connected playback devices
+    if (system === 'channelsdvr' && bridgeDevices && bridgeDevices.length > 0) {
+      const group = document.createElement('optgroup');
+      group.label = 'Playback Devices (online)';
+      bridgeDevices.forEach(d => {
+        const opt = document.createElement('option');
+        const name = d.device_name || d.device_model || 'Unknown';
+        const icon = d.device_type === 'direct' ? '📺' : '🟢';
+        const label = d.device_type === 'direct' ? 'direct' : 'bridge';
+        opt.value = `bridge:${name}`;
+        opt.textContent = `${icon} ${name} (${d.device_model || ''} · ${label})`;
+        if (`bridge:${name}` === selectedId) opt.selected = true;
+        group.appendChild(opt);
+      });
+      picker.appendChild(group);
+    }
   }
 
   // ─── Connection Status ────────────────────────────────────
@@ -186,14 +260,21 @@ const UI = (() => {
     const table = document.createElement('table');
     table.className = 'admin-table';
     table.innerHTML = `<thead><tr>
-      <th>Name</th><th>Type</th><th>System</th><th>Default</th><th></th>
+      <th>Name</th><th>ID</th><th>System</th><th>Default</th><th></th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
     devices.forEach(d => {
       const tr = document.createElement('tr');
+      const nameDisplay = d.friendly_name && d.friendly_name !== d.device_id
+        ? esc(d.friendly_name)
+        : `<em>${esc(d.device_id)}</em>`;
+      // Show short context ID for sagetv-ctx- devices
+      const shortId = d.device_id.startsWith('sagetv-ctx-')
+        ? d.device_id.slice('sagetv-ctx-'.length)
+        : d.device_id;
       tr.innerHTML = `
-        <td>${esc(d.friendly_name || d.device_id)}</td>
-        <td>${esc(d.platform || '-')}</td>
+        <td class="device-name-cell" data-action="rename-device" data-id="${esc(d.device_id)}" data-name="${esc(d.friendly_name || '')}" title="Click to rename">${nameDisplay}</td>
+        <td class="device-id-cell">${esc(shortId)}</td>
         <td>${esc(d.system || '-')}</td>
         <td>${d.is_default ? '★' : ''}</td>
         <td>
@@ -281,8 +362,19 @@ const UI = (() => {
     return d.innerHTML;
   }
 
+  function updateDpad(system, deviceId) {
+    if (!el['dpad-section']) return;
+    const hasDevice = !!deviceId;
+    el['dpad-section'].hidden = !hasDevice;
+    // Show the right sub-panel
+    const sagePad = document.getElementById('dpad-sagetv');
+    const chPad = document.getElementById('dpad-channels');
+    if (sagePad) sagePad.hidden = system !== 'sagetv';
+    if (chPad) chPad.hidden = system !== 'channelsdvr';
+  }
+
   return {
-    cacheElements, updateNowPlaying, formatTime,
+    cacheElements, updateNowPlaying, formatTime, updateDpad,
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,

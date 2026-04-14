@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Any, Dict
 
 # Limit CPU threads for PyTorch/sentence-transformers BEFORE any imports
-# so the embedding model doesn't starve DVR services, Ollama, or Whisper
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("MKL_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "2")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+# so the embedding model doesn't starve DVR services, Ollama, or Whisper.
+# Use ~12% of cores (minimum 1) for embedding — it's a background task.
+_embed_threads = str(max(1, (os.cpu_count() or 4) // 8))
+os.environ.setdefault("OMP_NUM_THREADS", _embed_threads)
+os.environ.setdefault("MKL_NUM_THREADS", _embed_threads)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", _embed_threads)
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _embed_threads)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", _embed_threads)
 
 import uvicorn
 from fastapi import FastAPI

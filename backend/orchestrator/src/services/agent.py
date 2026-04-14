@@ -10,141 +10,201 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_ITERATIONS = 5
+MAX_ITERATIONS = 5  # default; overridden by config.agent.max_iterations
 
-TOOL_DEFINITIONS = """
-## Available Tools
+# Fields to strip from tool results before sending to the LLM.
+# These are useful for the frontend popup but waste LLM context tokens.
+_LLM_STRIP_FIELDS = {
+    "cast", "genres", "image", "content_rating", "is_hd", "path",
+    "description", "duration_min", "original_date", "channel", "start_time",
+}
 
-### SageTV DVR — Query & Metadata
-- **sagetv_get_now_playing**: What's currently playing on SageTV. Params: session_id (optional).
-- **sagetv_get_recordings**: List recordings with paging. Params: limit (int, optional), offset (int, optional).
-- **sagetv_search_recordings**: Search recordings by filters. Params: title (str, optional), channel (str, optional), start_date (str YYYY-MM-DD, optional, preferred), end_date (str YYYY-MM-DD, optional, preferred), start_time (epoch ms, optional), end_time (epoch ms, optional), watched (bool, optional), archived (bool, optional), recording_state (str, optional), limit (int, optional).
-- **sagetv_get_recent_recordings**: Most recently completed recordings. Params: limit (int, optional).
-- **sagetv_get_active_recordings**: Recordings currently in progress. No params.
-- **sagetv_get_upcoming_recordings**: Scheduled future recordings. No params.
-- **sagetv_search_shows**: Search the program guide by title. Params: query (str, required).
-- **sagetv_get_channels**: List all channels. No params.
-- **sagetv_get_channel**: Get channel info by station ID. Params: station_id (str, required).
-- **sagetv_get_disk_space**: Disk space info. No params.
-- **sagetv_get_tuner_status**: Tuner status. No params.
-- **sagetv_get_clients**: List connected SageTV clients. No params.
-- **sagetv_get_recording**: Get single recording (fully hydrated). Params: media_file_id (str, required).
-- **sagetv_get_airing**: Get airing by ID. Params: airing_id (str, required).
-- **sagetv_get_show**: Get show metadata. Params: show_id (str, required).
 
-### SageTV DVR — Playback Control
-- **sagetv_pause_playback**: Pause playback. Params: session_id (optional).
-- **sagetv_resume_playback**: Resume playback. Params: session_id (optional).
-- **sagetv_stop_playback**: Stop playback. Params: session_id (optional).
-- **sagetv_skip_forward**: Skip forward. Params: session_id (optional).
-- **sagetv_skip_back**: Skip backward. Params: session_id (optional).
-- **sagetv_seek_relative**: Seek by seconds. Params: session_id (optional), seconds (int, required).
-- **sagetv_seek_absolute**: Seek to absolute position. Params: session_id (optional), position_seconds (int, required).
-- **sagetv_set_volume**: Set volume 0-100. Params: session_id (optional), level (int, required).
-- **sagetv_mute**: Mute audio. Params: session_id (optional).
-- **sagetv_unmute**: Unmute audio. Params: session_id (optional).
-- **sagetv_commercial_skip**: Skip current commercial break. Params: session_id (optional).
-- **sagetv_get_commercial_segments**: Get commercial break segments. Params: media_file_id (str, required).
-- **sagetv_tune_channel**: Tune to a channel. Params: session_id (optional), channel (str, required).
+def _slim_for_llm(obj):
+    """Recursively strip frontend-only fields from tool results to save LLM tokens."""
+    if isinstance(obj, dict):
+        return {k: _slim_for_llm(v) for k, v in obj.items() if k not in _LLM_STRIP_FIELDS}
+    if isinstance(obj, list):
+        return [_slim_for_llm(item) for item in obj]
+    return obj
 
-### SageTV DVR — Navigation
-- **sagetv_open_recordings**: Navigate to recordings screen. Params: session_id (optional).
-- **sagetv_open_guide**: Navigate to program guide. Params: session_id (optional).
-- **sagetv_open_home**: Navigate to home screen. Params: session_id (optional).
-- **sagetv_open_live_tv**: Navigate to live TV. Params: session_id (optional).
+# Tool definitions split by system for filtering based on user's LLM Focus selection.
+# Keys: "sagetv", "channelsdvr", "shared" (linux + transcript — always included)
+# COMPACT format: tool(required_param, optional_param?) — description
+_TOOL_SECTIONS = {
+    "sagetv": """
+## SageTV Tools
+Query: sagetv_search_recordings(title?, channel?, start_date? YYYY-MM-DD, end_date? YYYY-MM-DD, limit?) | sagetv_get_recordings(limit?, offset?) | sagetv_get_recent_recordings(limit?) | sagetv_get_active_recordings() | sagetv_get_upcoming_recordings() | sagetv_get_now_playing() | sagetv_search_shows(query) | sagetv_get_recording(media_file_id) | sagetv_get_airing(airing_id) | sagetv_get_show(show_id)
+System: sagetv_get_channels() | sagetv_get_channel(station_id) | sagetv_get_disk_space() | sagetv_get_tuner_status() | sagetv_get_clients()
+Playback: sagetv_pause_playback() | sagetv_resume_playback() | sagetv_stop_playback() | sagetv_skip_forward() | sagetv_skip_back() | sagetv_seek_relative(seconds) | sagetv_seek_absolute(position_seconds) | sagetv_set_volume(level) | sagetv_mute() | sagetv_unmute() | sagetv_commercial_skip() | sagetv_tune_channel(channel)
+Nav: sagetv_open_recordings() | sagetv_open_guide() | sagetv_open_home() | sagetv_open_live_tv()
+Manage: sagetv_record_show(airing_id) | sagetv_cancel_recording(airing_id) | sagetv_delete_media_file(media_file_id) | sagetv_set_watched(airing_id, watched?) | sagetv_set_archived(media_file_id, archived?)
+Favorites: sagetv_create_favorite(title, channel?) | sagetv_remove_favorite(favorite_id)
+Config: sagetv_get_config_value(key) | sagetv_set_config_value(key, value) | sagetv_run_library_scan()
+""",
 
-### SageTV DVR — Recording Management (CONFIRM required)
-- **sagetv_record_show**: Schedule a recording. Params: airing_id (str, required).
-- **sagetv_cancel_recording**: Cancel scheduled recording. Params: airing_id (str, required).
-- **sagetv_delete_media_file**: Permanently delete recorded file. Params: media_file_id (str, required).
-- **sagetv_set_watched**: Mark watched/unwatched. Params: airing_id (str, required), watched (bool, optional, default true).
-- **sagetv_set_archived**: Archive/protect from auto-delete. Params: media_file_id (str, required), archived (bool, optional, default true).
+    "channelsdvr": """
+## Channels DVR Tools
+Search recordings: channels_search_recordings(title?, channel?, start_date? YYYY-MM-DD, end_date? YYYY-MM-DD, limit?) — USE THIS to find what was recorded on a date
+List recordings: channels_get_recordings(limit?) — list all recordings
+Upcoming: channels_get_upcoming_recordings(date? YYYY-MM-DD, start_date? YYYY-MM-DD, end_date? YYYY-MM-DD) — list upcoming episodes scheduled to record. Use date for a single day (defaults to today), or start_date+end_date for a range (e.g. this week). USE THIS for "what's recording today/tonight/this week"
+Live: channels_get_now_playing() — what is airing live right now
+EPG: channels_search_epg(query) — search the electronic program guide for upcoming shows
+Info: channels_get_channels() | channels_get_storage_status() | channels_get_jobs() | channels_get_clients()
+Passes: channels_get_scheduled_recordings() — lists recording RULES/passes, NOT actual recordings
+Playback: channels_get_bridge_devices() | channels_get_playback_status(device?) | channels_pause_playback(device?) | channels_resume_playback(device?) | channels_toggle_pause(device?) | channels_stop_playback(device?) | channels_skip_commercial(device?) | channels_seek_relative(seconds, device?) | channels_seek_forward(device?) | channels_seek_backward(device?) | channels_toggle_mute(device?) | channels_toggle_cc(device?) | channels_play_channel(channel_number, device?) | channels_play_recording(recording_id, device?) | channels_channel_up(device?) | channels_channel_down(device?)
+Manage: channels_schedule_recording(program_id, channel) | channels_schedule_series_recording(series_id, channel?) | channels_cancel_scheduled_recording(id) | channels_delete_recording(id) | channels_delete_recording_file(id) | channels_regenerate_commercial_markers(id)
+System: channels_clear_cache() | channels_rebuild_index()
+""",
 
-### SageTV DVR — Favorites
-- **sagetv_create_favorite**: Create series recording favorite. Params: title (str, required), channel (str, optional).
-- **sagetv_remove_favorite**: Remove series favorite. Params: favorite_id (str, required).
+    "shared": """
+## Linux Tools
+Info: linux_disk_usage() | linux_memory_info() | linux_uptime() | linux_network_info()
+Files: linux_list_directory(path) | linux_file_info(path) | linux_count_files(root, pattern) | linux_find_large_files(root, sort_by?, extension?)
+Services: linux_service_status(service_name) | linux_restart_service(service_name) | linux_docker_ps() | linux_docker_restart(container) | linux_docker_logs(container, lines?) | linux_tail_log(path, lines?)
+Danger: linux_reboot_server() | linux_shutdown_server() | linux_restart_nginx()
 
-### SageTV DVR — Configuration & System
-- **sagetv_get_config_value**: Get SageTV config property. Params: key (str, required).
-- **sagetv_set_config_value**: Set SageTV config property. Params: key (str, required), value (str, required).
-- **sagetv_run_library_scan**: Trigger library rescan. No params.
-- **sagetv_get_media_file_property**: Get custom metadata. Params: media_file_id (str, required), key (str, required).
-- **sagetv_set_media_file_property**: Set custom metadata. Params: media_file_id (str, required), key (str, required), value (str, required).
+## Transcript Tools
+transcript_search(query, limit?) | transcript_cross_search(query, actor?, genre?, channel?, date_from?, date_to?, limit?) | transcript_actors(actor_name, limit?) | transcript_stats() | transcript_get(recording_id) | transcript_recording_summary(recording_id) | transcript_jobs(status?) | transcript_reindex(directory?)
+""",
+}
 
-### Channels DVR — Query & Metadata
-- **channels_get_now_playing**: Active playback sessions on Channels DVR. No params.
-- **channels_get_recordings**: List DVR recordings. Params: limit (int, optional).
-- **channels_search_recordings**: Search Channels DVR recordings by filters. Params: title (str, optional), channel (str, optional), start_date (str YYYY-MM-DD, optional), end_date (str YYYY-MM-DD, optional), limit (int, optional).
-- **channels_search_epg**: Search the EPG. Params: query (str, required).
-- **channels_get_channels**: List all channels. No params.
-- **channels_get_storage_status**: DVR storage info including recording directory path. No params.
-- **channels_get_scheduled_recordings**: Get all recording rules. No params.
-- **channels_get_jobs**: Get all DVR jobs (recording, comskip, transcode). No params.
-- **channels_get_clients**: List connected Channels DVR clients. No params.
 
-### Channels DVR — Playback Control
-- **channels_pause_playback**: Pause. Params: session_id (str, required).
-- **channels_resume_playback**: Resume. Params: session_id (str, required).
-- **channels_stop_playback**: Stop. Params: session_id (str, required).
-- **channels_skip_commercial**: Skip commercial. Params: session_id (str, required).
-- **channels_seek_relative**: Seek forward/back. Params: session_id (str, required), seconds (int, required).
-- **channels_seek_absolute**: Seek to position. Params: session_id (str, required), position_seconds (int, required).
-- **channels_previous_commercial**: Jump to previous commercial marker. Params: session_id (str, required).
-- **channels_set_playback_speed**: Set playback speed. Params: session_id (str, required), rate (float, required).
+def _build_tool_definitions(systems: list[str] | None = None) -> str:
+    """Build tool definitions text filtered by the active systems (static fallback)."""
+    parts = ["## Available Tools\n"]
+    all_systems = {"sagetv", "channelsdvr"}
+    active = set(systems) if systems else all_systems
+    if "sagetv" in active:
+        parts.append(_TOOL_SECTIONS["sagetv"])
+    if "channelsdvr" in active:
+        parts.append(_TOOL_SECTIONS["channelsdvr"])
+    parts.append(_TOOL_SECTIONS["shared"])
+    return "".join(parts)
 
-### Channels DVR — Recording Management (CONFIRM required)
-- **channels_schedule_recording**: Schedule one-time recording. Params: program_id (str, required), channel (str, required), start_time (str, optional), end_time (str, optional).
-- **channels_schedule_series_recording**: Schedule series pass. Params: series_id (str, required), channel (str, optional), options (dict, optional).
-- **channels_cancel_scheduled_recording**: Cancel recording rule. Params: id (str, required).
-- **channels_delete_recording**: Mark recording for removal. Params: id (str, required).
-- **channels_delete_recording_file**: Permanently delete recording file. Params: id (str, required).
-- **channels_regenerate_commercial_markers**: Regenerate commercial markers. Params: id (str, required).
 
-### Channels DVR — System
-- **channels_clear_cache**: Clear Channels DVR cache. No params.
-- **channels_rebuild_index**: Rebuild media index. No params.
+def _schema_to_compact(name: str, schema: Dict, description: str = "") -> str:
+    """Convert a JSON Schema tool definition to compact one-liner format.
 
-### Linux System — Info
-- **linux_disk_usage**: Disk usage for all mounts. No params.
-- **linux_memory_info**: RAM usage. No params.
-- **linux_uptime**: Uptime and load averages. No params.
-- **linux_network_info**: Network interfaces. No params.
+    Example: tool_name(required, optional?)
+    Description is only appended when explicitly provided.
+    """
+    props = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    params = []
+    for pname, pdef in props.items():
+        if pname.startswith("_"):
+            continue  # skip internal params like _confirmed
+        suffix = "" if pname in required else "?"
+        pdesc = pdef.get("description", "")
+        fmt = pdef.get("format", "")
+        # Add format hint for dates
+        hint = ""
+        if "YYYY-MM-DD" in pdesc or fmt == "date":
+            hint = " YYYY-MM-DD"
+        params.append(f"{pname}{suffix}{hint}")
+    param_str = ", ".join(params)
+    base = f"{name}({param_str})"
+    return f"{base} — {description}" if description else base
 
-### Linux System — File Operations
-- **linux_count_files**: Count files matching a glob. Params: root (str, required), pattern (str, required).
-- **linux_list_directory**: List files in a directory. Params: path (str, required).
-- **linux_file_info**: Get file/directory metadata. Params: path (str, required).
-- **linux_find_large_files**: Find large files. Params: root (str, required), sort_by (str, optional: "size"/"age"), extension (str, optional).
 
-### Linux System — Services & Docker
-- **linux_docker_ps**: List running Docker containers. No params.
-- **linux_service_status**: Get status of a system service. Params: service_name (str, required).
-- **linux_restart_service**: Restart a system service. Params: service_name (str, required).
-- **linux_docker_restart**: Restart a Docker container. Params: container (str, required).
-- **linux_docker_logs**: View container logs. Params: container (str, required), lines (int, optional).
-- **linux_tail_log**: View last N lines of a log file. Params: path (str, required), lines (int, optional, max 500).
+# Hints for key tools that need disambiguation in the prompt
+_KEY_TOOL_HINTS: Dict[str, str] = {
+    "channels_search_recordings": "USE THIS to find what was recorded on a date",
+    "channels_get_upcoming_recordings": "USE THIS for 'what's recording today/tonight/this week'",
+    "channels_get_scheduled_recordings": "lists recording RULES/passes, NOT actual recordings",
+    "channels_get_now_playing": "what is airing live right now",
+    "channels_search_epg": "search program guide for upcoming shows",
+    "sagetv_search_recordings": "search recordings by title/date",
+}
 
-### Linux System — Server Control (DANGEROUS)
-- **linux_reboot_server**: Reboot the Linux server. No params.
-- **linux_shutdown_server**: Shut down the Linux server. No params.
-- **linux_restart_nginx**: Restart nginx. No params.
 
-### Transcript Search
-- **transcript_search**: Full-text search across all transcripts. Params: query (str, required), limit (int, optional).
-- **transcript_cross_search**: Search with metadata filters. Params: query (str, required), actor (str, optional), genre (str, optional), channel (str, optional), date_from (str, optional), date_to (str, optional), limit (int, optional).
-- **transcript_actors**: Find recordings featuring an actor. Params: actor_name (str, required), limit (int, optional).
-- **transcript_stats**: Transcription statistics. No params.
-- **transcript_get**: Get transcript for a recording. Params: recording_id (str, required).
-- **transcript_recording_summary**: Get enriched summary (metadata+actors+transcript). Params: recording_id (str, required).
-- **transcript_jobs**: List transcription job queue. Params: status (str, optional: pending/processing/done/error).
-- **transcript_reindex**: Reindex transcript sidecar files. Params: directory (str, optional).
-"""
+def _categorize_tool(name: str) -> str:
+    """Assign a display category to a tool based on its name."""
+    for prefix in ("channels_", "sagetv_", "linux_", "transcript_"):
+        if name.startswith(prefix):
+            action = name[len(prefix):]
+            break
+    else:
+        return "Other"
+
+    if any(w in action for w in ("search", "get_recording", "get_recent", "get_active",
+           "get_upcoming", "get_now_playing", "get_airing", "get_show")):
+        return "Query"
+    if any(w in action for w in ("play", "pause", "resume", "stop", "seek", "skip",
+           "mute", "unmute", "volume", "commercial", "channel_up", "channel_down",
+           "toggle", "tune")):
+        return "Playback"
+    if "open_" in action:
+        return "Nav"
+    if any(w in action for w in ("record", "cancel", "delete", "set_watched",
+           "set_archived", "regenerate", "schedule", "favorite")):
+        return "Manage"
+    if any(w in action for w in ("config", "scan", "cache", "rebuild", "clear",
+           "reindex")):
+        return "Config"
+    if any(w in action for w in ("get_channel", "get_disk", "get_storage", "get_tuner",
+           "get_client", "get_job", "get_bridge", "get_playback_status",
+           "get_scheduled", "disk_usage", "memory", "uptime", "network")):
+        return "Info"
+    if any(w in action for w in ("list_directory", "file_info", "count_files",
+           "find_large")):
+        return "Files"
+    if any(w in action for w in ("service", "docker", "tail_log")):
+        return "Services"
+    if any(w in action for w in ("reboot", "shutdown", "restart")):
+        return "Danger"
+    return "Other"
+
+
+# Human-readable status messages for tool calls shown in the UI
+_TOOL_STATUS = {
+    "channels_search_recordings": "Searching Channels DVR recordings",
+    "channels_get_recordings": "Fetching Channels DVR recordings",
+    "channels_get_now_playing": "Checking what's playing now",
+    "channels_search_epg": "Searching the program guide",
+    "channels_get_channels": "Getting channel lineup",
+    "channels_get_storage_status": "Checking DVR storage",
+    "channels_get_scheduled_recordings": "Getting scheduled recordings",
+    "channels_get_jobs": "Checking DVR jobs",
+    "channels_get_clients": "Getting connected clients",
+    "sagetv_search_recordings": "Searching SageTV recordings",
+    "sagetv_get_recordings": "Fetching SageTV recordings",
+    "sagetv_get_recent_recordings": "Getting recent recordings",
+    "sagetv_get_active_recordings": "Checking active recordings",
+    "sagetv_get_upcoming_recordings": "Getting upcoming recordings",
+    "sagetv_get_now_playing": "Checking what's playing now",
+    "sagetv_search_shows": "Searching SageTV shows",
+    "transcript_search": "Searching transcripts",
+    "transcript_cross_search": "Cross-searching transcripts",
+    "transcript_stats": "Getting transcript stats",
+    "linux_disk_usage": "Checking disk usage",
+    "linux_memory_info": "Checking memory",
+    "linux_uptime": "Checking system uptime",
+    "linux_service_status": "Checking service status",
+    "linux_docker_ps": "Listing containers",
+}
+
+
+def _tool_status_message(tool_name: str) -> str:
+    """Return a human-readable status message for a tool call."""
+    if tool_name in _TOOL_STATUS:
+        return _TOOL_STATUS[tool_name]
+    # Fallback: derive from tool name
+    for prefix, system in [("channels_", "Channels DVR"), ("sagetv_", "SageTV"),
+                           ("linux_", "system"), ("transcript_", "transcripts")]:
+        if tool_name.startswith(prefix):
+            action = tool_name[len(prefix):].replace("_", " ")
+            if "play" in action or "pause" in action or "stop" in action or "seek" in action:
+                return f"Controlling {system} playback"
+            return f"Querying {system}"
+    return f"Running {tool_name}"
 
 
 class AgentLoop:
@@ -152,6 +212,79 @@ class AgentLoop:
 
     def __init__(self, orchestrator: Any) -> None:
         self._orch = orchestrator
+        self._max_iterations = orchestrator.config.get("agent", {}).get(
+            "max_iterations", MAX_ITERATIONS
+        )
+        self._dynamic_tools: Dict[str, str] | None = None  # cached dynamic tool text
+
+    async def _discover_tools(self, systems: list[str] | None = None) -> str:
+        """Query each MCP server's tools/list and build compact grouped tool definitions.
+
+        Produces compact output matching the static format: tools grouped by category
+        with | separators, descriptions only for key tools that need disambiguation.
+        Falls back to static _TOOL_SECTIONS if servers are unreachable.
+        """
+        from collections import defaultdict
+
+        all_systems = {"sagetv", "channelsdvr"}
+        active = set(systems) if systems else all_systems
+
+        sections: Dict[str, str] = {}
+
+        # Map system names to MCP clients and section headers
+        server_map = []
+        if "channelsdvr" in active and hasattr(self._orch, "_channels"):
+            server_map.append(("channelsdvr", self._orch._channels, "Channels DVR"))
+        if "sagetv" in active and hasattr(self._orch, "_sagetv"):
+            server_map.append(("sagetv", self._orch._sagetv, "SageTV"))
+        # Always include linux + transcript
+        if hasattr(self._orch, "_linux"):
+            server_map.append(("linux", self._orch._linux, "Linux"))
+
+        # Ordered categories for output
+        _CAT_ORDER = ("Query", "Info", "Playback", "Nav", "Manage", "Config",
+                       "Files", "Services", "Danger", "Other")
+
+        for sys_key, client, label in server_map:
+            try:
+                tools = await client.list_tools()
+                # Group tools by category
+                categories: Dict[str, list] = defaultdict(list)
+                for t in tools:
+                    schema = t.get("inputSchema", {})
+                    hint = _KEY_TOOL_HINTS.get(t["name"], "")
+                    compact = _schema_to_compact(t["name"], schema, hint)
+                    cat = _categorize_tool(t["name"])
+                    categories[cat].append(compact)
+
+                lines = [f"\n## {label} Tools"]
+                for cat in _CAT_ORDER:
+                    if cat in categories:
+                        lines.append(f"{cat}: {' | '.join(categories[cat])}")
+                sections[sys_key] = "\n".join(lines) + "\n"
+                logger.info("Discovered %d tools from %s", len(tools), label)
+            except Exception as exc:
+                logger.warning("Could not discover %s tools: %s — using static fallback", label, exc)
+                # Fall back to static section
+                fallback_key = {"channelsdvr": "channelsdvr", "sagetv": "sagetv", "linux": "shared"}.get(sys_key)
+                if fallback_key and fallback_key in _TOOL_SECTIONS:
+                    sections[sys_key] = _TOOL_SECTIONS[fallback_key]
+
+        # Transcript tools always from static (direct TCP, no list_tools)
+        if "linux" not in sections:
+            sections["linux"] = _TOOL_SECTIONS["shared"]
+        else:
+            # Append transcript tools from static since they're on a separate server
+            sections["linux"] += "\n## Transcript Tools\n" + "\n".join(
+                line for line in _TOOL_SECTIONS["shared"].split("\n")
+                if line.strip().startswith("transcript_")
+            ) + "\n"
+
+        parts = ["## Available Tools\n"]
+        for key in ("channelsdvr", "sagetv", "linux"):
+            if key in sections:
+                parts.append(sections[key])
+        return "".join(parts)
 
     async def _discover_system_paths(self) -> str:
         """Pre-discover dynamic paths from MCP servers for injection into the prompt."""
@@ -179,137 +312,72 @@ class AgentLoop:
             )
         return "".join(lines)
 
-    async def _build_system_prompt(self) -> str:
+    async def _build_system_prompt(self, systems: list[str] | None = None) -> str:
         """Build the system prompt with dynamically discovered paths and unified routing rules."""
         import datetime
         now = datetime.datetime.now().astimezone()
         today = now.strftime("%A, %B %d, %Y")
         current_time = now.strftime("%I:%M %p %Z")
         channels_path_line = await self._discover_system_paths()
-        # Use string concatenation to avoid .format() conflicts with JSON braces in the prompt
+
+        # Determine which DVR systems are active
+        all_systems = {"sagetv", "channelsdvr"}
+        active = set(systems) if systems else all_systems
+        has_sagetv = "sagetv" in active
+        has_channels = "channelsdvr" in active
+        both = has_sagetv and has_channels
+
+        # Scope line
+        if both:
+            scope_line = "Both SageTV (sagetv_ tools) and Channels DVR (channels_ tools) are active."
+        elif has_channels:
+            scope_line = "Only Channels DVR is active. Use ONLY channels_ tools. Never mention SageTV."
+        else:
+            scope_line = "Only SageTV is active. Use ONLY sagetv_ tools. Never mention Channels DVR."
+
+        # Search tool names
+        search_tools = []
+        if has_sagetv:
+            search_tools.append("sagetv_search_recordings")
+        if has_channels:
+            search_tools.append("channels_search_recordings")
+
         return (
-            "You are the AI Media Remote Control assistant.\n"
-            f"Today is {today}. Current time is {current_time}.\n"
-            "You control four MCP servers:\n"
-            "1. SageTV MCP (DVR engine) — tools prefixed sagetv_\n"
-            "2. ChannelsDVR MCP (DVR engine) — tools prefixed channels_\n"
-            "3. Linux MCP (filesystem/system helper) — tools prefixed linux_\n"
-            "4. Transcript Index (semantic search) — tools prefixed transcript_\n\n"
+            f"You are an AI media assistant. Today: {today}, {current_time}.\n"
+            f"{scope_line}\n\n"
 
-            "SageTV and ChannelsDVR are functionally identical DVRs targeting different backends. "
-            "All DVR logic applies equally to both.\n\n"
-
-            "To use a tool, respond with ONLY a tool call in this exact format:\n\n"
+            "TOOL CALL FORMAT — respond with ONLY this when calling a tool:\n"
             "<tool_call>\n"
             '{"tool": "tool_name", "args": {"param": "value"}}\n'
             "</tool_call>\n\n"
 
-            # ---- MCP SERVER SELECTION (ROUTING) ----
-            "MCP SERVER SELECTION RULES:\n\n"
+            "RULES:\n"
+            "- For date-based queries (today, yesterday, last week), ALWAYS call the DVR search tool with start_date/end_date. Do not answer from context alone.\n"
+            "- For 'what is recording today', 'what's scheduled', 'upcoming recordings', ALWAYS call sagetv_get_upcoming_recordings() and/or channels_get_upcoming_recordings(). Never answer from memory.\n"
+            "- Use DVR tools for recordings, playback, EPG. Use linux_ tools only for filesystem/services.\n"
+            "- For date searches, use start_date/end_date as YYYY-MM-DD in "
+            + "/".join(search_tools) + ".\n"
+            "- Never delete DVR files via linux_ tools. Use the DVR's delete tool.\n"
+            "- Destructive tools require user confirmation first.\n"
+            "- On tool error, tell the user briefly. Do NOT retry.\n"
+            "- Final answers: plain language, concise. No JSON, no tool names, no code blocks, no IDs.\n"
+            "- Never include server file paths or directory paths in answers.\n"
+            "- Never describe your reasoning steps. Just give the answer.\n"
+            "- Only use tools listed below.\n\n"
 
-            "USE A DVR MCP (sagetv_ or channels_) FOR:\n"
-            "- Recording metadata, search, deletion, playback\n"
-            "- Resume, seek, skip, commercial skip\n"
-            "- Airings, EPG, favorites, passes, rules\n"
-            "- Retrieving recording file paths\n"
-            "- DVR-level rescan/reindex\n"
-            "- Any action involving a show, episode, or recording\n\n"
+            "OUTPUT FORMAT:\n"
+            "- ALWAYS wrap every show name in double quotes: \"NCIS\", \"Will Trent\"\n"
+            "- ALWAYS include the episode title from the tool result and wrap it in double quotes.\n"
+            "- Format: \"ShowName\" \"EpisodeTitle\" S##E## — every line MUST have all three parts.\n"
+            "- Example: \"NCIS\" \"Toil and Trouble\" S23E19\n"
+            "- Do NOT omit episode titles. Do NOT skip them. The user needs them.\n"
+            "- Do NOT include descriptions, air times, or channel numbers unless asked.\n\n"
 
-            "USE LINUX MCP ONLY FOR:\n"
-            "- Directory listing, disk usage, file size, file existence\n"
-            "- Reading raw files, counting files by pattern\n"
-            "- Service/container status, log viewing\n"
-            "- Moving/deleting ONLY orphaned files (never DVR-managed files)\n"
-            "- Validating file paths returned by DVR MCPs\n\n"
-
-            "USE TRANSCRIPT INDEX FOR:\n"
-            "- Semantic search: quotes, scenes, characters, dialogue\n"
-            "- 'Which episode has the line...', 'Find the scene where...'\n"
-            "- Mapping transcript results back to recordings via DVR metadata\n\n"
-
-            # ---- ENTITY EXTRACTION ----
-            "ENTITY EXTRACTION:\n"
-            "When the user mentions a show, reduce it to minimal search text "
-            "(e.g. 'big bang theory', 'law order svu'). "
-            "Search using the DVR MCP's search tool, select the canonical match, "
-            "and use canonical IDs in the final tool call. "
-            "If the match is ambiguous, ask the user.\n\n"
-
-            # ---- TRANSCRIPT-AWARE ROUTING ----
-            "TRANSCRIPT-AWARE ROUTING:\n"
-            "If the user references quotes, scenes, or dialogue:\n"
-            "1. Query transcript_search or transcript_cross_search\n"
-            "2. Resolve transcript result to a recording_id and timestamp\n"
-            "3. Use the correct DVR MCP to act on that recording "
-            "(e.g. play at offset, delete, get metadata)\n\n"
-
-            # ---- MULTI-MCP ORCHESTRATION PATTERNS ----
-            "MULTI-MCP ORCHESTRATION PATTERNS:\n"
-            "A) Delete recording: search DVR → canonicalize → find recording → delete via DVR MCP\n"
-            "B) File size of recording: search DVR → get file path from metadata → linux_file_info(path)\n"
-            "C) Orphaned file cleanup: get DVR file lists → get filesystem listing → compute orphans → delete via Linux MCP\n"
-            "D) Transcript playback: transcript_search → resolve recording+timestamp → DVR play at offset\n\n"
-
-            # ---- DISCOVERED PATHS ----
-            "KNOWN PATHS:\n"
-            "- SageTV recordings are stored at /var/media/tv\n"
-            + channels_path_line +
-            "- Both SageTV and Channels DVR use .vprj sidecar files alongside recordings (.mpg, .ts)\n\n"
-
-            # ---- SAFETY RULES ----
-            "SAFETY RULES:\n"
-            "- NEVER delete DVR-managed files via Linux MCP. Use the DVR's own delete tool.\n"
-            "- Tools marked CONFIRM require confirmation before executing destructive actions.\n"
-            "- Tools marked DANGEROUS (server reboot/shutdown) should only be used if the user explicitly requests it.\n"
-            "- Never hallucinate file paths. Retrieve paths from DVR metadata or discovered paths above.\n\n"
-
-            # ---- OUTPUT RULES ----
-            "OUTPUT RULES:\n"
-            "1. When making a tool call, output ONLY the <tool_call> block — no other text.\n"
-            "2. When giving your final answer, use plain conversational language.\n"
-            "3. NEVER include raw JSON, tool names, or tool result data in your final answer.\n"
-            "4. NEVER say 'Tool:', 'Result:', or reference tool names in your response.\n"
-            "5. Summarize tool results in natural language.\n"
-            "6. If a tool returns an error, briefly tell the user the service is offline.\n"
-            "7. Do NOT retry a tool that returned an error.\n"
-            "8. Keep answers concise — 1 to 3 sentences when possible.\n"
-            "9. Only use tools listed below. Do not invent tool names.\n"
-            "10. NEVER use placeholder values like '<path from ...>'. Use only real values you know.\n"
-            "11. If the DVR target is ambiguous (SageTV vs ChannelsDVR), ask the user.\n"
-            "12. NEVER output code blocks (```), import statements, or pseudo-code in your answer. "
-            "You are NOT a coding assistant — you are a media assistant.\n"
-            "13. NEVER describe your reasoning steps, filtering process, or methodology. "
-            "Just present the final result directly.\n"
-            "14. Do NOT say 'Here is how I will do it', 'Step 1', 'Let me filter', etc. "
-            "Just give the answer.\n\n"
-
-            # ---- RECORDING PRESENTATION ----
-            "RECORDING PRESENTATION:\n"
-            "When listing recordings, always include for each:\n"
-            "- Show title and episode title\n"
-            "- Season/episode number if available (e.g. S07E04)\n"
-            "- Air date or recording date (use the StartDate or AiringStartDate field which is human-readable)\n"
-            "- Episode description/synopsis\n"
-            "SageTV recording objects contain Airing → Show with fields: "
-            "ShowTitle, ShowEpisode (episode title), ShowDescription, ShowSeasonNumber, ShowEpisodeNumber, ShowExternalID. "
-            "Always check the ShowDescription field and present it as a brief summary of the episode.\n"
-            "Enriched recordings also include StartDate and EndDate as readable date strings.\n"
-            "Channels DVR recordings contain Airing with fields: "
-            "Title, EpisodeTitle, Summary, SeasonNumber, EpisodeNumber, Channel, Time. "
-            "Always present the Summary as a brief description.\n"
-            "Enriched Channels DVR recordings also include AirDate and RecordedDate as readable date strings.\n\n"
-
-            # ---- TIMESTAMP HINTS ----
-            "TIMESTAMP HINTS:\n"
-            "Recording objects now include human-readable date fields:\n"
-            "- SageTV: StartDate, EndDate, AiringStartDate (e.g. '2026-04-05 08:00 PM')\n"
-            "- Channels DVR: AirDate, RecordedDate (e.g. '2026-04-05 10:00 PM')\n"
-            "Use these to verify dates instead of trying to convert epoch values.\n"
-            "For both sagetv_search_recordings and channels_search_recordings, "
-            "use start_date and end_date parameters with YYYY-MM-DD format "
-            "(e.g. start_date='2026-04-05', end_date='2026-04-05' to find recordings from April 5). "
-            "Do NOT try to compute epoch values yourself.\n\n"
-            + TOOL_DEFINITIONS
+            "PATHS:\n"
+            + ("- SageTV: /var/media/tv\n" if has_sagetv else "")
+            + (channels_path_line if has_channels else "")
+            + "\n"
+            + await self._discover_tools(systems)
         )
 
     async def run(
@@ -317,22 +385,39 @@ class AgentLoop:
         user_query: str,
         transcript_context: str = "",
         semantic_context: str = "",
+        systems: list[str] | None = None,
+        status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agentic loop: send query to LLM, parse tool calls,
         execute them, feed results back, repeat until final answer.
 
+        Args:
+            status_callback: Optional async callable to emit human-readable
+                status messages (e.g. "Searching Channels DVR recordings").
+            token_callback: Optional async callable to stream individual
+                tokens to the frontend for progressive rendering.
+
         Returns:
             Dict with status, response, model, iterations.
         """
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": await self._build_system_prompt()},
+            {"role": "system", "content": await self._build_system_prompt(systems)},
         ]
+        logger.info("System prompt: %d chars", len(messages[0]["content"]))
+
+        # Store active systems for tool-call guardrail
+        self._active_systems = set(systems) if systems else {"sagetv", "channelsdvr"}
 
         # Build user message with pre-fetched context
         context_parts = []
         if semantic_context:
-            context_parts.append(semantic_context)
+            context_parts.append(
+                "Background context from media library (may not match the query date — "
+                "always use tools to answer date-specific questions):\n"
+                f"{semantic_context}"
+            )
         if transcript_context:
             context_parts.append(
                 "Relevant transcript excerpts (pre-searched for context):\n"
@@ -351,10 +436,38 @@ class AgentLoop:
 
         llm_result: Dict[str, Any] = {}
 
-        for iteration in range(MAX_ITERATIONS):
-            logger.info("Agent loop iteration %d/%d", iteration + 1, MAX_ITERATIONS)
+        for iteration in range(self._max_iterations):
+            logger.info("Agent loop iteration %d/%d", iteration + 1, self._max_iterations)
 
-            llm_result = await self._orch.llm.generate_chat(messages)
+            if status_callback:
+                if iteration == 0:
+                    await status_callback("Thinking")
+                else:
+                    await status_callback("Analyzing results")
+
+            # Stream tokens from the LLM. We forward tokens to the frontend
+            # until we detect a <tool_call> tag, then stop forwarding.
+            _forwarding = True
+            _tool_detected = False
+
+            async def _on_token(token: str):
+                nonlocal _forwarding, _tool_detected
+                if _tool_detected:
+                    return
+                # Check accumulated text so far for tool_call marker
+                if "<tool_call>" in token or "<tool" in token:
+                    _tool_detected = True
+                    _forwarding = False
+                    # Tell frontend to clear partial tokens (tool call coming)
+                    if status_callback:
+                        await status_callback("Calling tools")
+                    return
+                if _forwarding and token_callback:
+                    await token_callback(token)
+
+            llm_result = await self._orch.llm.stream_chat(
+                messages, token_callback=_on_token
+            )
             if llm_result.get("error"):
                 return llm_result
 
@@ -367,12 +480,33 @@ class AgentLoop:
             tool_calls = self._parse_tool_calls(response_text)
 
             if not tool_calls:
+                # Guard: if iter 0 and response mentions a tool name without
+                # actually calling it, nudge the LLM to use <tool_call> format.
+                if iteration == 0 and any(
+                    t in response_text for t in (
+                        "channels_get_upcoming", "sagetv_get_upcoming",
+                        "channels_search_recordings", "sagetv_search_recordings",
+                        "I will use", "let me check", "let me use",
+                    )
+                ):
+                    logger.info("LLM mentioned tool without calling — nudging retry")
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You mentioned a tool but did not call it. "
+                            "You MUST use <tool_call> tags. Try again."
+                        ),
+                    })
+                    continue
+
                 final = self._strip_markers(response_text)
                 return {
                     "status": "ok",
                     "response": final,
                     "model": llm_result.get("model", ""),
                     "iterations": iteration + 1,
+                    "streamed": True,
                 }
 
             # Append assistant message, execute tools, feed back results
@@ -385,8 +519,13 @@ class AgentLoop:
                 tool_args = tc.get("args") or {}
                 logger.info("Executing tool: %s(%s)", tool_name, json.dumps(tool_args, default=str)[:200])
 
+                if status_callback:
+                    await status_callback(_tool_status_message(tool_name))
+
                 result = await self._execute_tool(tool_name, tool_args)
-                result_str = json.dumps(result, default=str)
+                result_slim = _slim_for_llm(result)
+                result_str = json.dumps(result_slim, default=str)
+                logger.debug("Slimmed result for %s (%d chars): %.800s", tool_name, len(result_str), result_str)
                 if len(result_str) > 4000:
                     result_str = result_str[:4000] + "... (truncated)"
                 tool_results.append(f"Tool: {tool_name}\nResult: {result_str}")
@@ -412,7 +551,7 @@ class AgentLoop:
             })
 
         # Max iterations reached
-        logger.warning("Agent loop reached max iterations (%d)", MAX_ITERATIONS)
+        logger.warning("Agent loop reached max iterations (%d)", self._max_iterations)
         return {
             "status": "ok",
             "response": (
@@ -421,33 +560,77 @@ class AgentLoop:
                 + llm_result.get("response", "")
             ),
             "model": llm_result.get("model", ""),
-            "iterations": MAX_ITERATIONS,
+            "iterations": self._max_iterations,
         }
 
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
 
+    # Pattern 1: properly closed <tool_call>...</tool_call>
     _TOOL_CALL_RE = re.compile(
-        r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL,
+        r"<tool_call>\s*(\{.*\})\s*</tool_call>", re.DOTALL,
+    )
+    # Pattern 2: unclosed <tool_call> followed by JSON (common with mistral)
+    _TOOL_CALL_OPEN_RE = re.compile(
+        r"<tool_call>\s*(\{[^<]+\})", re.DOTALL,
     )
 
     def _parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extract tool call JSON blocks from LLM response text."""
+        """Extract tool call JSON blocks from LLM response text.
+
+        Handles: <tool_call>{...}</tool_call>, <tool_call>{...} (unclosed),
+        and multiple tool calls in one response.
+        """
+        # Try closed tags first, fall back to unclosed
         matches = self._TOOL_CALL_RE.findall(text)
+        if not matches:
+            matches = self._TOOL_CALL_OPEN_RE.findall(text)
+
         calls: List[Dict[str, Any]] = []
         for match in matches:
+            raw = match.strip()
+            json_str = self._extract_balanced_json(raw) or raw
             try:
-                parsed = json.loads(match)
+                parsed = json.loads(json_str)
                 if "tool" in parsed:
                     if "args" not in parsed:
                         parsed["args"] = {}
                     calls.append(parsed)
                 else:
-                    logger.warning("Tool call missing 'tool' key: %s", match[:200])
+                    logger.warning("Tool call missing 'tool' key: %s", json_str[:200])
             except json.JSONDecodeError:
-                logger.warning("Malformed tool call JSON: %s", match[:200])
+                logger.warning("Malformed tool call JSON: %s", json_str[:200])
         return calls
+
+    @staticmethod
+    def _extract_balanced_json(text: str) -> str | None:
+        """Extract a balanced JSON object from text starting at the first '{'."""
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i, ch in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
 
     @staticmethod
     def _strip_markers(text: str) -> str:
@@ -467,6 +650,13 @@ class AgentLoop:
     ) -> Dict[str, Any]:
         """Route a tool call to the correct MCP client."""
         try:
+            # Enforce system scope — reject tools for disabled systems
+            active = getattr(self, "_active_systems", {"sagetv", "channelsdvr"})
+            if tool_name.startswith("sagetv_") and "sagetv" not in active:
+                return {"error": "SageTV is not active. Only Channels DVR tools are available."}
+            if tool_name.startswith("channels_") and "channelsdvr" not in active:
+                return {"error": "Channels DVR is not active. Only SageTV tools are available."}
+
             if tool_name.startswith("sagetv_"):
                 return await self._orch._sagetv.call_tool(tool_name, args)
             elif tool_name.startswith("channels_"):
@@ -489,7 +679,7 @@ class AgentLoop:
     ) -> Dict[str, Any]:
         """Call a transcript tool via direct TCP JSON-RPC to port 8770."""
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 8770)
+            reader, writer = await asyncio.open_connection("127.0.0.1", 8770, limit=1024 * 1024)
             request = json.dumps({
                 "jsonrpc": "2.0",
                 "id": 1,

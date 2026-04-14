@@ -64,6 +64,45 @@ const API = (() => {
     return request(`${baseUrl}/api/query`, 'POST', { prompt: text, systems: systems || undefined });
   }
 
+  /**
+   * Streaming query via SSE — calls onStatus(msg) for each status update,
+   * then returns the final result object.
+   */
+  async function queryStream(text, systems, onStatus, signal, onToken) {
+    const resp = await fetch(`${baseUrl}/api/query/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ prompt: text, systems: systems || undefined }),
+      signal: signal || undefined,
+    });
+    if (resp.status === 401) { window.location.href = '/login.html'; throw new Error('unauthorized'); }
+    if (!resp.ok) return { error: 'Server error (' + resp.status + ')' };
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete line in buffer
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'status' && onStatus) onStatus(evt.message);
+          else if (evt.type === 'token' && onToken) onToken(evt.token);
+          else if (evt.type === 'result') finalResult = evt.data;
+        } catch (_) { /* skip malformed */ }
+      }
+    }
+    return finalResult || { error: 'No response from server.' };
+  }
+
   async function playback(action, params = {}) {
     const target = params.system || 'sagetv';
     const deviceId = params.device_id || '';
@@ -79,6 +118,14 @@ const API = (() => {
 
   async function search(query) {
     return request(`${baseUrl}/api/search?q=${encodeURIComponent(query)}`);
+  }
+
+  async function getTranscript(recordingId) {
+    return request(`${baseUrl}/api/transcript/${encodeURIComponent(recordingId)}`);
+  }
+
+  async function searchTranscripts(query) {
+    return request(`${baseUrl}/api/transcript/search?q=${encodeURIComponent(query)}`);
   }
 
   async function playTitle(title, system) {
@@ -114,8 +161,24 @@ const API = (() => {
     return request(`${sessionUrl}/devices`);
   }
 
+  async function bridgeDevices() {
+    return request(`${baseUrl}/api/bridge/devices`);
+  }
+
+  async function bridgeStatus(deviceName) {
+    return request(`${baseUrl}/api/bridge/status?device=${encodeURIComponent(deviceName)}`);
+  }
+
   async function addDevice(data) {
     return request(`${sessionUrl}/devices`, 'POST', data);
+  }
+
+  async function updateDevice(deviceId, updates) {
+    return request(`${sessionUrl}/devices/${deviceId}`, 'PUT', { updates });
+  }
+
+  async function discoverDevices() {
+    return request(`${sessionUrl}/devices/discover`, 'POST');
   }
 
   async function deleteDevice(deviceId) {
@@ -141,8 +204,8 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, playback, search, playTitle, system, health, services,
-    listDevices, addDevice, deleteDevice, setDefaultDevice,
+    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services,
+    listDevices, bridgeDevices, bridgeStatus, addDevice, updateDevice, discoverDevices, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,
     get baseUrl() { return baseUrl; },

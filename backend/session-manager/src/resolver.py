@@ -80,6 +80,11 @@ class SessionResolver:
     # ------------------------------------------------------------------
 
     async def _find_session(self, device: Device) -> Optional[PlaybackSession]:
+        # SageTV context devices: query the context directly via MCP
+        sagetv_ctx = (device.capabilities or {}).get("sagetv_context")
+        if sagetv_ctx and device.system == "sagetv":
+            return await self._query_sagetv_context(device, sagetv_ctx)
+
         if device.system == "sagetv":
             sessions = await self._query_sagetv_sessions()
         elif device.system == "channelsdvr":
@@ -119,6 +124,43 @@ class SessionResolver:
         if client_id and client_id in device.device_id:
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Direct context query (for auto-discovered SageTV devices)
+    # ------------------------------------------------------------------
+
+    async def _query_sagetv_context(self, device: Device, context_id: str) -> Optional[PlaybackSession]:
+        """Query playback state for a specific SageTV UI context directly."""
+        result = await self._mcp_rpc(
+            self._sagetv_host, self._sagetv_port,
+            "tools/call",
+            {"name": "sagetv_get_context_info", "arguments": {"session_id": context_id}},
+        )
+        content = result.get("content", [])
+        if not content:
+            return None
+        try:
+            data = json.loads(content[0].get("text", "{}"))
+        except (json.JSONDecodeError, IndexError):
+            return None
+        if not data.get("success"):
+            return None
+
+        info = data.get("data", {})
+        state = info.get("state", "idle")
+        if state == "idle":
+            return None
+
+        return PlaybackSession(
+            device_id=device.device_id,
+            session_id=context_id,
+            system="sagetv",
+            client_id=context_id,
+            title=info.get("title", ""),
+            position=info.get("position", 0),
+            duration=info.get("duration", 0),
+            state=state,
+        )
 
     # ------------------------------------------------------------------
     # MCP queries

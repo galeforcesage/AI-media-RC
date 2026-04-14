@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LLM Remote — Login</title>
+<title>AI Media Remote — Login</title>
 <meta name="theme-color" content="#121212">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -47,6 +47,10 @@ body {
   font-size: 1.5rem;
   color: var(--primary);
   margin-bottom: 0.3rem;
+  display: inline-block;
+  border: 2px solid var(--primary);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.7rem;
 }
 .login-card .subtitle {
   font-size: 0.85rem;
@@ -96,7 +100,7 @@ body {
 </head>
 <body>
   <div class="login-card">
-    <h1>LLM Remote</h1>
+    <h1>AI Media Remote</h1>
     <p class="subtitle">Enter the access password to continue.</p>
     <div class="error-msg" id="error-msg"></div>
     <form id="login-form">

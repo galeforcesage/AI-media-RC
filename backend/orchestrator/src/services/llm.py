@@ -29,12 +29,18 @@ Keep responses concise and conversational. If you don't have enough information,
 
 
 # Reserve CPU cores for MCP/playback/SSH — don't let Ollama use all of them.
-# On a 16-core box, 12 inference threads leaves 4 for everything else.
-DEFAULT_NUM_THREADS = 12
+# Use 75% of available cores (minimum 1) for LLM inference.
+import os as _os
+DEFAULT_NUM_THREADS = max(1, int((_os.cpu_count() or 4) * 0.75))
 
 # Only allow one LLM inference at a time so queries queue up rather than
 # compounding CPU pressure.
-MAX_CONCURRENT_LLM = 1
+DEFAULT_MAX_CONCURRENT_LLM = 1
+
+# Default LLM generation parameters
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_NUM_PREDICT = 512
+DEFAULT_NUM_CTX = 4096
 
 
 class LLMService:
@@ -45,15 +51,22 @@ class LLMService:
         model_path: str = "models/llm",
         base_url: str = "http://127.0.0.1:11434",
         model: str = "mistral:instruct",
-        num_threads: int = DEFAULT_NUM_THREADS,
+        num_threads: Optional[int] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        num_predict: int = DEFAULT_NUM_PREDICT,
+        num_ctx: int = DEFAULT_NUM_CTX,
+        max_concurrent: int = DEFAULT_MAX_CONCURRENT_LLM,
     ) -> None:
         self.model_path = model_path
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.num_threads = num_threads
+        self.num_threads = num_threads if num_threads is not None else DEFAULT_NUM_THREADS
+        self.temperature = temperature
+        self.num_predict = num_predict
+        self.num_ctx = num_ctx
         self.loaded = False
         self._lock = asyncio.Lock()
-        self._inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+        self._inference_semaphore = asyncio.Semaphore(max_concurrent)
 
     async def load(self) -> None:
         """Verify Ollama is reachable and the model is available."""
@@ -104,12 +117,12 @@ class LLMService:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.7,
-                    "num_predict": 512,
+                    "temperature": self.temperature,
+                    "num_predict": self.num_predict,
                     "num_thread": self.num_threads,
                 },
             }
-            timeout = aiohttp.ClientTimeout(total=120)
+            timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -131,7 +144,7 @@ class LLMService:
             }
         except asyncio.TimeoutError:
             logger.error("LLM generation timed out")
-            return {"error": "LLM generation timed out (120s)"}
+            return {"error": "LLM generation timed out (300s)"}
         except Exception as exc:
             logger.exception("LLM generation error")
             return {"error": str(exc)}
@@ -158,9 +171,9 @@ class LLMService:
                 "messages": messages,
                 "stream": False,
                 "options": {
-                    "temperature": 0.7,
-                    "num_predict": 1024,
-                    "num_ctx": 8192,
+                    "temperature": self.temperature,
+                    "num_predict": self.num_predict,
+                    "num_ctx": self.num_ctx,
                     "num_thread": self.num_threads,
                 },
             }
@@ -194,6 +207,74 @@ class LLMService:
             logger.exception("LLM chat generation error")
             return {"error": str(exc)}
 
+    async def stream_chat(
+        self,
+        messages: list[Dict[str, Any]],
+        token_callback=None,
+    ) -> Dict[str, Any]:
+        """
+        Streaming multi-turn chat via Ollama /api/chat.
+
+        Streams tokens through token_callback as they arrive,
+        and returns the final accumulated result dict.
+        """
+        logger.info("LLM streaming chat (%d messages)", len(messages))
+        try:
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                "options": {
+                    "temperature": self.temperature,
+                    "num_predict": self.num_predict,
+                    "num_ctx": self.num_ctx,
+                    "num_thread": self.num_threads,
+                },
+            }
+            accumulated = []
+            timeout = aiohttp.ClientTimeout(total=300)
+            async with self._inference_semaphore:
+              async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/chat", json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Ollama stream_chat error %d: %s", resp.status, body[:200])
+                        return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
+                    async for line in resp.content:
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        msg = chunk.get("message", {})
+                        token = msg.get("content", "")
+                        if token:
+                            accumulated.append(token)
+                            if token_callback:
+                                await token_callback(token)
+                        if chunk.get("done"):
+                            break
+
+            response_text = "".join(accumulated).strip()
+            logger.info(
+                "LLM stream_chat done (%d chars): %s",
+                len(response_text), response_text[:100],
+            )
+            return {
+                "status": "ok",
+                "response": response_text,
+                "model": self.model,
+            }
+        except asyncio.TimeoutError:
+            logger.error("LLM stream_chat timed out")
+            return {"error": "LLM generation timed out (300s)"}
+        except Exception as exc:
+            logger.exception("LLM stream_chat error")
+            return {"error": str(exc)}
+
     async def stream(
         self,
         prompt: str,
@@ -207,13 +288,13 @@ class LLMService:
             "prompt": prompt,
             "stream": True,
             "options": {
-                "temperature": 0.7,
-                "num_predict": 512,
+                "temperature": self.temperature,
+                "num_predict": self.num_predict,
                 "num_thread": self.num_threads,
             },
         }
         try:
-            timeout = aiohttp.ClientTimeout(total=120)
+            timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(

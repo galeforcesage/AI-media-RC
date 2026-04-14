@@ -59,17 +59,36 @@ def _date_str_to_epoch(date_str: str, end_of_day: bool = False) -> int:
 
 
 def _enrich_channels_recording(rec: Dict) -> Dict:
-    """Add human-readable date fields to a Channels DVR recording."""
+    """Extract only LLM-relevant fields from a Channels DVR recording.
+
+    The raw DVR record is ~5KB (commercials, signal stats, raw EPG, etc.)
+    which blows past the agent's 2000-char truncation limit.  Return a
+    compact dict so the LLM can see all results at once.
+    """
     if not isinstance(rec, dict):
         return rec
     airing = rec.get("Airing") or {}
-    air_time = airing.get("Time")
-    if air_time:
-        airing["AirDate"] = _epoch_to_readable(int(air_time))
-    created = rec.get("CreatedAt")
-    if created:
-        rec["RecordedDate"] = _epoch_to_readable(int(created))
-    return rec
+    air_time = airing.get("Time") or rec.get("CreatedAt") or 0
+    season = airing.get("SeasonNumber")
+    episode = airing.get("EpisodeNumber")
+    se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
+
+    return {
+        "id": rec.get("ID", ""),
+        "title": airing.get("Title", ""),
+        "episode_title": airing.get("EpisodeTitle", ""),
+        "season_episode": se,
+        "channel": airing.get("Channel", ""),
+        "recorded": _epoch_to_readable(int(air_time)) if air_time else "",
+        "original_date": airing.get("OriginalDate", ""),
+        "duration_min": round(rec.get("Duration", 0) / 60, 1),
+        "description": airing.get("FullSummary", "") or airing.get("Summary", ""),
+        "genres": airing.get("Genres", []),
+        "image": airing.get("Image", ""),
+        "cast": airing.get("Cast", []),
+        "content_rating": airing.get("ContentRating", ""),
+        "path": rec.get("Path", ""),
+    }
 
 
 def _enrich_channels_recordings(data: Any) -> Any:
@@ -80,93 +99,203 @@ def _enrich_channels_recordings(data: Any) -> Any:
 
 
 # ==================================================================
-# Playback tool handlers
+# Playback tool handlers — routed through bridge APK
 # ==================================================================
 
-async def _pause_playback(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/pause")
-    return _ok(message="Playback paused")
+async def _bridge_cmd(bridge, method: str, path: str, body=None, device: str = "") -> Dict:
+    """Send a command to a device via the bridge APK."""
+    if bridge is None:
+        return _fail("no_bridge", "Bridge manager not available")
+    dev = bridge.get_device(device)
+    if dev is None:
+        names = list(bridge.connected_devices.keys())
+        if not names:
+            return _fail("no_device", "No Channels playback device connected. Ensure a Bridge APK (Android TV) is running or an Apple TV has Channels open.")
+        return _fail("device_not_found", f"Device '{device}' not found. Connected: {names}")
+    result = await dev.send_command(method, path, body)
+    status = result.get("status", 500)
+    resp_body = result.get("body", {})
+    if status in (200, 201, 204):
+        return _ok(data=resp_body, message="OK")
+    error_msg = resp_body.get("error", f"HTTP {status}") if isinstance(resp_body, dict) else str(resp_body)
+    return _fail("device_error", error_msg)
 
 
-async def _resume_playback(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/play")
-    return _ok(message="Playback resumed")
+async def _get_playback_status(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "GET", "/api/status", device=device)
+    # Enrich with recording duration from DVR server
+    if result.get("success") and isinstance(result.get("data"), dict):
+        np = result["data"].get("now_playing", {})
+        title = np.get("title", "")
+        ep_title = np.get("episode_title", "")
+        if title and client:
+            try:
+                recs = await client.get_recordings()
+                for rec in recs:
+                    a = rec.get("Airing", {})
+                    if a.get("Title") == title and (not ep_title or a.get("EpisodeTitle") == ep_title):
+                        result["data"]["duration"] = rec.get("Duration", 0)
+                        break
+            except Exception:
+                pass
+    return result
 
 
-async def _stop_playback(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/stop")
-    return _ok(message="Playback stopped")
+async def _pause_playback(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/pause", device=device)
+    if result.get("success"):
+        result["message"] = "Playback paused"
+    return result
 
 
-async def _seek_relative(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
+async def _resume_playback(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/resume", device=device)
+    if result.get("success"):
+        result["message"] = "Playback resumed"
+    return result
+
+
+async def _toggle_pause(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/toggle_pause", device=device)
+    if result.get("success"):
+        result["message"] = "Play/pause toggled"
+    return result
+
+
+async def _stop_playback(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/stop", device=device)
+    if result.get("success"):
+        result["message"] = "Playback stopped"
+    return result
+
+
+async def _seek_relative(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
     seconds = args.get("seconds", 0)
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/seek", json_body={"offset": seconds})
-    return _ok(message=f"Seeked {seconds}s relative")
+    result = await _bridge_cmd(bridge, "POST", f"/api/seek/{seconds}", device=device)
+    if result.get("success"):
+        result["message"] = f"Seeked {seconds}s"
+    return result
 
 
-async def _seek_absolute(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    position = args.get("position_seconds", 0)
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/seek", json_body={"position": position})
-    return _ok(message=f"Seeked to {position}s")
+async def _seek_forward(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/seek_forward", device=device)
+    if result.get("success"):
+        result["message"] = "Seeked forward"
+    return result
 
 
-async def _skip_commercial(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/commercial/next")
-    return _ok(message="Skipped to next commercial break")
+async def _seek_backward(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/seek_backward", device=device)
+    if result.get("success"):
+        result["message"] = "Seeked backward"
+    return result
 
 
-async def _previous_commercial(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/commercial/prev")
-    return _ok(message="Returned to previous commercial break")
+async def _skip_commercial(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/skip_forward", device=device)
+    if result.get("success"):
+        result["message"] = "Skipped to next commercial marker"
+    return result
 
 
-async def _set_playback_speed(client, args: Dict) -> Dict:
-    sid = args.get("session_id")
-    rate = args.get("rate", 1.0)
-    if not sid:
-        return _fail("missing_param", "session_id is required")
-    await client.post(f"/dvr/sessions/{sid}/speed", json_body={"rate": rate})
-    return _ok(message=f"Playback speed set to {rate}x")
+async def _previous_commercial(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/skip_backward", device=device)
+    if result.get("success"):
+        result["message"] = "Returned to previous commercial marker"
+    return result
+
+
+async def _toggle_mute(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/toggle_mute", device=device)
+    if result.get("success"):
+        result["message"] = "Mute toggled"
+    return result
+
+
+async def _toggle_cc(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/toggle_cc", device=device)
+    if result.get("success"):
+        result["message"] = "Closed captions toggled"
+    return result
+
+
+async def _play_channel(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    channel = args.get("channel_number", "")
+    if not channel:
+        return _fail("missing_param", "channel_number is required")
+    result = await _bridge_cmd(bridge, "POST", f"/api/play/channel/{channel}", device=device)
+    if result.get("success"):
+        result["message"] = f"Playing channel {channel}"
+    return result
+
+
+async def _play_recording(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    rec_id = args.get("recording_id", "")
+    if not rec_id:
+        return _fail("missing_param", "recording_id is required")
+    result = await _bridge_cmd(bridge, "POST", f"/api/play/recording/{rec_id}", device=device)
+    if result.get("success"):
+        result["message"] = f"Playing recording {rec_id}"
+    return result
+
+
+async def _channel_up(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/channel_up", device=device)
+    if result.get("success"):
+        result["message"] = "Channel up"
+    return result
+
+
+async def _channel_down(client, args: Dict, bridge=None) -> Dict:
+    device = args.get("device", "")
+    result = await _bridge_cmd(bridge, "POST", "/api/channel_down", device=device)
+    if result.get("success"):
+        result["message"] = "Channel down"
+    return result
+
+
+async def _get_bridge_devices(client, args: Dict, bridge=None) -> Dict:
+    if bridge is None:
+        return _fail("no_bridge", "Bridge manager not available")
+    devices = bridge.connected_devices
+    if not devices:
+        return _ok(data=[], message="No bridge devices connected")
+    return _ok(data=list(devices.values()), message=f"{len(devices)} bridge device(s) connected")
 
 
 # ==================================================================
 # Query tool handlers
 # ==================================================================
 
-async def _get_now_playing(client, args: Dict) -> Dict:
+async def _get_now_playing(client, args: Dict, bridge=None) -> Dict:
     sessions = await client.get_sessions()
     return _ok(data=sessions, message=f"{len(sessions)} active sessions")
 
 
-async def _get_recordings(client, args: Dict) -> Dict:
+async def _get_recordings(client, args: Dict, bridge=None) -> Dict:
     recordings = await client.get_recordings()
     limit = args.get("limit", 50)
     return _ok(data=_enrich_channels_recordings(recordings[:limit]), message=f"{len(recordings)} recordings total, returning {min(limit, len(recordings))}")
 
 
-async def _search_recordings(client, args: Dict) -> Dict:
+async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
     """Search Channels DVR recordings with filters."""
+    from datetime import datetime
     title = args.get("title", "")
     channel = args.get("channel", "")
     start_date = args.get("start_date")
@@ -213,20 +342,54 @@ async def _search_recordings(client, args: Dict) -> Dict:
         if len(results) >= limit:
             break
 
-    return _ok(data=_enrich_channels_recordings(results), message=f"Found {len(results)} matching recordings")
+    response = {"results": _enrich_channels_recordings(results)}
+
+    # When searching by date, also include failed recordings from that period
+    if start_epoch or end_epoch:
+        jobs = await client.get_jobs()
+        failed = []
+        for j in jobs:
+            if not (j.get("Failed") or j.get("Dead")):
+                continue
+            airing = j.get("Airing", {})
+            start = airing.get("Time", j.get("Time", 0))
+            if start_epoch and int(start) < start_epoch:
+                continue
+            if end_epoch and int(start) > end_epoch:
+                continue
+            if title:
+                j_title = (airing.get("Title", "") + " " + airing.get("EpisodeTitle", "")).lower()
+                if title.lower() not in j_title:
+                    continue
+            dt = datetime.fromtimestamp(start)
+            failed.append({
+                "title": airing.get("Title") or j.get("Name", ""),
+                "episode_title": airing.get("EpisodeTitle", ""),
+                "channel": (j.get("Channels") or [""])[0],
+                "start_time": dt.strftime("%Y-%m-%d %I:%M %p"),
+                "error": j.get("Error", ""),
+                "status": "failed",
+            })
+        if failed:
+            response["failed_recordings"] = failed
+
+    msg = f"Found {len(results)} matching recordings"
+    if response.get("failed_recordings"):
+        msg += f" and {len(response['failed_recordings'])} failed"
+    return _ok(data=response, message=msg)
 
 
-async def _get_scheduled_recordings(client, args: Dict) -> Dict:
+async def _get_scheduled_recordings(client, args: Dict, bridge=None) -> Dict:
     rules = await client.get_rules()
     return _ok(data=rules, message=f"{len(rules)} recording rules")
 
 
-async def _get_channels(client, args: Dict) -> Dict:
+async def _get_channels(client, args: Dict, bridge=None) -> Dict:
     channels = await client.get_channels()
     return _ok(data=channels, message=f"{len(channels)} channels")
 
 
-async def _search_epg(client, args: Dict) -> Dict:
+async def _search_epg(client, args: Dict, bridge=None) -> Dict:
     query = args.get("query", "")
     if not query:
         return _fail("missing_param", "query is required")
@@ -234,7 +397,7 @@ async def _search_epg(client, args: Dict) -> Dict:
     return _ok(data=results, message=f"{len(results)} results for '{query}'")
 
 
-async def _get_storage_status(client, args: Dict) -> Dict:
+async def _get_storage_status(client, args: Dict, bridge=None) -> Dict:
     dvr = await client.dvr_info()
     return _ok(data={
         "path": dvr.get("path", ""),
@@ -244,12 +407,107 @@ async def _get_storage_status(client, args: Dict) -> Dict:
     }, message="Storage status retrieved")
 
 
-async def _get_jobs(client, args: Dict) -> Dict:
+async def _get_jobs(client, args: Dict, bridge=None) -> Dict:
     jobs = await client.get_jobs()
     return _ok(data=jobs, message=f"{len(jobs)} jobs")
 
 
-async def _get_clients(client, args: Dict) -> Dict:
+async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
+    """List upcoming scheduled recordings categorized by status."""
+    import time
+    from datetime import datetime, timedelta
+    jobs = await client.get_jobs()
+    now = time.time()
+
+    # Date filtering: support single date or start_date/end_date range
+    start_date_str = args.get("start_date", "")
+    end_date_str = args.get("end_date", "")
+    date_str = args.get("date", "")
+
+    if start_date_str or end_date_str:
+        # Date range mode
+        try:
+            if start_date_str:
+                range_start = datetime.strptime(start_date_str, "%Y-%m-%d")
+            else:
+                range_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            if end_date_str:
+                range_end = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)
+            else:
+                range_end = range_start + timedelta(days=1)
+        except ValueError:
+            return _fail("bad_param", "dates must be YYYY-MM-DD")
+        day_start = range_start.timestamp()
+        day_end = range_end.timestamp()
+        day_label = f"{range_start.strftime('%Y-%m-%d')} to {(range_end - timedelta(days=1)).strftime('%Y-%m-%d')}"
+    elif date_str:
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return _fail("bad_param", f"date must be YYYY-MM-DD, got '{date_str}'")
+        day_start = day.timestamp()
+        day_end = (day + timedelta(days=1)).timestamp()
+        day_label = day.strftime("%Y-%m-%d")
+    else:
+        day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = day.timestamp()
+        day_end = (day + timedelta(days=1)).timestamp()
+        day_label = day.strftime("%Y-%m-%d")
+
+    def _enrich(j):
+        airing = j.get("Airing", {})
+        start = airing.get("Time", j.get("Time", 0))
+        dt = datetime.fromtimestamp(start)
+        tags = airing.get("Tags", [])
+        return {
+            "title": airing.get("Title") or j.get("Name", ""),
+            "episode_title": airing.get("EpisodeTitle", ""),
+            "season": airing.get("SeasonNumber"),
+            "episode": airing.get("EpisodeNumber"),
+            "channel": (j.get("Channels") or [""])[0],
+            "start_time": dt.strftime("%Y-%m-%d %I:%M %p"),
+            "duration_min": round(airing.get("Duration", 0) / 60),
+            "original_date": airing.get("OriginalDate", ""),
+            "description": airing.get("FullSummary") or airing.get("Summary", ""),
+            "genres": airing.get("Genres", []),
+            "cast": airing.get("Cast", [])[:5],
+            "content_rating": airing.get("ContentRating", ""),
+            "is_new": "New" in tags,
+            "is_hd": any(t.startswith("HD") for t in tags),
+            "_sort": start,
+        }
+
+    scheduled = []
+    skipped = []
+    for j in jobs:
+        if j.get("Failed") or j.get("Dead"):
+            continue  # failed jobs are past events, not upcoming
+        airing = j.get("Airing", {})
+        start = airing.get("Time", j.get("Time", 0))
+        if start < day_start or start >= day_end:
+            continue
+        entry = _enrich(j)
+        if j.get("Skipped"):
+            skipped.append(entry)
+        else:
+            scheduled.append(entry)
+
+    for group in (scheduled, skipped):
+        group.sort(key=lambda r: r.pop("_sort"))
+
+    result = {"scheduled": scheduled}
+    if skipped:
+        result["skipped"] = skipped
+
+    day_label = day.strftime("%Y-%m-%d")
+    total = len(scheduled) + len(skipped)
+    parts = [f"{len(scheduled)} scheduled"]
+    if skipped:
+        parts.append(f"{len(skipped)} skipped")
+    return _ok(data=result, message=f"{total} recordings on {day_label} ({', '.join(parts)})")
+
+
+async def _get_clients(client, args: Dict, bridge=None) -> Dict:
     clients = await client.get_clients()
     return _ok(data=clients, message=f"{len(clients)} clients")
 
@@ -258,7 +516,7 @@ async def _get_clients(client, args: Dict) -> Dict:
 # Recording tool handlers
 # ==================================================================
 
-async def _schedule_recording(client, args: Dict) -> Dict:
+async def _schedule_recording(client, args: Dict, bridge=None) -> Dict:
     body = {
         "ProgramID": args.get("program_id"),
         "Channel": args.get("channel"),
@@ -269,7 +527,7 @@ async def _schedule_recording(client, args: Dict) -> Dict:
     return _ok(data=result, message="Recording scheduled")
 
 
-async def _schedule_series_recording(client, args: Dict) -> Dict:
+async def _schedule_series_recording(client, args: Dict, bridge=None) -> Dict:
     body = {
         "SeriesID": args.get("series_id"),
         "Channel": args.get("channel"),
@@ -281,7 +539,7 @@ async def _schedule_series_recording(client, args: Dict) -> Dict:
     return _ok(data=result, message="Series recording scheduled")
 
 
-async def _cancel_scheduled_recording(client, args: Dict) -> Dict:
+async def _cancel_scheduled_recording(client, args: Dict, bridge=None) -> Dict:
     rule_id = args.get("id")
     if not rule_id:
         return _fail("missing_param", "id is required")
@@ -289,7 +547,7 @@ async def _cancel_scheduled_recording(client, args: Dict) -> Dict:
     return _ok(message=f"Recording rule {rule_id} cancelled")
 
 
-async def _delete_recording(client, args: Dict) -> Dict:
+async def _delete_recording(client, args: Dict, bridge=None) -> Dict:
     file_id = args.get("id")
     if not file_id:
         return _fail("missing_param", "id is required")
@@ -297,7 +555,7 @@ async def _delete_recording(client, args: Dict) -> Dict:
     return _ok(message=f"Recording {file_id} deleted")
 
 
-async def _delete_recording_file(client, args: Dict) -> Dict:
+async def _delete_recording_file(client, args: Dict, bridge=None) -> Dict:
     file_id = args.get("id")
     if not file_id:
         return _fail("missing_param", "id is required")
@@ -309,7 +567,7 @@ async def _delete_recording_file(client, args: Dict) -> Dict:
 # Commercial tool handlers
 # ==================================================================
 
-async def _regenerate_commercial_markers(client, args: Dict) -> Dict:
+async def _regenerate_commercial_markers(client, args: Dict, bridge=None) -> Dict:
     file_id = args.get("id")
     if not file_id:
         return _fail("missing_param", "id is required")
@@ -321,12 +579,12 @@ async def _regenerate_commercial_markers(client, args: Dict) -> Dict:
 # System tool handlers (OWNER)
 # ==================================================================
 
-async def _clear_cache(client, args: Dict) -> Dict:
+async def _clear_cache(client, args: Dict, bridge=None) -> Dict:
     await client.post("/dvr/cache/clear")
     return _ok(message="Cache cleared")
 
 
-async def _rebuild_index(client, args: Dict) -> Dict:
+async def _rebuild_index(client, args: Dict, bridge=None) -> Dict:
     await client.post("/dvr/index/rebuild")
     return _ok(message="Index rebuild started")
 
@@ -336,100 +594,177 @@ async def _rebuild_index(client, args: Dict) -> Dict:
 # ==================================================================
 
 TOOL_REGISTRY = {
-    # --- Playback (SAFE) ---
-    "channels_pause_playback": {
-        "description": "Pause playback on a Channels DVR session.",
+    # --- Bridge Device Management ---
+    "channels_get_bridge_devices": {
+        "description": "List connected Channels Bridge devices available for playback control.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": _get_bridge_devices,
+    },
+
+    # --- Playback Status (via bridge) ---
+    "channels_get_playback_status": {
+        "description": "Get current playback status from a Channels app (what's playing, paused/playing, position).",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string", "description": "Active session ID"}},
-            "required": ["session_id"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional, uses first connected device if omitted)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _get_playback_status,
+    },
+
+    # --- Playback Control (via bridge to Channels App API) ---
+    "channels_pause_playback": {
+        "description": "Pause playback on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
         "handler": _pause_playback,
     },
     "channels_resume_playback": {
-        "description": "Resume playback on a Channels DVR session.",
+        "description": "Resume playback on a Channels device.",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string", "description": "Active session ID"}},
-            "required": ["session_id"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
         "handler": _resume_playback,
     },
-    "channels_stop_playback": {
-        "description": "Stop playback and close the media player.",
+    "channels_toggle_pause": {
+        "description": "Toggle play/pause on a Channels device.",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string", "description": "Active session ID"}},
-            "required": ["session_id"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _toggle_pause,
+    },
+    "channels_stop_playback": {
+        "description": "Stop playback on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
         "handler": _stop_playback,
     },
     "channels_seek_relative": {
-        "description": "Seek forward or backward by a number of seconds.",
+        "description": "Seek forward or backward by N seconds on a Channels device.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
                 "seconds": {"type": "integer", "description": "Positive = forward, negative = backward"},
+                "device": {"type": "string", "description": "Device name (optional)"},
             },
-            "required": ["session_id", "seconds"],
+            "required": ["seconds"],
         },
         "safety": Safety.SAFE,
         "handler": _seek_relative,
     },
-    "channels_seek_absolute": {
-        "description": "Seek to an absolute position in seconds.",
+    "channels_seek_forward": {
+        "description": "Seek forward by the default amount in Channels settings.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "position_seconds": {"type": "integer", "description": "Target position in seconds"},
-            },
-            "required": ["session_id", "position_seconds"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
-        "handler": _seek_absolute,
+        "handler": _seek_forward,
     },
-    "channels_skip_commercial": {
-        "description": "Skip to the end of the current commercial break.",
+    "channels_seek_backward": {
+        "description": "Seek backward by the default amount in Channels settings.",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string"}},
-            "required": ["session_id"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _seek_backward,
+    },
+    "channels_skip_commercial": {
+        "description": "Skip to the next commercial marker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
         "handler": _skip_commercial,
     },
     "channels_previous_commercial": {
-        "description": "Jump back to the previous commercial marker.",
+        "description": "Jump to the previous commercial marker.",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string"}},
-            "required": ["session_id"],
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
         },
         "safety": Safety.SAFE,
         "handler": _previous_commercial,
     },
-    "channels_set_playback_speed": {
-        "description": "Set the playback speed multiplier.",
+    "channels_toggle_mute": {
+        "description": "Toggle mute on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _toggle_mute,
+    },
+    "channels_toggle_cc": {
+        "description": "Toggle closed captions on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _toggle_cc,
+    },
+    "channels_play_channel": {
+        "description": "Tune to a channel on a Channels device.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "rate": {"type": "number", "description": "Speed multiplier (e.g. 1.5, 2.0)"},
+                "channel_number": {"type": "string", "description": "Channel number to tune to"},
+                "device": {"type": "string", "description": "Device name (optional)"},
             },
-            "required": ["session_id", "rate"],
+            "required": ["channel_number"],
         },
         "safety": Safety.SAFE,
-        "handler": _set_playback_speed,
+        "handler": _play_channel,
+    },
+    "channels_play_recording": {
+        "description": "Play a recording on a Channels device by recording ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recording_id": {"type": "string", "description": "Recording ID from the DVR library"},
+                "device": {"type": "string", "description": "Device name (optional)"},
+            },
+            "required": ["recording_id"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _play_recording,
+    },
+    "channels_channel_up": {
+        "description": "Channel up on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _channel_up,
+    },
+    "channels_channel_down": {
+        "description": "Channel down on a Channels device.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"device": {"type": "string", "description": "Device name (optional)"}},
+        },
+        "safety": Safety.SAFE,
+        "handler": _channel_down,
     },
 
-    # --- Queries (SAFE) ---
+    # --- Queries (SAFE, via DVR server API) ---
     "channels_get_now_playing": {
-        "description": "Get all active playback sessions.",
+        "description": "Get all active playback sessions from the DVR server.",
         "inputSchema": {"type": "object", "properties": {}},
         "safety": Safety.SAFE,
         "handler": _get_now_playing,
@@ -491,6 +826,16 @@ TOOL_REGISTRY = {
         "inputSchema": {"type": "object", "properties": {}},
         "safety": Safety.SAFE,
         "handler": _get_jobs,
+    },
+    "channels_get_upcoming_recordings": {
+        "description": "List upcoming scheduled recordings (actual episodes about to record). USE THIS for 'what is recording today/tonight/this week'. Defaults to today if no date given.",
+        "inputSchema": {"type": "object", "properties": {
+            "date": {"type": "string", "description": "Single date YYYY-MM-DD. Defaults to today."},
+            "start_date": {"type": "string", "description": "Range start YYYY-MM-DD (use with end_date for multi-day queries like 'this week')."},
+            "end_date": {"type": "string", "description": "Range end YYYY-MM-DD (inclusive)."},
+        }},
+        "safety": Safety.SAFE,
+        "handler": _get_upcoming_recordings,
     },
     "channels_get_clients": {
         "description": "Get connected Channels DVR clients.",

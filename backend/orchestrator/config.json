@@ -5,7 +5,11 @@
     "llm": {
         "model_path": "models/llm",
         "base_url": "http://127.0.0.1:11434",
-        "model": "mistral:instruct"
+        "model": "mistral:instruct",
+        "temperature": 0.7,
+        "num_predict": 512,
+        "num_ctx": 4096,
+        "max_concurrent": 1
     },
     "whisper": {
         "model_path": "models/whisper",
@@ -18,5 +22,53 @@
     "voice": {
         "max_history": 20,
         "session_ttl": 1800
-    }
+    },
+    "agent": {
+        "max_iterations": 5
+    },
+    "semantic": {
+        "embed_model": "all-MiniLM-L6-v2",
+        "encode_batch_size": 64
+    },
+    "mcp": {
+        "sagetv_host": "127.0.0.1",
+        "sagetv_port": 8766,
+        "channels_host": "127.0.0.1",
+        "channels_port": 8767,
+        "linux_host": "127.0.0.1",
+        "linux_port": 8768,
+        "transcription_host": "127.0.0.1",
+        "transcription_port": 8770
+    },
+    "channels_dvr_url": "http://localhost:8089",
+    "session_manager_url": "http://127.0.0.1:8769",
+    "paths": {
+        "sagetv_media": "/var/media/tv",
+        "allowed_log_paths": [
+            "/var/log/syslog",
+            "/var/log/auth.log",
+            "/var/log/kern.log",
+            "/var/log/docker.log",
+            "/var/log/nginx/error.log",
+            "/var/log/nginx/access.log",
+            "/opt/sagetv/server/logs/sagetv.log",
+            "/tmp/orchestrator.log",
+            "/tmp/transcription.log",
+            "/tmp/session-manager.log",
+            "/tmp/mcp-sagetv.log",
+            "/tmp/mcp-channels.log",
+            "/tmp/mcp-linux.log"
+        ],
+        "allowed_browse_roots": [
+            "/var/media/tv",
+            "/var/media/channels",
+            "~/AI-media-RC",
+            "/tmp/transcription"
+        ]
+    },
+    "auth": {
+        "app_max_age": 1209600,
+        "admin_ttl": 14400
+    },
+    "speech_language": "en-US"
 }

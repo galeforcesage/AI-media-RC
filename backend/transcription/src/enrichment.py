@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -106,6 +108,17 @@ class MetadataEnrichmentPipeline:
                 chunks=chunks,
                 summary=None,  # Summary generated asynchronously later
             )
+
+            # 5b. Copy sidecar alongside the original recording file
+            source_file = job.get("file_path")
+            if sidecar_path and source_file:
+                try:
+                    recording_dir = os.path.dirname(source_file)
+                    dest = os.path.join(recording_dir, os.path.basename(sidecar_path))
+                    shutil.copy2(sidecar_path, dest)
+                    logger.info("Copied sidecar to recording dir: %s", dest)
+                except Exception:
+                    logger.warning("Failed to copy sidecar to recording dir", exc_info=True)
 
             # 6. Insert into transcript index
             genre = metadata.get("genre", [])

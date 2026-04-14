@@ -38,15 +38,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8770)
     p.add_argument("--db", default="transcription.db")
-    p.add_argument("--sagetv-dir", default="", help="Override SageTV recording dir (skip auto-discovery)")
-    p.add_argument("--channels-dir", default="", help="Override Channels DVR recording dir (skip auto-discovery)")
+    p.add_argument("--sagetv-dir", nargs="*", default=[], help="Override SageTV recording dir(s) (skip auto-discovery)")
+    p.add_argument("--channels-dir", nargs="*", default=[], help="Override Channels DVR recording dir(s) (skip auto-discovery)")
     p.add_argument("--sagetv-mcp", default="127.0.0.1:8766", help="SageTV MCP server host:port")
     p.add_argument("--channels-mcp", default="127.0.0.1:8767", help="Channels DVR MCP server host:port")
     p.add_argument("--ssd-temp", default="/tmp/transcription")
     p.add_argument("--whisper-model", default="auto")
     p.add_argument("--whisper-device", default="auto")
-    p.add_argument("--whisper-threads", type=int, default=8, help="CPU threads for Whisper inference (default: 8)")
-    p.add_argument("--ffmpeg-threads", type=int, default=4, help="CPU threads for ffmpeg extraction (default: 4)")
+    import os
+    _quarter = max(1, (os.cpu_count() or 4) // 4)
+    _ffmpeg = max(1, _quarter // 2)
+    p.add_argument("--whisper-threads", type=int, default=_quarter, help=f"CPU threads for Whisper inference (default: {_quarter}, 25%% of cores)")
+    p.add_argument("--ffmpeg-threads", type=int, default=_ffmpeg, help=f"CPU threads for ffmpeg extraction (default: {_ffmpeg})")
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
@@ -92,9 +95,9 @@ async def run(args: argparse.Namespace) -> None:
         channels_dirs = []
 
         if args.sagetv_dir:
-            sagetv_dirs = [args.sagetv_dir]
+            sagetv_dirs = list(args.sagetv_dir)
         if args.channels_dir:
-            channels_dirs = [args.channels_dir]
+            channels_dirs = list(args.channels_dir)
 
         # Auto-discover any directories not explicitly set
         if not sagetv_dirs or not channels_dirs:

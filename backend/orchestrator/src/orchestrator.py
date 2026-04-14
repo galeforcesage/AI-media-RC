@@ -11,8 +11,10 @@ Responsibilities:
 
 from __future__ import annotations
 import asyncio
+from datetime import datetime, timedelta
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 from utils.logger import get_logger
@@ -55,7 +57,11 @@ class Orchestrator:
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
             base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
             model=config.get("llm", {}).get("model", "mistral:instruct"),
-            num_threads=config.get("llm", {}).get("num_threads", 12),
+            num_threads=config.get("llm", {}).get("num_threads"),  # None = use LLMService dynamic default
+            temperature=config.get("llm", {}).get("temperature", 0.7),
+            num_predict=config.get("llm", {}).get("num_predict", 512),
+            num_ctx=config.get("llm", {}).get("num_ctx", 4096),
+            max_concurrent=config.get("llm", {}).get("max_concurrent", 1),
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
@@ -224,8 +230,178 @@ class Orchestrator:
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------
+    # Fast-path classifier: skip LLM entirely for simple commands
+    # ------------------------------------------------------------------
+
+    # Each entry: (compiled_regex, action, system_override | None, human_label)
+    # The regex matches the FULL lowercased prompt.
+    _FAST_PATTERNS: list[tuple[re.Pattern, str, str | None, str]] = [
+        # Playback transport
+        (re.compile(r"^(please\s+)?(pause|pause\s+(it|this|playback|the\s+(tv|show|video)))$", re.I),
+         "pause", None, "Paused"),
+        (re.compile(r"^(please\s+)?(play|resume|unpause|play\s+(it|this|playback))$", re.I),
+         "play", None, "Resumed playback"),
+        (re.compile(r"^(please\s+)?(stop|stop\s+(it|this|playback|the\s+(tv|show|video)))$", re.I),
+         "stop", None, "Stopped"),
+        (re.compile(r"^(please\s+)?(play[\s/]?pause|toggle\s+play)$", re.I),
+         "play_pause", None, "Toggled play/pause"),
+
+        # Skip / seek
+        (re.compile(r"^(please\s+)?(skip|fast)\s*forward", re.I),
+         "skip_forward", None, "Skipped forward"),
+        (re.compile(r"^(please\s+)?(skip|rewind)\s*back", re.I),
+         "skip_back", None, "Skipped back"),
+        (re.compile(r"^(please\s+)?(skip\s*(the\s+)?commercial(s)?|comskip)$", re.I),
+         "commercial_skip", None, "Skipping commercial"),
+
+        # Volume / mute
+        (re.compile(r"^(please\s+)?mute(\s+(it|the\s+(tv|sound)))?$", re.I),
+         "mute_toggle", None, "Toggled mute"),
+        (re.compile(r"^(please\s+)?unmute(\s+(it|the\s+(tv|sound)))?$", re.I),
+         "unmute", None, "Unmuted"),
+
+        # Channel
+        (re.compile(r"^(please\s+)?channel\s*up$", re.I),
+         "channel_up", None, "Channel up"),
+        (re.compile(r"^(please\s+)?channel\s*down$", re.I),
+         "channel_down", None, "Channel down"),
+
+        # Navigation (SageTV only)
+        (re.compile(r"^(please\s+)?(go\s+)?home$", re.I),
+         "open_home", "sagetv", "Opening Home"),
+        (re.compile(r"^(please\s+)?(open\s+)?(the\s+)?(program\s+)?guide$", re.I),
+         "open_guide", "sagetv", "Opening Guide"),
+        (re.compile(r"^(please\s+)?(show\s+)?(my\s+)?recordings$", re.I),
+         "open_recordings", "sagetv", "Opening Recordings"),
+        (re.compile(r"^(please\s+)?(go\s+to\s+|open\s+)?live\s*tv$", re.I),
+         "open_live_tv", "sagetv", "Opening Live TV"),
+        (re.compile(r"^(please\s+)?(go\s*)?back$", re.I),
+         "nav_back", "sagetv", "Going back"),
+        (re.compile(r"^(please\s+)?(exit|close)(\s+(it|this|the\s+(app|video|player)))?$", re.I),
+         "close", "sagetv", "Closing"),
+
+        # CC
+        (re.compile(r"^(please\s+)?(toggle\s+)?(closed\s*)?captions?$", re.I),
+         "toggle_cc", None, "Toggled captions"),
+        (re.compile(r"^(please\s+)?(turn\s+)?(on|off)\s+(closed\s*)?captions?$", re.I),
+         "toggle_cc", None, "Toggled captions"),
+        (re.compile(r"^(please\s+)?cc$", re.I),
+         "toggle_cc", None, "Toggled captions"),
+    ]
+
+    def _try_fast_path(
+        self, prompt: str, systems: list[str] | None,
+    ) -> tuple[str, str, str | None] | None:
+        """
+        Check if the prompt matches a simple command pattern.
+
+        Returns (action, label, system_override) or None if no match.
+        """
+        text = prompt.strip()
+        for pattern, action, sys_override, label in self._FAST_PATTERNS:
+            if pattern.match(text):
+                logger.info("Fast-path match: '%s' → %s", text, action)
+                return action, label, sys_override
+        return None
+
+    # ------------------------------------------------------------------
     # High-level orchestration methods
     # ------------------------------------------------------------------
+
+    # Patterns for relative date expressions → (day_offset, label)
+    _DATE_PATTERNS: list[tuple[re.Pattern, int]] = [
+        (re.compile(r"\byesterday\b", re.IGNORECASE), -1),
+        (re.compile(r"\blast\s+night\b", re.IGNORECASE), -1),
+        (re.compile(r"\btoday\b", re.IGNORECASE), 0),
+        (re.compile(r"\btonight\b", re.IGNORECASE), 0),
+        (re.compile(r"\btomorrow\b", re.IGNORECASE), 1),
+    ]
+
+    # Day-of-week names for "last <day>" / "this <day>" resolution
+    _DAY_NAMES = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+    _LAST_DAY_RE = re.compile(
+        r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        re.IGNORECASE,
+    )
+    _THIS_DAY_RE = re.compile(
+        r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        re.IGNORECASE,
+    )
+    _LAST_N_DAYS_RE = re.compile(
+        r"\b(?:last|past)\s+(\d+)\s+days?\b",
+        re.IGNORECASE,
+    )
+    _LAST_WEEK_RE = re.compile(
+        r"\b(?:last|past|this past)\s+week\b",
+        re.IGNORECASE,
+    )
+    _THIS_WEEK_RE = re.compile(
+        r"\bthis\s+week\b",
+        re.IGNORECASE,
+    )
+
+    def _resolve_dates(self, prompt: str) -> str:
+        """Replace relative date words with concrete YYYY-MM-DD dates."""
+        now = datetime.now()
+        for pattern, offset in self._DATE_PATTERNS:
+            match = pattern.search(prompt)
+            if match:
+                date_str = (now + timedelta(days=offset)).strftime("%Y-%m-%d")
+                original = match.group(0)
+                prompt = pattern.sub(f"{original} ({date_str})", prompt, count=1)
+
+        # "last <day>" — most recent past occurrence of that weekday
+        m = self._LAST_DAY_RE.search(prompt)
+        if m:
+            target_dow = self._DAY_NAMES[m.group(1).lower()]
+            current_dow = now.weekday()
+            days_back = (current_dow - target_dow) % 7
+            if days_back == 0:
+                days_back = 7  # "last Friday" on a Friday means 7 days ago
+            date_str = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            prompt = self._LAST_DAY_RE.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
+
+        # "this <day>" — this week's occurrence (past or future)
+        m = self._THIS_DAY_RE.search(prompt)
+        if m:
+            target_dow = self._DAY_NAMES[m.group(1).lower()]
+            current_dow = now.weekday()
+            delta = target_dow - current_dow
+            date_str = (now + timedelta(days=delta)).strftime("%Y-%m-%d")
+            prompt = self._THIS_DAY_RE.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
+
+        # "last N days" / "past N days"
+        m = self._LAST_N_DAYS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            start_str = (now - timedelta(days=n)).strftime("%Y-%m-%d")
+            end_str = now.strftime("%Y-%m-%d")
+            prompt = self._LAST_N_DAYS_RE.sub(
+                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+
+        # "last week" / "past week"
+        m = self._LAST_WEEK_RE.search(prompt)
+        if m:
+            start_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            end_str = now.strftime("%Y-%m-%d")
+            prompt = self._LAST_WEEK_RE.sub(
+                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+
+        # "this week" — Sunday through Saturday of the current week
+        m = self._THIS_WEEK_RE.search(prompt)
+        if m:
+            days_since_sun = (now.weekday() + 1) % 7  # Mon=0..Sun=6 → Sun=0
+            week_start = now - timedelta(days=days_since_sun)
+            week_end = week_start + timedelta(days=6)
+            start_str = week_start.strftime("%Y-%m-%d")
+            end_str = week_end.strftime("%Y-%m-%d")
+            prompt = self._THIS_WEEK_RE.sub(
+                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+
+        return prompt
 
     async def run_query(
         self,
@@ -233,32 +409,59 @@ class Orchestrator:
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
         systems: list[str] | None = None,
+        status_callback=None,
+        token_callback=None,
     ) -> Dict[str, Any]:
         """Run a text query through the agentic tool-calling loop."""
+        # Pre-resolve relative date references so the LLM gets concrete dates
+        prompt = self._resolve_dates(prompt)
         logger.info("run_query (synthesize=%s, systems=%s)", synthesize, systems)
 
-        # Prepend system focus hint so the LLM routes to the correct MCP backend(s)
-        if systems and set(systems) != {"sagetv", "channelsdvr"}:
-            labels = ["Channels DVR" if s == "channelsdvr" else "SageTV" for s in systems]
-            prompt = f"[System: {', '.join(labels)} only — do NOT use tools for other systems] {prompt}"
-        elif systems and len(systems) == 2:
-            prompt = f"[System: Both SageTV and Channels DVR — check both MCP servers] {prompt}"
+        # ── Fast-path: skip LLM entirely for simple playback commands ──
+        fast = self._try_fast_path(prompt, systems)
+        if fast:
+            action, label, sys_override = fast
+            if status_callback:
+                await status_callback(label)
+            # Determine target system
+            active = systems or ["sagetv", "channelsdvr"]
+            target = sys_override or active[0]
+            try:
+                result = await self.run_playback(action, target=target)
+                if result.get("error"):
+                    return {
+                        "status": "error",
+                        "llm_response": f"Command failed: {result['error']}",
+                        "transcript_results": [],
+                    }
+                return {
+                    "status": "ok",
+                    "llm_response": f"{label}.",
+                    "transcript_results": [],
+                    "fast_path": True,
+                }
+            except Exception as exc:
+                logger.exception("Fast-path execution failed")
+                return {"status": "error", "llm_response": f"Command failed: {exc}", "transcript_results": []}
+
         try:
             # Pre-fetch transcript context so the LLM has immediate context
             transcript_context = ""
             transcript_hits: list = []
             try:
+                if status_callback:
+                    await status_callback("Searching transcripts")
                 transcript_results = await self.search.transcript_search(prompt)
                 if isinstance(transcript_results, dict):
                     data = transcript_results.get("data", transcript_results)
                     transcript_hits = data.get("results", [])
                 if transcript_hits:
                     lines = []
-                    for r in transcript_hits[:5]:
+                    for r in transcript_hits[:2]:
                         title = r.get("title", "Unknown")
                         ep = r.get("episode_title", "")
                         start = r.get("start_time", 0)
-                        snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
+                        snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
                         mins = int(start // 60)
                         secs = int(start % 60)
                         time_str = f"{mins}:{secs:02d}"
@@ -274,7 +477,9 @@ class Orchestrator:
             semantic_context = ""
             try:
                 if self.semantic_index.ready:
-                    hits = await self.semantic_index.search(prompt, n_results=10)
+                    if status_callback:
+                        await status_callback("Searching media library")
+                    hits = await self.semantic_index.search(prompt, n_results=2, systems=systems)
                     semantic_context = self.semantic_index.format_context(hits)
                     if semantic_context:
                         logger.info("Semantic index returned %d hits", len(hits))
@@ -286,6 +491,9 @@ class Orchestrator:
                 prompt,
                 transcript_context=transcript_context,
                 semantic_context=semantic_context,
+                systems=systems,
+                status_callback=status_callback,
+                token_callback=token_callback,
             )
 
             # Build response in pipeline-compatible format
@@ -328,34 +536,31 @@ class Orchestrator:
         try:
             payload = dict(payload or {})
 
-            # Resolve device_id → session_id if present
+            # Route Channels DVR actions directly through MCP (supports all actions + bridge)
+            if target in ("channelsdvr", "channels"):
+                return await self._execute_channels(action, payload)
+
+            # Resolve device_id → session_id if present (SageTV path)
             device_id = payload.pop("device_id", None)
             if device_id and "session_id" not in payload:
-                ctx = await self.resolve_session(device_id)
-                if ctx and ctx.get("session"):
-                    session = ctx["session"]
-                    payload["session_id"] = session.get("session_id", "")
-                    # Override target system from resolved device if needed
-                    resolved_system = ctx.get("system")
-                    if resolved_system and resolved_system != "unknown":
-                        target = resolved_system
-                    logger.info("Resolved device %s → session_id=%s system=%s",
-                                device_id, payload.get("session_id"), target)
+                # SageTV context devices: extract context ID directly (skip HTTP resolve)
+                if device_id.startswith("sagetv-ctx-"):
+                    payload["session_id"] = device_id[len("sagetv-ctx-"):]
+                    logger.info("SageTV context device %s → session_id=%s",
+                                device_id, payload["session_id"])
+                else:
+                    ctx = await self.resolve_session(device_id)
+                    if ctx and ctx.get("session"):
+                        session = ctx["session"]
+                        payload["session_id"] = session.get("session_id", "")
+                        resolved_system = ctx.get("system")
+                        if resolved_system and resolved_system != "unknown":
+                            target = resolved_system
+                        logger.info("Resolved device %s → session_id=%s system=%s",
+                                    device_id, payload.get("session_id"), target)
 
-            ctrl = self.playback_controller
-            if action == "play":
-                return await ctrl.play(target, payload)
-            if action == "pause":
-                return await ctrl.pause(target, payload)
-            if action == "stop":
-                return await ctrl.stop(target, payload)
-            if action == "seek":
-                position = payload.get("position", 0)
-                return await ctrl.seek(position, target, payload)
-            if action == "status":
-                states = await ctrl.now_playing(target)
-                return {k: v.to_dict() for k, v in states.items()}
-            return {"error": f"Unknown playback action '{action}'"}
+            # SageTV: route through MCP directly (supports all actions)
+            return await self._execute_sagetv(action, payload)
         except Exception as exc:
             logger.exception("run_playback failed")
             return {"error": str(exc)}
@@ -478,26 +683,49 @@ class Orchestrator:
         "set_archived": "sagetv_set_archived",
         "set_property": "sagetv_set_media_file_property",
         "get_property": "sagetv_get_media_file_property",
-        "play_pause": "sagetv_pause_playback",
+        "play_pause": "sagetv_toggle_playback",
         "commercial_skip": "sagetv_commercial_skip",
         "mute_toggle": "sagetv_mute",
+        "channel_up": "sagetv_channel_up",
+        "channel_down": "sagetv_channel_down",
+        "nav_up": "sagetv_nav_up",
+        "nav_down": "sagetv_nav_down",
+        "nav_left": "sagetv_nav_left",
+        "nav_right": "sagetv_nav_right",
+        "nav_select": "sagetv_nav_select",
+        "nav_back": "sagetv_nav_back",
+        "nav_options": "sagetv_nav_options",
+        "page_up": "sagetv_page_up",
+        "page_down": "sagetv_page_down",
+        "toggle_cc": "sagetv_toggle_cc",
+        "close": "sagetv_close",
+        "power_off": "sagetv_power_off",
+        "open_home": "sagetv_open_home",
+        "open_guide": "sagetv_open_guide",
+        "open_recordings": "sagetv_open_recordings",
+        "open_live_tv": "sagetv_open_live_tv",
     }
 
     _CHANNELS_TOOL_MAP = {
         "play": "channels_resume_playback",
         "pause": "channels_pause_playback",
         "stop": "channels_stop_playback",
-        "seek": "channels_seek",
-        "status": "channels_get_now_playing",
+        "seek": "channels_seek_relative",
+        "status": "channels_get_playback_status",
         "get_recordings": "channels_get_recordings",
-        "search": "channels_search",
+        "search": "channels_search_recordings",
         "get_channels": "channels_get_channels",
         "delete": "channels_delete_recording",
-        "play_pause": "channels_pause_playback",
-        "skip_forward": "channels_skip_forward",
-        "skip_back": "channels_skip_back",
+        "play_pause": "channels_toggle_pause",
+        "skip_forward": "channels_seek_forward",
+        "skip_back": "channels_seek_backward",
         "commercial_skip": "channels_skip_commercial",
-        "mute_toggle": "channels_mute",
+        "mute_toggle": "channels_toggle_mute",
+        "play_channel": "channels_play_channel",
+        "play_recording": "channels_play_recording",
+        "channel_up": "channels_channel_up",
+        "channel_down": "channels_channel_down",
+        "toggle_cc": "channels_toggle_cc",
     }
 
     async def _execute_sagetv(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:

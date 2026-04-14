@@ -6,10 +6,13 @@ All endpoints accept/return JSON and route through the orchestrator.
 """
 
 from __future__ import annotations
+import asyncio
+import json
 import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ class QueryRequest(BaseModel):
     prompt: str
     synthesize: bool = True
     metadata: Optional[Dict[str, Any]] = None
+    systems: Optional[list[str]] = None
 
 
 class PlaybackRequest(BaseModel):
@@ -95,8 +99,62 @@ async def query(request: QueryRequest):
     """
     orch = _require_orchestrator()
     return await _safe_execute(
-        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata)
+        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems)
     )
+
+
+@router.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """
+    SSE streaming variant of /query.
+    Emits status events as the agent works, token events as the LLM
+    generates, then a final result event.
+    """
+    orch = _require_orchestrator()
+    # Unified queue: status messages (str), token chunks (dict), sentinel (None)
+    event_queue: asyncio.Queue = asyncio.Queue()
+
+    async def status_callback(msg: str) -> None:
+        await event_queue.put({"type": "status", "message": msg})
+
+    async def token_callback(token: str) -> None:
+        event_queue.put_nowait({"type": "token", "token": token})
+
+    async def run_and_finish():
+        result = {"error": "Cancelled"}
+        try:
+            result = await orch.run_query(
+                request.prompt,
+                synthesize=request.synthesize,
+                metadata=request.metadata,
+                systems=request.systems,
+                status_callback=status_callback,
+                token_callback=token_callback,
+            )
+        except asyncio.CancelledError:
+            logger.info("Query cancelled by client disconnect")
+        except Exception as exc:
+            result = {"error": str(exc)}
+        finally:
+            event_queue.put_nowait(None)  # sentinel
+        return result
+
+    task = asyncio.create_task(run_and_finish())
+
+    async def event_generator():
+        try:
+            while True:
+                evt = await event_queue.get()
+                if evt is None:
+                    break
+                yield f"data: {json.dumps(evt)}\n\n"
+            result = await task
+            yield f"data: {json.dumps({'type': 'result', 'data': result})}\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/query/voice")
@@ -166,6 +224,30 @@ async def search(
     return await _safe_execute(orch.run_search(q, target=target))
 
 
+@router.get("/transcript/search")
+async def search_transcripts(
+    q: str = Query(..., min_length=1, description="Search query"),
+):
+    """Search transcripts by title/episode."""
+    orch = _require_orchestrator()
+    result = await orch.agent._call_transcription(
+        "transcript_search", {"query": q, "limit": 50}
+    )
+    return result or {"results": [], "count": 0}
+
+
+@router.get("/transcript/{recording_id}")
+async def get_transcript(recording_id: str):
+    """Fetch transcript for a recording by ID."""
+    orch = _require_orchestrator()
+    result = await orch.agent._call_transcription(
+        "transcript_get", {"recording_id": recording_id}
+    )
+    if isinstance(result, dict) and result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
 @router.post("/system")
 async def system(request: SystemRequest):
     """
@@ -181,6 +263,24 @@ async def system(request: SystemRequest):
 async def health():
     """Basic health check."""
     return {"status": "ok"}
+
+
+@router.get("/bridge/devices")
+async def bridge_devices():
+    """List connected Channels playback devices (bridge + direct)."""
+    orch = _require_orchestrator()
+    result = await orch.execute("channels.get_bridge_devices", {})
+    if isinstance(result, dict) and result.get("success"):
+        return {"devices": result.get("data", [])}
+    return {"devices": [], "error": result.get("message", "Could not fetch devices")}
+
+
+@router.get("/bridge/status")
+async def bridge_status(device: str = Query(..., description="Device name")):
+    """Get playback status from a Channels bridge device."""
+    orch = _require_orchestrator()
+    result = await orch.execute("channels.get_playback_status", {"device": device})
+    return result
 
 
 @router.get("/services")

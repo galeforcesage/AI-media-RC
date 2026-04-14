@@ -43,8 +43,24 @@ def select_model(preferred: str = "large-v3") -> str:
 
 
 # Reserve CPU headroom for SageTV, Channels DVR, and other services.
-# On a 16-core box, 8 threads for Whisper leaves plenty for DVR playback.
-DEFAULT_CPU_THREADS = 8
+# Use 25% of available cores (minimum 1) so transcription stays low-priority.
+import os as _os
+DEFAULT_CPU_THREADS = max(1, _os.cpu_count() // 4) if _os.cpu_count() else 2
+
+
+def _detect_device() -> str:
+    """Detect GPU availability. Returns 'cuda' if usable, otherwise 'cpu'."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_mb = torch.cuda.get_device_properties(0).total_mem / (1024 * 1024)
+            logger.info("GPU detected: %s (%.0f MB VRAM) — using CUDA", gpu_name, vram_mb)
+            return "cuda"
+    except Exception:
+        pass
+    logger.info("No GPU detected — using CPU")
+    return "cpu"
 
 
 class WhisperEngine:
@@ -77,6 +93,13 @@ class WhisperEngine:
 
         if self._model_name == "auto":
             self._model_name = select_model()
+
+        # Auto-detect device: use CUDA if available, otherwise CPU
+        if self._device == "auto":
+            self._device = _detect_device()
+        # Auto-detect compute type based on device
+        if self._compute_type == "auto":
+            self._compute_type = "float16" if self._device == "cuda" else "int8"
 
         logger.info("Loading Whisper model: %s (device=%s, compute=%s, threads=%d)",
                      self._model_name, self._device, self._compute_type, self._cpu_threads)

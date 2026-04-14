@@ -60,3 +60,12 @@ scripts/test_ollama.py
 
 # Generated PWA icons (regenerate via frontend/icons/generate.py)
 frontend/icons/*.png
+
+# Android build artifacts
+.gradle/
+**/build/
+*.apk
+local.properties
+
+# Temp test files
+test_q.json

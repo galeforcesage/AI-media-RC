@@ -15,6 +15,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from .bridge import BridgeManager
 from .channels_client import ChannelsDVRClient
 from .tools import TOOL_REGISTRY, Safety
 
@@ -30,6 +31,10 @@ class ChannelsDVRMCPServer:
         self.client = ChannelsDVRClient(
             base_url=config.get("channels_url", "http://localhost:8089"),
         )
+        self.bridge = BridgeManager(
+            auth_token=config.get("bridge_token", ""),
+        )
+        self._bridge_port = config.get("bridge_port", 8770)
         self._server: Optional[asyncio.AbstractServer] = None
 
     # ------------------------------------------------------------------
@@ -40,12 +45,16 @@ class ChannelsDVRMCPServer:
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
+        # Bridge listens on all interfaces so Android TV devices can connect
+        await self.bridge.start("0.0.0.0", self._bridge_port)
         logger.info("Channels DVR MCP server listening on %s:%d", self.host, self.port)
+        logger.info("Bridge listener on 0.0.0.0:%d", self._bridge_port)
 
     async def stop(self) -> None:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        await self.bridge.stop()
         await self.client.close()
         logger.info("Channels DVR MCP server stopped")
 
@@ -183,7 +192,7 @@ class ChannelsDVRMCPServer:
                 }
 
         try:
-            result = await spec["handler"](self.client, arguments)
+            result = await spec["handler"](self.client, arguments, bridge=self.bridge)
             return {
                 "content": [{"type": "text", "text": json.dumps(result)}],
                 "isError": False,

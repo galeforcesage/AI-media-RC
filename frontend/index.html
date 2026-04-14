@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LLM Remote</title>
+<title>AI Media Remote</title>
 <meta name="theme-color" content="#121212">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="LLM Remote">
+<meta name="apple-mobile-web-app-title" content="AI Media Remote">
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -17,10 +17,10 @@
   <!-- Region 1: Header -->
   <header id="header">
     <div class="header-left">
-      <h1 class="logo">LLM Remote</h1>
+      <h1 class="logo">AI Media Remote</h1>
     </div>
     <div class="header-controls">
-      <div class="picker-label">LLM Focus
+      <div class="picker-label">AI Focus
         <div class="checkbox-dropdown" id="llm-focus">
           <button type="button" class="cb-toggle" id="llm-focus-toggle" aria-haspopup="true" aria-expanded="false">Both ▾</button>
           <div class="cb-menu" id="llm-focus-menu">
@@ -35,52 +35,118 @@
           <option value="channelsdvr">Channels DVR</option>
         </select>
       </label>
-      <select id="device-picker" aria-label="Select device">
-        <option value="">Select device...</option>
-      </select>
+      <label class="picker-label">Device
+        <select id="device-picker" aria-label="Select device">
+          <option value="">Select device...</option>
+        </select>
+      </label>
     </div>
   </header>
 
-  <!-- Region 2: Now Playing -->
-  <section id="now-playing" class="panel" aria-live="polite">
-    <div class="np-info">
-      <div class="np-title" id="np-title">No active playback</div>
-      <div class="np-episode" id="np-episode"></div>
-      <div class="np-channel" id="np-channel"></div>
-      <div class="np-state" id="np-state"></div>
+  <!-- Region 2: Remote Controls (hidden when no device selected) -->
+  <section id="remote-controls" hidden>
+    <!-- Now Playing -->
+    <div id="now-playing" class="panel">
+      <div class="np-info">
+        <div class="np-title" id="np-title">No active playback</div>
+        <div class="np-episode" id="np-episode"></div>
+        <div class="np-channel" id="np-channel"></div>
+        <div class="np-state" id="np-state"></div>
+      </div>
+      <div class="np-progress">
+        <span id="np-position">0:00</span>
+        <input type="range" id="seek-slider" min="0" max="100" value="0" aria-label="Seek position">
+        <span id="np-duration">0:00</span>
+      </div>
     </div>
-    <div class="np-progress">
-      <span id="np-position">0:00</span>
-      <input type="range" id="seek-slider" min="0" max="100" value="0" aria-label="Seek position">
-      <span id="np-duration">0:00</span>
-    </div>
-  </section>
 
-  <!-- Region 3: Transport Controls -->
-  <section id="transport" class="panel">
-    <div class="transport-row">
-      <button id="btn-skip-back" class="transport-btn" title="Skip back 10s" aria-label="Skip back 10 seconds">
-        <span class="icon">⏪</span><span class="label">-10s</span>
-      </button>
-      <button id="btn-play-pause" class="transport-btn primary" title="Play / Pause" aria-label="Play or Pause">
-        <span class="icon" id="play-pause-icon">▶</span>
-      </button>
-      <button id="btn-stop" class="transport-btn" title="Stop" aria-label="Stop">
-        <span class="icon">⏹</span>
-      </button>
-      <button id="btn-skip-forward" class="transport-btn" title="Skip forward 30s" aria-label="Skip forward 30 seconds">
-        <span class="icon">⏩</span><span class="label">+30s</span>
-      </button>
-    </div>
-    <div class="transport-row secondary">
-      <button id="btn-commercial-skip" class="transport-btn small" title="Skip commercial" aria-label="Skip commercial">
-        <span class="icon">⏭</span><span class="label">Com Skip</span>
-      </button>
-      <div class="volume-control">
-        <button id="btn-mute" class="transport-btn small" title="Mute" aria-label="Mute">
-          <span class="icon" id="mute-icon">🔊</span>
-        </button>
-        <input type="range" id="volume-slider" min="0" max="100" value="75" aria-label="Volume">
+    <!-- Transport + D-pad side by side -->
+    <div id="transport-wrapper" class="panel transport-wrapper">
+      <div id="transport" class="transport-main">
+        <div class="transport-row">
+          <button id="btn-skip-back" class="transport-btn" title="Skip back 10s" aria-label="Skip back 10 seconds">
+            <span class="icon">⏪</span><span class="label">-10s</span>
+          </button>
+          <button id="btn-play-pause" class="transport-btn primary" title="Play / Pause" aria-label="Play or Pause">
+            <span class="icon" id="play-pause-icon">▶</span>
+          </button>
+          <button id="btn-stop" class="transport-btn" title="Stop" aria-label="Stop">
+            <span class="icon">⏹</span>
+          </button>
+          <button id="btn-skip-forward" class="transport-btn" title="Skip forward 30s" aria-label="Skip forward 30 seconds">
+            <span class="icon">⏩</span><span class="label">+30s</span>
+          </button>
+        </div>
+        <div class="transport-row secondary">
+          <button id="btn-commercial-skip" class="transport-btn small" title="Skip commercial" aria-label="Skip commercial">
+            <span class="icon">⏭</span><span class="label">Com Skip</span>
+          </button>
+          <div class="volume-control">
+            <button id="btn-mute" class="transport-btn small" title="Mute" aria-label="Mute">
+              <span class="icon" id="mute-icon">🔊</span>
+            </button>
+            <input type="range" id="volume-slider" min="0" max="100" value="75" aria-label="Volume">
+          </div>
+        </div>
+      </div>
+      <!-- D-pad: navigation controls -->
+      <div id="dpad-section" class="dpad-section" hidden>
+        <!-- Full D-pad for SageTV -->
+        <div id="dpad-sagetv" class="dpad-sagetv" hidden>
+          <div class="dpad-grid">
+            <div class="dpad-row">
+              <div class="dpad-spacer"></div>
+              <button id="btn-nav-up" class="dpad-btn" title="Up" aria-label="Navigate up">▲</button>
+              <div class="dpad-spacer"></div>
+            </div>
+            <div class="dpad-row">
+              <button id="btn-nav-left" class="dpad-btn" title="Left" aria-label="Navigate left">◀</button>
+              <button id="btn-nav-select" class="dpad-btn dpad-center" title="Select" aria-label="Select">OK</button>
+              <button id="btn-nav-right" class="dpad-btn" title="Right" aria-label="Navigate right">▶</button>
+            </div>
+            <div class="dpad-row">
+              <div class="dpad-spacer"></div>
+              <button id="btn-nav-down" class="dpad-btn" title="Down" aria-label="Navigate down">▼</button>
+              <div class="dpad-spacer"></div>
+            </div>
+          </div>
+          <div class="dpad-extras">
+            <button id="btn-nav-back" class="dpad-btn small" title="Back" aria-label="Back">↩ Back</button>
+            <button id="btn-close" class="dpad-btn small" title="Exit / Close" aria-label="Exit">✕ Exit</button>
+            <button id="btn-nav-options" class="dpad-btn small" title="Options" aria-label="Options">☰</button>
+            <button id="btn-toggle-cc-sage" class="dpad-btn small" title="Closed Captions" aria-label="Toggle CC">CC</button>
+          </div>
+          <div class="dpad-nav-row">
+            <button id="btn-open-home" class="nav-btn" title="Home" aria-label="Home">🏠</button>
+            <button id="btn-open-guide" class="nav-btn" title="Guide" aria-label="Program Guide">📺</button>
+            <button id="btn-open-recordings" class="nav-btn" title="Recordings" aria-label="Recordings">⏺</button>
+            <button id="btn-open-live-tv" class="nav-btn" title="Live TV" aria-label="Live TV">📡</button>
+          </div>
+          <div class="dpad-ch-row">
+            <button id="btn-ch-up-sage" class="dpad-btn small" title="Channel Up" aria-label="Channel Up">CH ▲</button>
+            <button id="btn-ch-down-sage" class="dpad-btn small" title="Channel Down" aria-label="Channel Down">CH ▼</button>
+          </div>
+        </div>
+        <!-- Simple D-pad for Channels DVR -->
+        <div id="dpad-channels" class="dpad-channels" hidden>
+          <div class="dpad-grid">
+            <div class="dpad-row">
+              <div class="dpad-spacer"></div>
+              <button id="btn-ch-up" class="dpad-btn" title="Channel Up" aria-label="Channel Up">▲</button>
+              <div class="dpad-spacer"></div>
+            </div>
+            <div class="dpad-row">
+              <button class="dpad-btn disabled" disabled aria-label="Left (not supported)">◀</button>
+              <button id="btn-toggle-cc" class="dpad-btn dpad-center" title="Closed Captions" aria-label="Toggle CC">CC</button>
+              <button class="dpad-btn disabled" disabled aria-label="Right (not supported)">▶</button>
+            </div>
+            <div class="dpad-row">
+              <div class="dpad-spacer"></div>
+              <button id="btn-ch-down" class="dpad-btn" title="Channel Down" aria-label="Channel Down">▼</button>
+              <div class="dpad-spacer"></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -89,10 +155,11 @@
   <section id="chat" class="panel">
     <div id="messages" class="messages" role="log" aria-live="polite"></div>
     <div class="input-row">
+      <button id="btn-cancel" class="btn-cancel" title="Cancel" aria-label="Cancel request" hidden>✕</button>
+      <button id="btn-voice" class="btn-voice" title="Hold to speak" aria-label="Hold to speak">🎤</button>
       <input type="text" id="text-input" placeholder="Type a command..." aria-label="Command input"
              autocomplete="off">
       <button id="btn-send" class="btn-send" title="Send" aria-label="Send command">➤</button>
-      <button id="btn-voice" class="btn-voice" title="Hold to speak" aria-label="Hold to speak">🎤</button>
     </div>
   </section>
 
@@ -213,6 +280,34 @@
         <button type="submit" value="cancel">Cancel</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Show Metadata Popup -->
+  <dialog id="show-info-dialog">
+    <div class="show-info-header">
+      <h2 id="show-info-title">Show Info</h2>
+      <button type="button" id="show-info-close" class="dialog-close" aria-label="Close">&times;</button>
+    </div>
+    <div id="show-info-body" class="show-info-body">
+      <p>Loading...</p>
+    </div>
+  </dialog>
+
+  <!-- Transcript Viewer/Editor -->
+  <dialog id="transcript-dialog">
+    <div class="transcript-header">
+      <h2 id="transcript-title">Transcript</h2>
+      <button type="button" id="transcript-close" class="dialog-close" aria-label="Close">&times;</button>
+    </div>
+    <div id="transcript-meta" class="transcript-meta"></div>
+    <div id="transcript-body" class="transcript-body">
+      <p>Loading...</p>
+    </div>
+    <div class="transcript-actions" id="transcript-actions" hidden>
+      <button type="button" id="transcript-edit" class="btn-small">✏️ Edit</button>
+      <button type="button" id="transcript-save" class="btn-small" hidden>💾 Save</button>
+      <button type="button" id="transcript-cancel-edit" class="btn-small" hidden>Cancel</button>
+    </div>
   </dialog>
 
   <script src="js/api.js"></script>

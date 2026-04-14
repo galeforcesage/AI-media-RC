@@ -96,7 +96,7 @@ class SearchService:
             if filters:
                 args.update(filters)
 
-            reader, writer = await asyncio.open_connection("127.0.0.1", 8770)
+            reader, writer = await asyncio.open_connection("127.0.0.1", 8770, limit=1024 * 1024)
             request = json.dumps({
                 "jsonrpc": "2.0", "id": 1,
                 "method": "tools/call",

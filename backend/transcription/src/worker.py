@@ -50,7 +50,7 @@ class TranscriptionWorker:
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
         try:
-            os.nice(10)
+            os.nice(19)
             logger.info("Transcription worker nice level set to %d", os.nice(0))
         except (OSError, AttributeError):
             pass  # nice() not available on all platforms

@@ -5,6 +5,10 @@ const Voice = (() => {
   let recognition = null;
   let recording = false;
   let onResult = null;
+  let silenceTimer = null;
+  let pendingTranscript = '';
+  let finalTranscript = '';   // accumulated final text across onresult events
+  const SILENCE_DELAY = 2000; // ms to wait after last speech before submitting
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -19,23 +23,52 @@ const Voice = (() => {
       return false;
     }
     recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
+    recognition.continuous = true;
+    recognition.interimResults = true;
     recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      recording = false;
-      if (onResult) onResult(transcript);
+      // Only process new / changed results (from resultIndex onwards)
+      // to avoid re-concatenating already-finalized text.
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalTranscript += result[0].transcript;
+        } else {
+          interim += result[0].transcript;
+        }
+      }
+      pendingTranscript = finalTranscript + interim;
+      // Show words in the text box as they are spoken
+      const input = document.getElementById('text-input');
+      if (input) input.value = pendingTranscript;
+
+      // Reset the silence timer — submit after 2s of no new speech
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        if (pendingTranscript.trim() && onResult) {
+          const text = pendingTranscript.trim();
+          pendingTranscript = '';
+          finalTranscript = '';
+          stop();
+          onResult(text);
+        }
+      }, SILENCE_DELAY);
     };
 
     recognition.onerror = (event) => {
       console.warn('Speech recognition error:', event.error);
       recording = false;
+      clearTimeout(silenceTimer);
     };
 
     recognition.onend = () => {
-      recording = false;
+      // If we're still supposed to be recording (browser auto-stopped), restart
+      if (recording) {
+        try { recognition.start(); } catch { /* noop */ }
+        return;
+      }
       updateButton();
     };
 
@@ -46,6 +79,8 @@ const Voice = (() => {
     if (!recognition) return;
     if (recording) { stop(); return; }
     try {
+      pendingTranscript = '';
+      finalTranscript = '';
       recognition.start();
       recording = true;
       updateButton();
@@ -56,8 +91,11 @@ const Voice = (() => {
 
   function stop() {
     if (!recognition) return;
-    try { recognition.stop(); } catch { /* noop */ }
+    clearTimeout(silenceTimer);
     recording = false;
+    pendingTranscript = '';
+    finalTranscript = '';
+    try { recognition.stop(); } catch { /* noop */ }
     updateButton();
   }
 

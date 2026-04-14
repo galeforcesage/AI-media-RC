@@ -4,7 +4,7 @@
   Provides offline shell so the app installs on all platforms.
 */
 
-const CACHE_NAME = 'llm-remote-v1';
+const CACHE_NAME = 'llm-remote-v3.2.5';
 
 const SHELL_ASSETS = [
   '/',
@@ -56,18 +56,14 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets: cache-first, fallback to network, update cache
+  // Static assets: network-first so updates are immediate, cache fallback for offline
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const networkFetch = fetch(event.request).then((response) => {
-        if (response.ok) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-        }
-        return response;
-      }).catch(() => cached);
-
-      return cached || networkFetch;
-    })
+    fetch(event.request).then((response) => {
+      if (response.ok) {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+      }
+      return response;
+    }).catch(() => caches.match(event.request))
   );
 });

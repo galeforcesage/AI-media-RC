@@ -50,7 +50,7 @@ class AudioExtractor:
             return output_path
 
         # Use nice/ionice to lower extraction priority so DVR playback isn't affected.
-        cmd = ["nice", "-n", "15", "ionice", "-c", "3", "ffmpeg", "-threads", str(self.ffmpeg_threads)]
+        cmd = ["nice", "-n", "19", "ionice", "-c", "3", "ffmpeg", "-threads", str(self.ffmpeg_threads)]
         if start_seconds is not None and start_seconds > 0:
             cmd += ["-ss", str(start_seconds)]
         cmd += [

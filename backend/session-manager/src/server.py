@@ -234,6 +234,7 @@ def create_app(config: Dict[str, Any]) -> web.Application:
     app.router.add_post("/devices", route(api.add_device))
     app.router.add_post("/devices/pair/qr", route(api.pair_qr))
     app.router.add_post("/devices/pair/api", route(api.pair_api))
+    app.router.add_post("/devices/discover", route(api.discover_sagetv))
     app.router.add_put("/devices/{device_id}", route(api.update_device))
     app.router.add_delete("/devices/{device_id}", route(api.delete_device))
     app.router.add_post("/devices/{device_id}/default", route(api.set_default))

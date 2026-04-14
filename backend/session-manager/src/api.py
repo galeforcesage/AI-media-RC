@@ -108,6 +108,55 @@ class SessionManagerAPI:
             return {"success": False, "error": "No default device set"}
         return {"success": True, "device": device.to_dict()}
 
+    async def discover_sagetv(self, body: Dict) -> Dict:
+        """Auto-discover SageTV UI contexts and register as devices."""
+        result = await self.resolver._mcp_rpc(
+            self.resolver._sagetv_host, self.resolver._sagetv_port,
+            "tools/call",
+            {"name": "sagetv_get_ui_contexts", "arguments": {}},
+        )
+        content = result.get("content", [])
+        if not content:
+            return {"success": False, "error": "Could not reach SageTV MCP"}
+
+        try:
+            data = json.loads(content[0].get("text", "{}"))
+        except (json.JSONDecodeError, IndexError):
+            return {"success": False, "error": "Invalid response from SageTV MCP"}
+
+        if not data.get("success"):
+            return {"success": False, "error": data.get("message", "MCP call failed")}
+
+        contexts = data.get("data", [])
+        discovered = []
+        for ctx in contexts:
+            ctx_id = ctx.get("context_id", "")
+            if not ctx_id:
+                continue
+            device_id = f"sagetv-ctx-{ctx_id}"
+            existing = self.registry.get_device(device_id)
+            if existing:
+                self.registry.touch_device(device_id)
+                discovered.append(existing.to_dict())
+            else:
+                device = Device(
+                    device_id=device_id,
+                    friendly_name=ctx_id,
+                    system="sagetv",
+                    platform="placeshifter",
+                    capabilities={
+                        "sagetv_context": ctx_id,
+                        "supports_seek": True,
+                        "supports_volume": True,
+                        "supports_commercial_skip": True,
+                    },
+                    pairing_method="api",
+                )
+                self.registry.add_device(device)
+                discovered.append(device.to_dict())
+
+        return {"success": True, "discovered": discovered, "count": len(discovered)}
+
     # ------------------------------------------------------------------
     # Session endpoints
     # ------------------------------------------------------------------

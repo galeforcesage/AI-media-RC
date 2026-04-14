@@ -88,6 +88,7 @@ class PlaybackRequest(BaseModel):
     action: str
     system: Optional[str] = "sagetv"
     device_id: Optional[str] = None
+    device: Optional[str] = None  # Bridge device name for Channels DVR
     position: Optional[float] = None
     level: Optional[int] = None
     seconds: Optional[float] = None
@@ -144,6 +145,8 @@ async def playback(request: PlaybackRequest):
         payload["seconds"] = request.seconds
     if request.device_id:
         payload["device_id"] = request.device_id
+    if request.device:
+        payload["device"] = request.device
     return await _orchestrator.run_playback(request.action, target=request.system or "sagetv", payload=payload)
 
 
@@ -164,3 +167,14 @@ async def system(request: SystemRequest):
 async def health():
     """Health check."""
     return {"status": "ok"}
+
+
+@router.get("/bridge/devices")
+async def bridge_devices():
+    """List connected Channels Bridge devices available for playback control."""
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
+    result = await _orchestrator.execute("channels.get_bridge_devices", {})
+    if isinstance(result, dict) and result.get("success"):
+        return {"devices": result.get("data", [])}
+    return {"devices": [], "error": result.get("message", "Could not fetch bridge devices")}

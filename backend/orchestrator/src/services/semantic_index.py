@@ -15,6 +15,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import hashlib
+
 import aiohttp
 
 from utils.logger import get_logger
@@ -22,18 +24,19 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # Lightweight model — ~80MB, fast on CPU, good quality
-EMBED_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "media_index"
 CHROMA_DIR = os.path.join(os.path.expanduser("~"), ".llm-remote", "chroma_db")
 CHANNELS_DVR_URL = "http://localhost:8089"
 
 # How often to refresh the index (seconds)
-REFRESH_INTERVAL = 3600  # 1 hour
+REFRESH_INTERVAL = 1800  # 30 minutes (incremental, so lightweight)
 
 # CPU throttling: limit threads used by sentence-transformers / PyTorch
-# so we don't starve DVR services, Ollama, or Whisper
-_MAX_ENCODE_THREADS = 2
-_ENCODE_BATCH_SIZE = 64  # smaller batches = less CPU spikes
+# so we don't starve DVR services, Ollama, or Whisper.
+# Use ~12% of cores (minimum 1).
+_MAX_ENCODE_THREADS = max(1, (os.cpu_count() or 4) // 8)
+DEFAULT_ENCODE_BATCH_SIZE = 64  # smaller batches = less CPU spikes
 _STARTUP_DELAY = 30  # seconds to wait before first index build
 
 
@@ -51,6 +54,16 @@ class SemanticIndex:
         self._last_refresh = 0.0
         self._doc_count = 0
         self._refresh_task: Optional[asyncio.Task] = None
+        self._doc_hashes: Dict[str, str] = {}  # id -> text hash for incremental skip
+
+        # Pull tunables from config
+        sem_cfg = getattr(orchestrator, "config", {}).get("semantic", {})
+        self._embed_model = sem_cfg.get("embed_model", DEFAULT_EMBED_MODEL)
+        self._encode_batch_size = sem_cfg.get("encode_batch_size", DEFAULT_ENCODE_BATCH_SIZE)
+
+        # Scale max_chars for format_context with LLM context window
+        llm_ctx = getattr(orchestrator, "config", {}).get("llm", {}).get("num_ctx", 4096)
+        self._default_max_chars = max(400, llm_ctx // 5)
 
     async def start(self) -> None:
         """Initialize the embedding model and ChromaDB, then build/refresh the index."""
@@ -76,8 +89,8 @@ class SemanticIndex:
         from sentence_transformers import SentenceTransformer
         import chromadb
 
-        logger.info("Loading embedding model: %s (max %d threads)", EMBED_MODEL, _MAX_ENCODE_THREADS)
-        self._embedder = SentenceTransformer(EMBED_MODEL)
+        logger.info("Loading embedding model: %s (max %d threads)", self._embed_model, _MAX_ENCODE_THREADS)
+        self._embedder = SentenceTransformer(self._embed_model)
 
         os.makedirs(CHROMA_DIR, exist_ok=True)
         client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -104,30 +117,41 @@ class SemanticIndex:
     # Search
     # ------------------------------------------------------------------
 
-    async def search(self, query: str, n_results: int = 10) -> List[Dict[str, Any]]:
+    async def search(self, query: str, n_results: int = 10, systems: list[str] | None = None) -> List[Dict[str, Any]]:
         """
         Semantic search — find recordings most relevant to the query.
         Returns list of dicts with metadata + relevance score.
+        Optionally filter by source systems (e.g. ["channelsdvr"]).
         Runs in <100ms typically.
         """
         if not self._ready or not self._collection:
             return []
 
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, self._search_sync, query, n_results)
+        results = await loop.run_in_executor(None, self._search_sync, query, n_results, systems)
         return results
 
-    def _search_sync(self, query: str, n_results: int) -> List[Dict[str, Any]]:
+    def _search_sync(self, query: str, n_results: int, systems: list[str] | None = None) -> List[Dict[str, Any]]:
         """Synchronous search in ChromaDB."""
         if self._collection.count() == 0:
             return []
 
         n_results = min(n_results, self._collection.count())
         embedding = self._embedder.encode(query).tolist()
+
+        # Filter by active systems if not all are selected
+        where_filter = None
+        if systems and set(systems) != {"sagetv", "channelsdvr"}:
+            if len(systems) == 1:
+                where_filter = {"source": systems[0]}
+            else:
+                where_filter = {"source": {"$in": systems}}
+
         results = self._collection.query(
             query_embeddings=[embedding],
             n_results=n_results,
             include=["documents", "metadatas", "distances"],
+            where=where_filter,
         )
 
         hits = []
@@ -141,8 +165,10 @@ class SemanticIndex:
             })
         return hits
 
-    def format_context(self, hits: List[Dict[str, Any]], max_chars: int = 2000) -> str:
+    def format_context(self, hits: List[Dict[str, Any]], max_chars: int | None = None) -> str:
         """Format search results as concise context for the LLM prompt."""
+        if max_chars is None:
+            max_chars = self._default_max_chars
         if not hits:
             return ""
 
@@ -341,28 +367,58 @@ class SemanticIndex:
         return {"id": f"sagetv_{media_id or hash(text)}", "text": text, "meta": meta}
 
     def _upsert_docs(self, docs: List[Dict[str, str]]) -> int:
-        """Embed and upsert documents into ChromaDB (sync, runs in executor)."""
+        """Embed and upsert documents into ChromaDB (sync, runs in executor).
+
+        Incremental: skips docs whose text hasn't changed since last refresh.
+        Reconciliation: removes stale entries no longer present in source.
+        """
         if not docs:
             return self._collection.count()
 
         import time
-        batch_size = _ENCODE_BATCH_SIZE
-        for i in range(0, len(docs), batch_size):
-            batch = docs[i:i + batch_size]
-            ids = [d["id"] for d in batch]
-            texts = [d["text"] for d in batch]
-            metas = [d.get("meta", {}) for d in batch]
 
-            embeddings = self._embedder.encode(texts).tolist()
+        # --- Incremental: filter to only new/changed docs ---
+        new_hashes: Dict[str, str] = {}
+        changed_docs = []
+        for d in docs:
+            text_hash = hashlib.md5(d["text"].encode()).hexdigest()
+            new_hashes[d["id"]] = text_hash
+            if self._doc_hashes.get(d["id"]) != text_hash:
+                changed_docs.append(d)
 
-            self._collection.upsert(
-                ids=ids,
-                documents=texts,
-                embeddings=embeddings,
-                metadatas=metas,
-            )
-            # Yield CPU between batches so DVR services stay responsive
-            time.sleep(0.5)
+        if changed_docs:
+            logger.info("Incremental index: %d changed of %d total docs", len(changed_docs), len(docs))
+            batch_size = self._encode_batch_size
+            for i in range(0, len(changed_docs), batch_size):
+                batch = changed_docs[i:i + batch_size]
+                ids = [d["id"] for d in batch]
+                texts = [d["text"] for d in batch]
+                metas = [d.get("meta", {}) for d in batch]
+
+                embeddings = self._embedder.encode(texts).tolist()
+
+                self._collection.upsert(
+                    ids=ids,
+                    documents=texts,
+                    embeddings=embeddings,
+                    metadatas=metas,
+                )
+                # Yield CPU between batches so DVR services stay responsive
+                time.sleep(0.5)
+        else:
+            logger.info("Incremental index: no changes detected, skipping embedding")
+
+        # --- Reconciliation: remove stale entries ---
+        fresh_ids = set(new_hashes.keys())
+        stale_ids = [doc_id for doc_id in self._doc_hashes if doc_id not in fresh_ids]
+        if stale_ids:
+            logger.info("Removing %d stale entries from index", len(stale_ids))
+            # ChromaDB delete accepts max ~5000 ids at a time
+            for i in range(0, len(stale_ids), 5000):
+                self._collection.delete(ids=stale_ids[i:i + 5000])
+
+        # Update cached hashes
+        self._doc_hashes = new_hashes
 
         return self._collection.count()
 

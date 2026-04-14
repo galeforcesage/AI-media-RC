@@ -119,6 +119,36 @@ async def sagetv_resume_playback(client: SageXClient, args: Dict) -> Dict:
     return _ok(message="Playback resumed")
 
 
+async def sagetv_toggle_playback(client: SageXClient, args: Dict) -> Dict:
+    """Toggle play/pause on the active SageTV session."""
+    ctx = args.get("session_id", "")
+    # Try to detect current state; Placeshifter may report unreliable values
+    has_media = await client.call("MediaPlayerAPI.HasMediaFile", context=ctx)
+    if not has_media:
+        # Nothing loaded — try to play
+        await client.call("MediaPlayerAPI.Play", context=ctx)
+        return _ok(data={"state": "playing"}, message="Playback started")
+
+    # For Placeshifters, IsPlaying may be unreliable (always false).
+    # Use the explicit action hint from the caller if provided.
+    hint = args.get("action_hint", "")
+    if hint == "play":
+        await client.call("MediaPlayerAPI.Play", context=ctx)
+        return _ok(data={"state": "playing"}, message="Playback resumed")
+    elif hint == "pause":
+        await client.call("MediaPlayerAPI.Pause", context=ctx)
+        return _ok(data={"state": "paused"}, message="Playback paused")
+
+    # No hint — try IsPlaying detection
+    is_playing = await client.call("MediaPlayerAPI.IsPlaying", context=ctx)
+    if is_playing:
+        await client.call("MediaPlayerAPI.Pause", context=ctx)
+        return _ok(data={"state": "paused"}, message="Playback paused")
+    else:
+        await client.call("MediaPlayerAPI.Play", context=ctx)
+        return _ok(data={"state": "playing"}, message="Playback resumed")
+
+
 async def sagetv_stop_playback(client: SageXClient, args: Dict) -> Dict:
     ctx = args.get("session_id", "")
     await client.call("MediaPlayerAPI.CloseAndWaitUntilClosed", context=ctx)
@@ -237,6 +267,86 @@ async def sagetv_get_clients(client: SageXClient, args: Dict) -> Dict:
     return _ok(data=data, message="Connected clients retrieved")
 
 
+async def sagetv_get_ui_contexts(client: SageXClient, args: Dict) -> Dict:
+    """Get all active SageTV UI contexts (server, placeshifters, extenders, clients)."""
+    contexts = await client.call("GetUIContextNames")
+    if not contexts:
+        return _ok(data=[], message="No UI contexts found")
+    if isinstance(contexts, str):
+        contexts = [contexts]
+
+    results = []
+    for ctx_name in contexts:
+        info = {"context_id": ctx_name}
+        try:
+            has_media = await client.call("MediaPlayerAPI.HasMediaFile", context=ctx_name)
+            title = await client.call("MediaPlayerAPI.GetCurrentMediaTitle", context=ctx_name)
+            info["title"] = title or ""
+            info["has_media"] = bool(has_media)
+            if has_media:
+                loaded = await client.call("MediaPlayerAPI.IsMediaPlayerFullyLoaded", context=ctx_name)
+                info["loaded"] = bool(loaded)
+                try:
+                    is_playing = await client.call("MediaPlayerAPI.IsPlaying", context=ctx_name)
+                    info["state"] = "playing" if is_playing else "paused"
+                except Exception:
+                    info["state"] = "loaded" if loaded else "idle"
+            else:
+                info["loaded"] = False
+                info["state"] = "idle"
+        except Exception:
+            info["title"] = ""
+            info["has_media"] = False
+            info["loaded"] = False
+            info["state"] = "unknown"
+        results.append(info)
+
+    return _ok(data=results, message=f"{len(results)} UI contexts found")
+
+
+async def sagetv_get_context_info(client: SageXClient, args: Dict) -> Dict:
+    """Get detailed playback state for a specific SageTV UI context."""
+    ctx = args.get("session_id", "")
+    if not ctx:
+        return _fail("missing_session_id", "session_id (context ID) is required")
+
+    has_media = await client.call("MediaPlayerAPI.HasMediaFile", context=ctx)
+    if not has_media:
+        return _ok(data={"context_id": ctx, "state": "idle", "title": ""})
+
+    title = await client.call("MediaPlayerAPI.GetCurrentMediaTitle", context=ctx) or ""
+    loaded = await client.call("MediaPlayerAPI.IsMediaPlayerFullyLoaded", context=ctx)
+
+    try:
+        is_playing = await client.call("MediaPlayerAPI.IsPlaying", context=ctx)
+        state = "playing" if is_playing else "paused"
+    except Exception:
+        state = "loaded" if loaded else "idle"
+
+    position_ms = await client.call("MediaPlayerAPI.GetMediaTime", context=ctx) or 0
+    duration_ms = await client.call("MediaPlayerAPI.GetMediaDuration", context=ctx) or 0
+
+    # GetMediaTime returns epoch ms for recordings; convert to relative position
+    # by checking if it looks like an epoch timestamp (> year 2000 in ms)
+    pos = int(position_ms)
+    dur = int(duration_ms)
+    if pos > 946684800000:  # epoch ms > year 2000
+        # Epoch-based position — try to compute relative from recording start
+        # Duration in this case is often the buffer size, not the show length
+        # Just report 0 and let the UI handle it gracefully
+        pos = 0
+        dur = 0
+
+    return _ok(data={
+        "context_id": ctx,
+        "title": title,
+        "state": state,
+        "position": pos / 1000,
+        "duration": dur / 1000,
+        "loaded": bool(loaded),
+    })
+
+
 # ==================================================================
 # RECORDING TOOLS
 # ==================================================================
@@ -352,6 +462,92 @@ async def sagetv_open_live_tv(client: SageXClient, args: Dict) -> Dict:
     ctx = args.get("session_id", "")
     await client.call("SageCommand", ["Live TV"], context=ctx)
     return _ok(message="Opened live TV")
+
+
+async def sagetv_channel_up(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Channel Up"], context=ctx)
+    return _ok(message="Channel up")
+
+
+async def sagetv_channel_down(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Channel Down"], context=ctx)
+    return _ok(message="Channel down")
+
+
+async def sagetv_nav_up(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Up"], context=ctx)
+    return _ok(message="Navigate up")
+
+
+async def sagetv_nav_down(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Down"], context=ctx)
+    return _ok(message="Navigate down")
+
+
+async def sagetv_nav_left(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Left"], context=ctx)
+    return _ok(message="Navigate left")
+
+
+async def sagetv_nav_right(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Right"], context=ctx)
+    return _ok(message="Navigate right")
+
+
+async def sagetv_nav_select(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Select"], context=ctx)
+    return _ok(message="Select")
+
+
+async def sagetv_nav_back(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Back"], context=ctx)
+    return _ok(message="Back")
+
+
+async def sagetv_nav_options(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Options"], context=ctx)
+    return _ok(message="Options menu")
+
+
+async def sagetv_page_up(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Page Up"], context=ctx)
+    return _ok(message="Page up")
+
+
+async def sagetv_page_down(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Page Down"], context=ctx)
+    return _ok(message="Page down")
+
+
+async def sagetv_toggle_cc(client: SageXClient, args: Dict) -> Dict:
+    """Toggle closed captions / subtitles."""
+    ctx = args.get("session_id", "")
+    # SageTV uses the Options > Subtitles flow, but SageCommand "CC" toggles directly
+    await client.call("SageCommand", ["CC"], context=ctx)
+    return _ok(message="Closed captions toggled")
+
+
+async def sagetv_close(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Close"], context=ctx)
+    return _ok(message="Close/exit sent")
+
+
+async def sagetv_power_off(client: SageXClient, args: Dict) -> Dict:
+    ctx = args.get("session_id", "")
+    await client.call("SageCommand", ["Power Off"], context=ctx)
+    return _ok(message="Power off sent")
 
 
 # ==================================================================
@@ -839,6 +1035,26 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "safety": Safety.SAFE,
         "handler": sagetv_get_clients,
     },
+    "sagetv_toggle_playback": {
+        "description": "Toggle play/pause on the active SageTV session. Checks current playback rate and plays if paused, pauses if playing.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_toggle_playback,
+    },
+    "sagetv_get_ui_contexts": {
+        "description": "Get all active SageTV UI contexts (server, placeshifters, extenders, mini-clients). Returns context_id, title, playback state for each.",
+        "input_schema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_ui_contexts,
+    },
+    "sagetv_get_context_info": {
+        "description": "Get detailed playback state for a specific SageTV UI context including title, position, duration, and play/pause state.",
+        "input_schema": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "SageTV UI context ID"},
+        }, "required": ["session_id"]},
+        "safety": Safety.SAFE,
+        "handler": sagetv_get_context_info,
+    },
 
     # ---- Recording ----
     "sagetv_record_show": {
@@ -936,6 +1152,90 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "input_schema": _session_id_schema(),
         "safety": Safety.SAFE,
         "handler": sagetv_open_live_tv,
+    },
+    "sagetv_channel_up": {
+        "description": "Channel up on SageTV client.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_channel_up,
+    },
+    "sagetv_channel_down": {
+        "description": "Channel down on SageTV client.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_channel_down,
+    },
+    "sagetv_nav_up": {
+        "description": "Navigate up in SageTV UI menus.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_up,
+    },
+    "sagetv_nav_down": {
+        "description": "Navigate down in SageTV UI menus.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_down,
+    },
+    "sagetv_nav_left": {
+        "description": "Navigate left in SageTV UI menus.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_left,
+    },
+    "sagetv_nav_right": {
+        "description": "Navigate right in SageTV UI menus.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_right,
+    },
+    "sagetv_nav_select": {
+        "description": "Select/confirm in SageTV UI menus (like OK/Enter).",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_select,
+    },
+    "sagetv_nav_back": {
+        "description": "Go back in SageTV UI menus.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_back,
+    },
+    "sagetv_nav_options": {
+        "description": "Open options/context menu on SageTV client.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_nav_options,
+    },
+    "sagetv_page_up": {
+        "description": "Page up in SageTV UI lists.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_page_up,
+    },
+    "sagetv_page_down": {
+        "description": "Page down in SageTV UI lists.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_page_down,
+    },
+    "sagetv_toggle_cc": {
+        "description": "Toggle closed captions / subtitles on SageTV client.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_toggle_cc,
+    },
+    "sagetv_close": {
+        "description": "Close/exit the current SageTV screen or stop playback and return to the previous view.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.SAFE,
+        "handler": sagetv_close,
+    },
+    "sagetv_power_off": {
+        "description": "Send power off command to SageTV client.",
+        "input_schema": _session_id_schema(),
+        "safety": Safety.CONFIRM,
+        "handler": sagetv_power_off,
     },
 
     # ---- Commercial Skip ----
