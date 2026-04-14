@@ -97,7 +97,7 @@
                 android:id="@+id/editHost"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:hint="e.g. 10.0.0.10"
+                android:hint="e.g. 192.168.1.100"
                 android:inputType="text"
                 android:imeOptions="actionNext"
                 android:layout_marginBottom="12dp" />
