@@ -86,7 +86,29 @@ class MetadataStore:
         if self._conn:
             self._conn.close()
 
-    def save(self, meta: TranscriptMetadata) -> None:
+    def save(self, meta: TranscriptMetadata, append: bool = False) -> None:
+        if append:
+            # Append transcript text to existing record for incremental transcription
+            existing = self._conn.execute(
+                "SELECT recording_id, transcript, word_count, duration FROM transcripts WHERE recording_id = ?",
+                (meta.recording_id,),
+            ).fetchone()
+            if existing:
+                combined_text = (existing["transcript"] or "") + "\n" + meta.transcript
+                combined_words = existing["word_count"] + meta.word_count
+                combined_duration = max(existing["duration"], meta.duration)
+                self._conn.execute(
+                    "UPDATE transcripts SET transcript = ?, word_count = ?, duration = ?, "
+                    "vtt = vtt || ?, created_at = ? WHERE recording_id = ?",
+                    (combined_text, combined_words, combined_duration,
+                     "\n" + meta.vtt if meta.vtt else "", time.time(),
+                     meta.recording_id),
+                )
+                self._conn.commit()
+                logger.info("Appended transcript for %s (now %d words)",
+                            meta.recording_id, combined_words)
+                return
+            # No existing record — fall through to insert
         self._conn.execute(
             """INSERT OR REPLACE INTO transcripts
                (recording_id, system, title, episode, duration, word_count,

@@ -5,10 +5,10 @@
     "llm": {
         "model_path": "models/llm",
         "base_url": "http://127.0.0.1:11434",
-        "model": "mistral:instruct",
+        "model": "qwen2.5:latest",
         "temperature": 0.7,
-        "num_predict": 512,
-        "num_ctx": 4096,
+        "num_predict": 1024,
+        "num_ctx": 8192,
         "max_concurrent": 1
     },
     "whisper": {
@@ -41,6 +41,9 @@
         "transcription_port": 8770
     },
     "channels_dvr_url": "http://localhost:8089",
+    "sagetv_url": "http://localhost:8080",
+    "sagetv_user": "sage",
+    "sagetv_pass": "frey",
     "session_manager_url": "http://127.0.0.1:8769",
     "paths": {
         "sagetv_media": "/var/media/tv",

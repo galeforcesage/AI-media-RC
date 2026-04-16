@@ -301,23 +301,48 @@ async def services():
         "transcription":{"name": "Transcription",  "port": 8770, "url": None},
     }
 
+    # DVR backend APIs (external servers the MCP layer talks to)
+    cfg = _orchestrator.config if _orchestrator else {}
+    channels_url = cfg.get("channels_dvr_url", "http://localhost:8089")
+    sagetv_url = cfg.get("sagetv_url", "http://localhost:8080")
+    sagetv_user = cfg.get("sagetv_user", "sage")
+    sagetv_pass = cfg.get("sagetv_pass", "")
+    dvr_checks = {
+        "channels_dvr": {"name": "Channels DVR", "port": 8089, "url": f"{channels_url}/status",
+                         "group": "dvr"},
+        "sagetv_server": {"name": "SageTV Server", "port": 8080,
+                          "url": f"{sagetv_url}/sagex/api?c=MediaPlayerAPI.GetCurrentMediaFile&encoder=json",
+                          "auth": aiohttp.BasicAuth(sagetv_user, sagetv_pass),
+                          "group": "dvr"},
+    }
+
     results = {}
     timeout = aiohttp.ClientTimeout(total=3)
 
     async def check_http(sid, info):
         t0 = time.monotonic()
         try:
+            headers = {}
+            auth = info.get("auth")
+            if auth:
+                import base64
+                cred = base64.b64encode(f"{auth.login}:{auth.password}".encode()).decode()
+                headers["Authorization"] = f"Basic {cred}"
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(info["url"]) as resp:
+                async with session.get(info["url"], headers=headers) as resp:
                     ms = round((time.monotonic() - t0) * 1000)
+                    status = "up" if resp.status == 200 else "degraded"
+                    if status == "degraded":
+                        logger.warning("Health check %s: HTTP %d from %s", sid, resp.status, info["url"])
                     results[sid] = {
                         "name": info["name"],
                         "port": info["port"],
-                        "status": "up" if resp.status == 200 else "degraded",
+                        "status": status,
                         "latency_ms": ms,
                     }
-        except Exception:
+        except Exception as exc:
             ms = round((time.monotonic() - t0) * 1000)
+            logger.warning("Health check %s failed: %s", sid, exc)
             results[sid] = {"name": info["name"], "port": info["port"], "status": "down", "latency_ms": ms}
 
     async def check_tcp(sid, info):
@@ -348,5 +373,16 @@ async def services():
         else:
             tasks.append(check_tcp(sid, info))
 
+    # DVR backend checks (all HTTP)
+    for sid, info in dvr_checks.items():
+        tasks.append(check_http(sid, info))
+
     await asyncio.gather(*tasks)
-    return {"services": results}
+
+    # Split results into services vs dvr_backends
+    dvr_backends = {}
+    for sid in list(dvr_checks.keys()):
+        if sid in results:
+            dvr_backends[sid] = results.pop(sid)
+
+    return {"services": results, "dvr_backends": dvr_backends}

@@ -10,9 +10,13 @@ from __future__ import annotations
 import datetime
 import enum
 import logging
+import re
 from typing import Any, Callable, Coroutine, Dict
 
 logger = logging.getLogger(__name__)
+
+# Pattern matching SageTV server names used as fallback ShowTitle for imports
+_RE_SAGETV_NAME = re.compile(r'^SageTV\d*$', re.IGNORECASE)
 
 
 # ------------------------------------------------------------------
@@ -86,6 +90,67 @@ def _enrich_recording(mf: Dict) -> Dict:
         if val:
             airing["AiringEndDate"] = _epoch_ms_to_readable(int(val))
     return mf
+
+
+def _slim_recording(mf: Dict) -> Dict:
+    """Extract only the fields the LLM needs from a SageTV recording.
+
+    Raw SageTV MediaFile objects are 3-5 KB each (nested Airing→Show→Channel,
+    file paths, segment info, metadata IDs, etc.).  50 recordings = 150-250 KB
+    which exceeds the agent's 4 KB truncation limit.  Return a compact dict
+    matching the Channels enrichment shape so the LLM gets consistent data.
+    """
+    if not isinstance(mf, dict):
+        return mf
+    airing = mf.get("Airing") or {}
+    show = airing.get("Show") or {}
+    channel = airing.get("Channel") or {}
+    start_ms = mf.get("FileStartTime") or airing.get("AiringStartTime") or 0
+    season = show.get("ShowSeasonNumber")
+    episode = show.get("ShowEpisodeNumber")
+    se = ""
+    if isinstance(season, int) and isinstance(episode, int):
+        se = f"S{season:02d}E{episode:02d}"
+
+    title = show.get("ShowTitle", "")
+    ep_title = show.get("ShowEpisode", "")
+
+    # Imported files often have ShowTitle = server name (e.g. "SageTV9") and
+    # the real show name embedded in ShowEpisode as a filename like
+    # "MotorWeek-S37E09-2018LexusLC500-5549956-0".  Extract the real title.
+    if _RE_SAGETV_NAME.match(title) and ep_title and "-" in ep_title:
+        parts = ep_title.split("-")
+        title = parts[0]
+        # The remainder after title-SxxExx is the episode description
+        rest = "-".join(parts[1:])
+        # Strip the SxxExx and trailing ID/segment numbers
+        rest = re.sub(r'^S\d+E\d+-', '', rest)
+        rest = re.sub(r'-\d+-\d+$', '', rest)
+        if rest:
+            ep_title = rest
+
+    return {
+        "id": str(mf.get("MediaFileID", "")),
+        "title": title,
+        "episode_title": ep_title,
+        "season_episode": se,
+        "channel": channel.get("ChannelName", ""),
+        "recorded": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
+        "duration_min": round((mf.get("FileDuration", 0) or 0) / 60000, 1),
+        "description": show.get("ShowDescription", ""),
+        "genres": show.get("ShowCategory", ""),
+        "image": show.get("ShowImage", ""),
+        "cast": show.get("ShowCast", []),
+        "content_rating": show.get("ShowParentalRating", ""),
+        "watched": bool(airing.get("IsWatched", False)),
+    }
+
+
+def _slim_recordings(data: Any) -> Any:
+    """Slim a list of SageTV recordings to LLM-friendly compact dicts."""
+    if isinstance(data, list):
+        return [_slim_recording(mf) for mf in data]
+    return data
 
 
 def _enrich_recordings(data: Any) -> Any:
@@ -230,17 +295,44 @@ async def sagetv_get_recordings(client: SageXClient, args: Dict) -> Dict:
     size = int(args.get("limit", 50))
     start = int(args.get("offset", 0))
     data = await client.call("GetMediaFiles", ["T"], start=start, size=size)
-    return _ok(data=_enrich_recordings(data), message="Recordings retrieved")
+    return _ok(data=_slim_recordings(data), message="Recordings retrieved")
 
 
 async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dict:
     data = await client.call("GetScheduledRecordings")
-    return _ok(data=data, message="Upcoming recordings retrieved")
+    if not data or not isinstance(data, list):
+        return _ok(data=[], message="No upcoming recordings")
+    slimmed = []
+    for item in data:
+        airing = item if "AiringStartTime" in item else item.get("Airing", item)
+        show = airing.get("Show") or {}
+        channel = airing.get("Channel") or {}
+        start_ms = airing.get("AiringStartTime", 0)
+        season = show.get("ShowSeasonNumber")
+        episode = show.get("ShowEpisodeNumber")
+        se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
+        slimmed.append({
+            "title": show.get("ShowTitle", ""),
+            "episode_title": show.get("ShowEpisode", ""),
+            "season_episode": se,
+            "channel": channel.get("ChannelName", ""),
+            "start_time": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
+        })
+    return _ok(data=slimmed, message=f"{len(slimmed)} upcoming recordings")
 
 
 async def sagetv_get_channels(client: SageXClient, args: Dict) -> Dict:
     data = await client.call("GetAllChannels")
-    return _ok(data=data, message="Channels retrieved")
+    if not data or not isinstance(data, list):
+        return _ok(data=[], message="No channels")
+    slimmed = []
+    for ch in data:
+        slimmed.append({
+            "number": ch.get("ChannelNumber", ""),
+            "name": ch.get("ChannelName", ""),
+            "network": ch.get("ChannelNetwork", ""),
+        })
+    return _ok(data=slimmed, message=f"{len(slimmed)} channels")
 
 
 async def sagetv_search_shows(client: SageXClient, args: Dict) -> Dict:
@@ -731,10 +823,34 @@ async def sagetv_get_channel(client: SageXClient, args: Dict) -> Dict:
 # RECORDING QUERY TOOLS
 # ==================================================================
 
+async def sagetv_list_genres(client: SageXClient, args: Dict) -> Dict:
+    """List all distinct genres/categories across SageTV recordings."""
+    data = await client.call("GetMediaFiles", ["T"])
+    if not data or not isinstance(data, list):
+        return _ok(data={"genres": []}, message="No recordings found")
+    genre_counts = {}
+    for mf in data:
+        show = (mf.get("Airing") or {}).get("Show") or {}
+        cat = show.get("ShowCategory", "")
+        if cat:
+            for g in cat.split("/"):
+                g = g.strip()
+                if g:
+                    genre_counts[g] = genre_counts.get(g, 0) + 1
+    sorted_genres = sorted(genre_counts.items(), key=lambda x: -x[1])
+    return _ok(data={"genres": [{"name": g, "count": c} for g, c in sorted_genres]},
+               message=f"{len(sorted_genres)} genres across {len(data)} recordings")
+
+
 async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     """Search recordings with multiple filter criteria."""
     title = args.get("title", "")
+    episode_title = args.get("episode_title", "")
     channel = args.get("channel", "")
+    actor = args.get("actor", "")
+    genre = args.get("genre", "")
+    season = args.get("season")
+    episode = args.get("episode")
     start_time = args.get("start_time")
     end_time = args.get("end_time")
     # Accept human-readable date strings (YYYY-MM-DD) and convert to epoch ms
@@ -771,11 +887,40 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
             if title.lower() not in combined:
                 continue
 
+        if episode_title:
+            ep_title = show.get("ShowEpisode", "")
+            if episode_title.lower() not in ep_title.lower():
+                continue
+
         if channel:
             ch = airing.get("Channel") or {}
             ch_num = str(ch.get("ChannelNumber", ""))
             ch_name = str(ch.get("ChannelName", ""))
             if channel.lower() not in ch_num.lower() and channel.lower() not in ch_name.lower():
+                continue
+
+        if actor:
+            rec_cast = show.get("ShowCast") or []
+            if isinstance(rec_cast, str):
+                cast_str = rec_cast.lower()
+            else:
+                cast_str = " ".join(rec_cast).lower()
+            if actor.lower() not in cast_str:
+                continue
+
+        if genre:
+            rec_cat = show.get("ShowCategory", "")
+            if genre.lower() not in rec_cat.lower():
+                continue
+
+        if season is not None:
+            rec_season = show.get("ShowSeasonNumber", 0)
+            if int(season) != int(rec_season):
+                continue
+
+        if episode is not None:
+            rec_episode = show.get("ShowEpisodeNumber", 0)
+            if int(episode) != int(rec_episode):
                 continue
 
         mf_start = mf.get("FileStartTime") or airing.get("AiringStartTime") or 0
@@ -807,7 +952,7 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
         if len(results) >= limit:
             break
 
-    return _ok(data=_enrich_recordings(results), message=f"Found {len(results)} matching recordings")
+    return _ok(data=_slim_recordings(results), message=f"Found {len(results)} matching recordings")
 
 
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -817,7 +962,7 @@ async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
     if not data:
         return _ok(data=[], message="No recent recordings")
     items = data if isinstance(data, list) else []
-    return _ok(data=_enrich_recordings(items), message=f"{len(items)} recent recordings")
+    return _ok(data=_slim_recordings(items), message=f"{len(items)} recent recordings")
 
 
 async def sagetv_get_active_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -1289,11 +1434,22 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
 
     # ---- Recording Queries ----
+    "sagetv_list_genres": {
+        "description": "List all distinct genres/categories across SageTV recordings with counts.",
+        "input_schema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": sagetv_list_genres,
+    },
     "sagetv_search_recordings": {
-        "description": "Search recordings with filters: title, channel, date range, watched, archived, recording state. Supports human-readable dates via start_date/end_date (YYYY-MM-DD).",
+        "description": "Search recordings with filters: title, episode_title, actor, genre, channel, season, episode, date range, watched, archived, recording state.",
         "input_schema": {"type": "object", "properties": {
-            "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
+            "title": {"type": "string", "description": "Show name substring filter (case-insensitive). Use the SHOW NAME only."},
+            "episode_title": {"type": "string", "description": "Episode title/name substring filter (case-insensitive)."},
+            "actor": {"type": "string", "description": "Actor/cast member name substring filter (case-insensitive)."},
+            "genre": {"type": "string", "description": "Genre/category substring filter (e.g. 'drama', 'comedy'). Use sagetv_list_genres to see valid values."},
             "channel": {"type": "string", "description": "Channel number or name filter"},
+            "season": {"type": "integer", "description": "Season number filter (e.g. 3 for S03)"},
+            "episode": {"type": "integer", "description": "Episode number filter (e.g. 14 for E14)"},
             "start_date": {"type": "string", "description": "Minimum date (YYYY-MM-DD). Preferred over start_time."},
             "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD). Preferred over end_time."},
             "start_time": {"type": "integer", "description": "Minimum start time (epoch ms). Use start_date instead."},

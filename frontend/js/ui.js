@@ -21,6 +21,7 @@ const UI = (() => {
     'device-list', 'system-output',
     'transcription-stats', 'transcription-jobs',
     'service-grid',
+    'dvr-grid',
   ];
 
   function cacheElements() {
@@ -315,6 +316,28 @@ const UI = (() => {
     });
   }
 
+  function renderDvrGrid(backends) {
+    const grid = el['dvr-grid'];
+    if (!backends || Object.keys(backends).length === 0) {
+      grid.innerHTML = '<p class="empty">No DVR backends configured.</p>';
+      return;
+    }
+    grid.innerHTML = '';
+    Object.entries(backends).forEach(([id, svc]) => {
+      const card = document.createElement('div');
+      card.className = 'service-card';
+      const statusCls = svc.status === 'up' ? 'up' : svc.status === 'degraded' ? 'degraded' : 'down';
+      const latency = svc.latency_ms != null ? `${svc.latency_ms}ms` : '';
+      card.innerHTML =
+        `<div class="svc-left">` +
+          `<span class="svc-dot ${statusCls}"></span>` +
+          `<span class="svc-name">${esc(svc.name)}</span>` +
+          `<span class="svc-detail">:${svc.port}${latency ? ' · ' + latency : ''}</span>` +
+        `</div>`;
+      grid.appendChild(card);
+    });
+  }
+
   function renderSystemOutput(text) {
     el['system-output'].textContent = text;
   }
@@ -378,7 +401,7 @@ const UI = (() => {
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
-    renderDeviceList, renderServiceGrid, renderSystemOutput, renderTranscriptionStats,
+    renderDeviceList, renderServiceGrid, renderDvrGrid, renderSystemOutput, renderTranscriptionStats,
     openSettings, openAdmin, refreshAdminDevices,
     el: () => el,
   };

@@ -30,31 +30,67 @@ class SearchService:
             query: The search string.
         """
         logger.info("Searching programs: target=%s query=%s", target, query)
+        # SageTV search expects 'query'; Channels expects 'title'
+        param_key = "query" if target == "sagetv" else "title"
         try:
             return await self.orchestrator.execute(
-                f"{target}.search", {"query": query}
+                f"{target}.search", {param_key: query}
             )
         except Exception as exc:
             logger.exception("search_programs failed")
             return {"error": str(exc)}
 
+    async def search_upcoming(self, query: str) -> Dict[str, Any]:
+        """
+        Search upcoming scheduled recordings filtered by title.
+        Returns matching upcoming items in the same format as search_programs.
+        """
+        logger.info("Searching upcoming: query=%s", query)
+        try:
+            from datetime import date, timedelta
+            today = date.today()
+            end = today + timedelta(days=14)
+            result = await self.orchestrator.execute(
+                "channels.upcoming",
+                {"start_date": today.isoformat(), "end_date": end.isoformat()},
+            )
+            if not result or result.get("error"):
+                return result or {"error": "no upcoming data"}
+            data = result.get("data", {})
+            scheduled = data.get("scheduled", [])
+            skipped = data.get("skipped", [])
+            all_items = scheduled + skipped
+            q = query.lower()
+            matched = [
+                item for item in all_items
+                if q in (item.get("title") or "").lower()
+                or q in (item.get("episode_title") or "").lower()
+            ]
+            return {"success": True, "data": matched,
+                    "message": f"{len(matched)} upcoming for '{query}'"}
+        except Exception as exc:
+            logger.exception("search_upcoming failed")
+            return {"error": str(exc)}
+
     async def search_all(self, query: str) -> Dict[str, Any]:
         """
-        Fan-out search across all backends concurrently.
+        Fan-out search across all backends + upcoming concurrently.
         Returns a dict keyed by backend name.
         """
         logger.info("Fan-out search: query=%s", query)
         targets = ("sagetv", "channels")
         tasks = [self.search_programs(t, query) for t in targets]
+        tasks.append(self.search_upcoming(query))
         raw = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: Dict[str, Any] = {}
-        for target, res in zip(targets, raw):
+        labels = list(targets) + ["upcoming"]
+        for label, res in zip(labels, raw):
             if isinstance(res, Exception):
-                logger.error("search_all error for %s: %s", target, res)
-                results[target] = {"error": str(res)}
+                logger.error("search_all error for %s: %s", label, res)
+                results[label] = {"error": str(res)}
             else:
-                results[target] = res
+                results[label] = res
 
         return results
 

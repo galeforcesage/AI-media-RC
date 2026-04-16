@@ -137,6 +137,16 @@ class MCPClient:
                 return text
         return result
 
+    async def ping(self) -> bool:
+        """Return True if the MCP server is reachable (TCP connect)."""
+        try:
+            async with self._lock:
+                if self._writer is None:
+                    await self._connect()
+            return self._writer is not None
+        except (ConnectionError, OSError):
+            return False
+
     async def list_tools(self) -> list:
         """List available tools from the server."""
         result = await self._rpc("tools/list", {})

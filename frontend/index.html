@@ -155,7 +155,6 @@
   <section id="chat" class="panel">
     <div id="messages" class="messages" role="log" aria-live="polite"></div>
     <div class="input-row">
-      <button id="btn-cancel" class="btn-cancel" title="Cancel" aria-label="Cancel request" hidden>✕</button>
       <button id="btn-voice" class="btn-voice" title="Hold to speak" aria-label="Hold to speak">🎤</button>
       <input type="text" id="text-input" placeholder="Type a command..." aria-label="Command input"
              autocomplete="off">
@@ -211,6 +210,10 @@
           <button id="btn-refresh-services" class="btn-tiny" title="Refresh">↻</button>
         </div>
         <div id="service-grid" class="service-grid"></div>
+        <div class="services-header" style="margin-top:0.75rem">
+          <span class="services-title">DVR Backends</span>
+        </div>
+        <div id="dvr-grid" class="service-grid"></div>
       </div>
       <div id="tab-system" class="tab-panel">
         <button id="btn-docker-status" class="btn-small">Docker Status</button>

@@ -196,9 +196,6 @@
     });
     btnSend.addEventListener('click', handleSend);
 
-    // Cancel
-    document.getElementById('btn-cancel').addEventListener('click', cancelQuery);
-
     // Voice
     document.getElementById('btn-voice').addEventListener('click', () => {
       if (Voice.isRecording()) Voice.stop();
@@ -455,6 +452,7 @@
     try {
       const data = await API.services();
       if (data.services) UI.renderServiceGrid(data.services);
+      if (data.dvr_backends) UI.renderDvrGrid(data.dvr_backends);
     } catch (e) {
       console.error('Failed to refresh services:', e);
     }
@@ -483,32 +481,39 @@
       _activeAbort.abort();
       _activeAbort = null;
     }
-    document.getElementById('btn-cancel').hidden = true;
   }
 
   async function handleSend() {
     const input = document.getElementById('text-input');
     const text = input.value.trim();
     if (!text) return;
-    if (_activeAbort) return; // already in-flight
+    if (_activeAbort) {
+      // Already processing — flash the input to signal the user
+      input.classList.add('input-blocked');
+      setTimeout(() => input.classList.remove('input-blocked'), 400);
+      return;
+    }
     input.value = '';
+    const sendBtn = document.getElementById('btn-send');
+    if (sendBtn) sendBtn.disabled = true;
     UI.addMessage(text, 'user');
 
-    // Show thinking indicator + cancel button
+    // Show thinking indicator with inline cancel button
     const thinking = document.createElement('div');
     thinking.className = 'message thinking';
-    thinking.textContent = 'Thinking';
+    thinking.innerHTML = '<div class="think-current">Thinking</div>' +
+      '<button class="think-cancel" title="Cancel" aria-label="Cancel request">✕</button>';
+    thinking.querySelector('.think-cancel').addEventListener('click', cancelQuery);
     const msgContainer = document.getElementById('messages');
     msgContainer.appendChild(thinking);
     msgContainer.scrollTop = msgContainer.scrollHeight;
 
-    const btnCancel = document.getElementById('btn-cancel');
-    btnCancel.hidden = false;
     _activeAbort = new AbortController();
 
     // Streaming state: when tokens arrive, switch from "thinking" to live text
     let streamEl = null;
     let streamedText = '';
+    let statusLog = [];
 
     try {
       const data = await API.queryStream(text, State.get().llmFocus, (status) => {
@@ -520,7 +525,14 @@
           streamedText = '';
         }
         thinking.style.display = '';
-        thinking.textContent = status;
+        // Accumulate status log so user can see the full chain of events
+        statusLog.push(status);
+        const logHtml = statusLog.slice(0, -1)
+          .map(s => `<div class="think-prev">${esc(s)}</div>`).join('');
+        thinking.innerHTML = logHtml +
+          `<div class="think-current">${esc(status)}</div>` +
+          '<button class="think-cancel" title="Cancel" aria-label="Cancel request">✕</button>';
+        thinking.querySelector('.think-cancel').addEventListener('click', cancelQuery);
         msgContainer.scrollTop = msgContainer.scrollHeight;
       }, _activeAbort.signal, (token) => {
         // Token callback — progressively render LLM output
@@ -535,7 +547,13 @@
         msgContainer.scrollTop = msgContainer.scrollHeight;
       });
 
-      thinking.remove();
+      // Convert thinking indicator into a persistent status log
+      if (statusLog.length > 0) {
+        thinking.className = 'message status-log';
+        thinking.innerHTML = statusLog.map(s => `<div class="status-step">${esc(s)}</div>`).join('');
+      } else {
+        thinking.remove();
+      }
 
       // If we streamed the response, finalize with proper HTML rendering
       if (streamEl) {
@@ -561,7 +579,10 @@
       }
     } finally {
       _activeAbort = null;
-      btnCancel.hidden = true;
+      const inp = document.getElementById('text-input');
+      inp.focus();
+      const btn = document.getElementById('btn-send');
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -660,10 +681,10 @@
           return show === q || ep === q || show.includes(q) || ep.includes(q);
         });
       }
-      const display = exact.length > 0 ? exact : items;
+      const display = exact.length > 0 ? exact : (episodeFilter ? [] : items);
 
       if (display.length === 0) {
-        bodyEl.innerHTML = '<p>No recordings found for this title.</p>';
+        bodyEl.innerHTML = '<p>No recordings or upcoming episodes found for this title.</p>';
         return;
       }
 
@@ -707,7 +728,7 @@
         let seStr = seRaw;
         if (!seStr) {
           const season = r.season != null ? r.season : show.ShowSeasonNumber;
-          const epNum = r.episode_number != null ? r.episode_number : show.ShowEpisodeNumber;
+          const epNum = r.episode_number != null ? r.episode_number : (r.episode != null ? r.episode : show.ShowEpisodeNumber);
           const s = season != null ? `S${String(season).padStart(2,'0')}` : '';
           const e = epNum != null ? `E${String(epNum).padStart(2,'0')}` : '';
           seStr = (s || e) ? `${s}${e}` : '';
@@ -719,7 +740,8 @@
         const airDate = r.air_date || r.original_air_date || r.original_date || r.recorded || r.start_time || '';
         const desc = getDesc(r);
         const rating = r.content_rating || '';
-        const system = r._system || '';
+        const system = r._system === 'upcoming' ? 'scheduled' : (r._system || '');
+        const watched = r.watched ? '✓ watched' : '';
         const img = r.image || '';
         const cast = r.cast || show.ShowCast || [];
         const genres = r.genres || show.ShowGenres || show.ShowCategory || [];
@@ -741,7 +763,7 @@
         if (seStr) html += ` <span class="si-ep">${esc(seStr)}</span>`;
         html += '</div>';
         if (ep) html += `<div class="si-episode">${esc(ep)}</div>`;
-        const meta = [channel, duration, airDate, rating, system].filter(Boolean);
+        const meta = [channel, duration, airDate, rating, system, watched].filter(Boolean);
         if (meta.length) html += `<div class="si-meta">${meta.map(esc).join(' · ')}</div>`;
         if (desc) html += `<div class="si-desc">${esc(desc)}</div>`;
         if (genreList.length) html += `<div class="si-genres">${genreList.map(esc).join(', ')}</div>`;

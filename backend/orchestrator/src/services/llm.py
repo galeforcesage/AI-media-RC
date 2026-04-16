@@ -211,14 +211,20 @@ class LLMService:
         self,
         messages: list[Dict[str, Any]],
         token_callback=None,
+        tools: list[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """
         Streaming multi-turn chat via Ollama /api/chat.
 
+        When ``tools`` is provided, Ollama may return a tool_calls response
+        instead of text content.  In that case no tokens are streamed and
+        the returned dict contains a ``"tool_calls"`` key.
+
         Streams tokens through token_callback as they arrive,
         and returns the final accumulated result dict.
         """
-        logger.info("LLM streaming chat (%d messages)", len(messages))
+        logger.info("LLM streaming chat (%d messages, %d tools)",
+                     len(messages), len(tools) if tools else 0)
         try:
             payload: Dict[str, Any] = {
                 "model": self.model,
@@ -231,8 +237,11 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            if tools:
+                payload["tools"] = tools
             accumulated = []
-            timeout = aiohttp.ClientTimeout(total=300)
+            accumulated_tool_calls = []
+            timeout = aiohttp.ClientTimeout(total=600)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -250,6 +259,10 @@ class LLMService:
                         except json.JSONDecodeError:
                             continue
                         msg = chunk.get("message", {})
+                        # Native tool calls
+                        tc = msg.get("tool_calls")
+                        if tc:
+                            accumulated_tool_calls.extend(tc)
                         token = msg.get("content", "")
                         if token:
                             accumulated.append(token)
@@ -259,6 +272,19 @@ class LLMService:
                             break
 
             response_text = "".join(accumulated).strip()
+
+            if accumulated_tool_calls:
+                logger.info(
+                    "LLM stream_chat returned %d native tool_calls",
+                    len(accumulated_tool_calls),
+                )
+                return {
+                    "status": "ok",
+                    "response": response_text,
+                    "tool_calls": accumulated_tool_calls,
+                    "model": self.model,
+                }
+
             logger.info(
                 "LLM stream_chat done (%d chars): %s",
                 len(response_text), response_text[:100],

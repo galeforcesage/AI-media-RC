@@ -109,16 +109,21 @@ class MetadataEnrichmentPipeline:
                 summary=None,  # Summary generated asynchronously later
             )
 
-            # 5b. Copy sidecar alongside the original recording file
+            # 5b. Move sidecar alongside the original recording file.
+            #     This keeps sidecars co-located with recordings whether on
+            #     HDD (Channels DVR) or inside a Docker volume (SageTV).
+            #     The central sidecars/ dir is just a staging area.
             source_file = job.get("file_path")
             if sidecar_path and source_file:
                 try:
                     recording_dir = os.path.dirname(source_file)
                     dest = os.path.join(recording_dir, os.path.basename(sidecar_path))
                     shutil.copy2(sidecar_path, dest)
-                    logger.info("Copied sidecar to recording dir: %s", dest)
+                    os.unlink(sidecar_path)
+                    logger.info("Moved sidecar to recording dir: %s", dest)
                 except Exception:
-                    logger.warning("Failed to copy sidecar to recording dir", exc_info=True)
+                    # Keep the staging copy if move fails
+                    logger.warning("Failed to move sidecar to recording dir", exc_info=True)
 
             # 6. Insert into transcript index
             genre = metadata.get("genre", [])

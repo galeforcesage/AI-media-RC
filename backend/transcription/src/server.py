@@ -211,6 +211,16 @@ class TranscriptionServer:
             },
         },
         {
+            "name": "transcript_list_recent",
+            "description": "List the most recent transcripts ordered by date (newest first). Returns title, episode, recording_id, word_count, and created_at for each.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Number of transcripts to return (default 10)"},
+                },
+            },
+        },
+        {
             "name": "transcript_reindex",
             "description": "Reindex all transcript sidecar files. Safety level: CONFIRM.",
             "inputSchema": {
@@ -283,6 +293,16 @@ class TranscriptionServer:
             if "error" in result:
                 return self._tool_err(result["error"])
             return self._tool_ok(result)
+
+        elif name == "transcript_list_recent":
+            limit = args.get("limit", 10)
+            recent = self.store.list_recent(limit=limit)
+            data = [{"recording_id": r.recording_id, "title": r.title,
+                      "episode": r.episode, "word_count": r.word_count,
+                      "created_at": r.created_at} for r in recent]
+            stats = self.store.stats()
+            return self._tool_ok({"total": stats["total_transcripts"],
+                                  "recent": data, "count": len(data)})
 
         elif name == "transcript_reindex":
             directory = args.get("directory", str(self.sidecar.output_dir))

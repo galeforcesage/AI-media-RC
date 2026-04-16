@@ -61,6 +61,17 @@ class TranscriptionQueue:
         if existing:
             logger.debug("Job for recording %s already queued", job.recording_id)
             return job
+        # For incremental jobs, also dedup on file_path — don't allow multiple
+        # pending/processing jobs for the same physical file
+        if "__inc_" in job.recording_id:
+            existing_path = self._conn.execute(
+                "SELECT job_id FROM jobs WHERE file_path = ? AND status IN ('pending', 'extracting', 'processing')",
+                (job.file_path,),
+            ).fetchone()
+            if existing_path:
+                logger.debug("Incremental job for file %s already queued (job %s)",
+                             job.file_path, existing_path["job_id"])
+                return job
         self._conn.execute(
             """INSERT INTO jobs (job_id, system, recording_id, file_path, temp_audio_path,
                 status, attempts, max_attempts, error, created_at, updated_at, duration)

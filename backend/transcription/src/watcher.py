@@ -57,6 +57,7 @@ class FileWatcher:
         self._pending_first_seen: Dict[str, float] = {}  # path -> time first entered pending
         self._live_offset: Dict[str, int] = {}  # path -> bytes already queued for incremental
         self._live_queued: Dict[str, bool] = {}  # path -> has any incremental job been queued
+        self._live_job_id: Dict[str, str] = {}  # path -> job_id of active incremental job
         self._running = False
 
     async def start(self) -> None:
@@ -144,6 +145,7 @@ class FileWatcher:
                     self._pending_first_seen.pop(path_str, None)
                     prev_offset = self._live_offset.pop(path_str, 0)
                     self._live_queued.pop(path_str, None)
+                    self._live_job_id.pop(path_str, None)
                     if is_incremental_tail:
                         # Final job for the remaining tail of the file
                         self._enqueue(path_str, incremental=True, offset=prev_offset, final=True)
@@ -155,7 +157,11 @@ class FileWatcher:
             self._check_live(now)
 
     def _check_live(self, now: float) -> None:
-        """Queue incremental transcription if exactly one recording is in progress."""
+        """Queue incremental transcription if exactly one recording is in progress.
+        
+        Only queues a new incremental job when the previous one for this file
+        has completed (status != pending/processing), preventing queue flooding.
+        """
         growing = [
             p for p in self._pending
             if (now - self._pending_first_seen.get(p, now)) >= INCREMENTAL_MIN_AGE
@@ -169,14 +175,30 @@ class FileWatcher:
         offset = self._live_offset.get(path, 0)
         new_bytes = size - offset
 
-        if new_bytes >= INCREMENTAL_MIN_BYTES:
-            self._live_offset[path] = size
-            self._live_queued[path] = True
-            self._enqueue(path, incremental=True, offset=offset, final=False)
-            logger.info(
-                "Watcher '%s' queued incremental job: %s (offset=%d, size=%d)",
-                self.name, Path(path).stem, offset, size,
-            )
+        if new_bytes < INCREMENTAL_MIN_BYTES:
+            return
+
+        # Check if a previous incremental job for this file is still pending/processing
+        prev_job_id = self._live_job_id.get(path)
+        if prev_job_id:
+            try:
+                prev_job = self.queue.get_job(prev_job_id)
+                if prev_job and prev_job.status in ("pending", "extracting", "processing"):
+                    logger.debug("Watcher '%s' waiting for previous incremental job %s to finish",
+                                 self.name, prev_job_id)
+                    return
+            except Exception:
+                pass  # If we can't check, allow queueing
+
+        self._live_offset[path] = size
+        self._live_queued[path] = True
+        job = self._enqueue(path, incremental=True, offset=offset, final=False)
+        if job:
+            self._live_job_id[path] = job.job_id
+        logger.info(
+            "Watcher '%s' queued incremental job: %s (offset=%d, size=%d)",
+            self.name, Path(path).stem, offset, size,
+        )
 
     def _enqueue(
         self,
@@ -184,19 +206,20 @@ class FileWatcher:
         incremental: bool = False,
         offset: int = 0,
         final: bool = False,
-    ) -> None:
+    ) -> Optional[TranscriptionJob]:
         recording_id = Path(file_path).stem
-        # Skip if a transcript already exists for this recording
-        try:
-            existing = self.queue._conn.execute(
-                "SELECT recording_id FROM transcripts WHERE recording_id = ?",
-                (recording_id,),
-            ).fetchone()
-            if existing:
-                logger.debug("Transcript already exists for %s, skipping", recording_id)
-                return
-        except Exception:
-            pass  # Table may not exist yet; let the queue handle dedup
+        # Skip if a transcript already exists for this recording (non-incremental only)
+        if not incremental:
+            try:
+                existing = self.queue._conn.execute(
+                    "SELECT recording_id FROM transcripts WHERE recording_id = ?",
+                    (recording_id,),
+                ).fetchone()
+                if existing:
+                    logger.debug("Transcript already exists for %s, skipping", recording_id)
+                    return None
+            except Exception:
+                pass  # Table may not exist yet; let the queue handle dedup
         job = TranscriptionJob(
             system=self.system,
             recording_id=recording_id,
@@ -215,3 +238,4 @@ class FileWatcher:
                         self.name, recording_id, offset, final)
         else:
             logger.info("Watcher '%s' queued: %s", self.name, recording_id)
+        return job

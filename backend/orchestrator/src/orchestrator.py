@@ -305,6 +305,42 @@ class Orchestrator:
         return None
 
     # ------------------------------------------------------------------
+    # Temporal intent classifier
+    # ------------------------------------------------------------------
+
+    _FUTURE_RE = re.compile(
+        r"\b(?:record(?:s|ing)?\s+(?:today|tonight|tomorrow|this\s+week)|"
+        r"what(?:'s| is| will)\s+(?:record|schedule|on\s+tonight)|"
+        r"upcoming|scheduled|will\s+record|"
+        r"what\s+records\b|set\s+(?:a\s+)?recording|schedule\s+recording)\b",
+        re.IGNORECASE,
+    )
+    _PAST_RE = re.compile(
+        r"\b(?:recorded|watched|transcript|was\s+on|aired|"
+        r"yesterday|last\s+(?:night|week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+        r"what\s+(?:has\s+)?recorded|past\s+\d+\s+days?)\b",
+        re.IGNORECASE,
+    )
+    _PRESENT_RE = re.compile(
+        r"\b(?:right\s+now|currently|is\s+recording|now\s+playing|"
+        r"what(?:'s| is)\s+(?:on\s+now|playing|airing))\b",
+        re.IGNORECASE,
+    )
+
+    def _classify_temporal(self, prompt: str) -> str:
+        """Classify query temporal intent: 'past', 'future', 'present', or 'both'."""
+        has_future = bool(self._FUTURE_RE.search(prompt))
+        has_past = bool(self._PAST_RE.search(prompt))
+        has_present = bool(self._PRESENT_RE.search(prompt))
+        if has_future and not has_past:
+            return "future"
+        if has_past and not has_future:
+            return "past"
+        if has_present and not has_past and not has_future:
+            return "present"
+        return "both"
+
+    # ------------------------------------------------------------------
     # High-level orchestration methods
     # ------------------------------------------------------------------
 
@@ -445,46 +481,53 @@ class Orchestrator:
                 return {"status": "error", "llm_response": f"Command failed: {exc}", "transcript_results": []}
 
         try:
-            # Pre-fetch transcript context so the LLM has immediate context
+            # Classify temporal intent to skip irrelevant pre-fetches
+            temporal = self._classify_temporal(prompt)
+            logger.info("Temporal intent: %s", temporal)
+
+            # Pre-fetch transcript context (PAST only — transcripts can't exist for future content)
             transcript_context = ""
             transcript_hits: list = []
-            try:
-                if status_callback:
-                    await status_callback("Searching transcripts")
-                transcript_results = await self.search.transcript_search(prompt)
-                if isinstance(transcript_results, dict):
-                    data = transcript_results.get("data", transcript_results)
-                    transcript_hits = data.get("results", [])
-                if transcript_hits:
-                    lines = []
-                    for r in transcript_hits[:2]:
-                        title = r.get("title", "Unknown")
-                        ep = r.get("episode_title", "")
-                        start = r.get("start_time", 0)
-                        snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
-                        mins = int(start // 60)
-                        secs = int(start % 60)
-                        time_str = f"{mins}:{secs:02d}"
-                        if ep:
-                            lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
-                        else:
-                            lines.append(f'From "{title}" at {time_str}: {snippet}')
-                    transcript_context = "\n".join(lines)
-            except Exception:
-                logger.warning("Transcript pre-fetch failed, continuing without")
+            if temporal not in ("future", "present"):
+                try:
+                    if status_callback:
+                        await status_callback("Searching transcripts")
+                    transcript_results = await self.search.transcript_search(prompt)
+                    if isinstance(transcript_results, dict):
+                        data = transcript_results.get("data", transcript_results)
+                        transcript_hits = data.get("results", [])
+                    if transcript_hits:
+                        lines = []
+                        for r in transcript_hits[:2]:
+                            title = r.get("title", "Unknown")
+                            ep = r.get("episode_title", "")
+                            start = r.get("start_time", 0)
+                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
+                            mins = int(start // 60)
+                            secs = int(start % 60)
+                            time_str = f"{mins}:{secs:02d}"
+                            if ep:
+                                lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                            else:
+                                lines.append(f'From "{title}" at {time_str}: {snippet}')
+                        transcript_context = "\n".join(lines)
+                except Exception:
+                    logger.warning("Transcript pre-fetch failed, continuing without")
 
             # Pre-fetch semantic context from the vector index (sub-second)
+            # Pre-fetch semantic context (skip for future-only — no past media to match)
             semantic_context = ""
-            try:
-                if self.semantic_index.ready:
-                    if status_callback:
-                        await status_callback("Searching media library")
-                    hits = await self.semantic_index.search(prompt, n_results=2, systems=systems)
-                    semantic_context = self.semantic_index.format_context(hits)
-                    if semantic_context:
-                        logger.info("Semantic index returned %d hits", len(hits))
-            except Exception:
-                logger.warning("Semantic pre-fetch failed, continuing without")
+            if temporal != "future":
+                try:
+                    if self.semantic_index.ready:
+                        if status_callback:
+                            await status_callback("Searching media library")
+                        hits = await self.semantic_index.search(prompt, n_results=2, systems=systems)
+                        semantic_context = self.semantic_index.format_context(hits)
+                        if semantic_context:
+                            logger.info("Semantic index returned %d hits", len(hits))
+                except Exception:
+                    logger.warning("Semantic pre-fetch failed, continuing without")
 
             # Run the agentic tool-calling loop
             agent_result = await self.agent.run(
@@ -492,6 +535,7 @@ class Orchestrator:
                 transcript_context=transcript_context,
                 semantic_context=semantic_context,
                 systems=systems,
+                temporal=temporal,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -726,6 +770,7 @@ class Orchestrator:
         "channel_up": "channels_channel_up",
         "channel_down": "channels_channel_down",
         "toggle_cc": "channels_toggle_cc",
+        "upcoming": "channels_get_upcoming_recordings",
     }
 
     async def _execute_sagetv(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:

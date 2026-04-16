@@ -83,11 +83,20 @@ class TranscriptionWorker:
     async def _process(self, job: TranscriptionJob) -> None:
         logger.info("Processing job %s: %s (%s)", job.job_id, job.recording_id, job.file_path)
 
-        # Check if this is an incremental/live transcription job
-        is_incremental = getattr(job, "_incremental", False)
-        offset = getattr(job, "_offset", 0)
-        is_final = getattr(job, "_final", False)
-        base_recording_id = getattr(job, "_base_recording_id", job.recording_id)
+        # Check if this is an incremental/live transcription job.
+        # Detect from recording_id pattern since ad-hoc attrs don't survive queue round-trip.
+        is_incremental = getattr(job, "_incremental", False) or "__inc_" in job.recording_id
+        is_final = getattr(job, "_final", False) or job.recording_id.endswith("__final")
+        if is_incremental and not getattr(job, "_offset", None):
+            # Parse offset from recording_id: base__inc_OFFSET or base__inc_OFFSET__final
+            parts = job.recording_id.split("__inc_")
+            offset = int(parts[1].replace("__final", "")) if len(parts) > 1 and parts[1].replace("__final", "").isdigit() else 0
+        else:
+            offset = getattr(job, "_offset", 0)
+        if is_incremental:
+            base_recording_id = job.recording_id.split("__inc_")[0]
+        else:
+            base_recording_id = getattr(job, "_base_recording_id", job.recording_id)
 
         # For incremental jobs, compute a time offset from byte offset
         start_seconds = None
@@ -169,7 +178,7 @@ class TranscriptionWorker:
         )
 
         # Step 5: Store (append for incremental, overwrite otherwise)
-        self.store.save(meta)
+        self.store.save(meta, append=is_incremental)
 
         # Step 6: Enrich (only for complete or final incremental jobs)
         if self.enrichment and not (is_incremental and not is_final):

@@ -69,3 +69,11 @@ local.properties
 
 # Temp test files
 test_q.json
+
+# One-off diagnostic/cleanup scripts
+scripts/check_*.py
+scripts/cleanup_*.py
+scripts/move_sidecars.py
+scripts/rebuild_index.py
+scripts/reset_stale_jobs.py
+scripts/test_genres.py

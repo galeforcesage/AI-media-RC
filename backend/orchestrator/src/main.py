@@ -94,13 +94,20 @@ def build_config(args: argparse.Namespace) -> Dict[str, Any]:
     """Build the orchestrator config dict from file + CLI overrides."""
     config: Dict[str, Any] = {}
 
-    if args.config:
-        config_path = Path(args.config)
-        if config_path.exists():
-            config = load_config(config_path)
-            logger.info("Loaded config from %s", config_path)
-        else:
-            logger.warning("Config file not found: %s — using defaults", config_path)
+    # Auto-discover config.json next to the project root if --config not given
+    config_path = Path(args.config) if args.config else None
+    if config_path is None:
+        for candidate in [Path(__file__).resolve().parent.parent / "config.json",
+                          Path.cwd() / "config.json"]:
+            if candidate.exists():
+                config_path = candidate
+                break
+
+    if config_path and config_path.exists():
+        config = load_config(config_path)
+        logger.info("Loaded config from %s", config_path)
+    elif args.config:
+        logger.warning("Config file not found: %s — using defaults", args.config)
 
     # CLI overrides
     if args.model_path:

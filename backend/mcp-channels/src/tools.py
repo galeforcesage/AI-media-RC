@@ -87,6 +87,7 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
         "image": airing.get("Image", ""),
         "cast": airing.get("Cast", []),
         "content_rating": airing.get("ContentRating", ""),
+        "watched": bool(rec.get("Watched") or rec.get("PlayedAt")),
         "path": rec.get("Path", ""),
     }
 
@@ -293,13 +294,34 @@ async def _get_recordings(client, args: Dict, bridge=None) -> Dict:
     return _ok(data=_enrich_channels_recordings(recordings[:limit]), message=f"{len(recordings)} recordings total, returning {min(limit, len(recordings))}")
 
 
+async def _list_genres(client, args: Dict, bridge=None) -> Dict:
+    """List all distinct genres across Channels DVR recordings."""
+    recordings = await client.get_recordings()
+    genre_counts = {}
+    for rec in recordings:
+        airing = rec.get("Airing") or {}
+        for g in (airing.get("Genres") or []):
+            g = g.strip()
+            if g:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+    sorted_genres = sorted(genre_counts.items(), key=lambda x: -x[1])
+    return _ok(data={"genres": [{"name": g, "count": c} for g, c in sorted_genres]},
+               message=f"{len(sorted_genres)} genres across {len(recordings)} recordings")
+
+
 async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
     """Search Channels DVR recordings with filters."""
     from datetime import datetime
     title = args.get("title", "")
+    episode_title = args.get("episode_title", "")
     channel = args.get("channel", "")
+    actor = args.get("actor", "")
+    genre = args.get("genre", "")
+    season = args.get("season")
+    episode = args.get("episode")
     start_date = args.get("start_date")
     end_date = args.get("end_date")
+    watched = args.get("watched")  # None=any, true=watched only, false=unwatched only
     limit = int(args.get("limit", 50))
 
     start_epoch = None
@@ -327,9 +349,36 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
             if title.lower() not in combined:
                 continue
 
+        if episode_title:
+            rec_ep_title = airing.get("EpisodeTitle", "")
+            if episode_title.lower() not in rec_ep_title.lower():
+                continue
+
         if channel:
             rec_ch = str(airing.get("Channel", ""))
             if channel.lower() not in rec_ch.lower():
+                continue
+
+        if actor:
+            rec_cast = airing.get("Cast") or []
+            cast_str = " ".join(rec_cast).lower()
+            if actor.lower() not in cast_str:
+                continue
+
+        if genre:
+            rec_genres = airing.get("Genres") or []
+            genres_str = " ".join(rec_genres).lower()
+            if genre.lower() not in genres_str:
+                continue
+
+        if season is not None:
+            rec_season = airing.get("SeasonNumber", 0)
+            if int(season) != int(rec_season):
+                continue
+
+        if episode is not None:
+            rec_episode = airing.get("EpisodeNumber", 0)
+            if int(episode) != int(rec_episode):
                 continue
 
         rec_time = airing.get("Time") or rec.get("CreatedAt") or 0
@@ -337,6 +386,11 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
             continue
         if end_epoch and int(rec_time) > end_epoch:
             continue
+
+        if watched is not None:
+            is_watched = bool(rec.get("Watched") or rec.get("PlayedAt"))
+            if bool(watched) != is_watched:
+                continue
 
         results.append(rec)
         if len(results) >= limit:
@@ -386,7 +440,15 @@ async def _get_scheduled_recordings(client, args: Dict, bridge=None) -> Dict:
 
 async def _get_channels(client, args: Dict, bridge=None) -> Dict:
     channels = await client.get_channels()
-    return _ok(data=channels, message=f"{len(channels)} channels")
+    slimmed = []
+    for ch in channels:
+        slimmed.append({
+            "number": ch.get("Number") or ch.get("GuideNumber", ""),
+            "name": ch.get("Name") or ch.get("GuideName", ""),
+            "network": ch.get("Station", ""),
+            "hd": ch.get("HD", False),
+        })
+    return _ok(data=slimmed, message=f"{len(slimmed)} channels")
 
 
 async def _search_epg(client, args: Dict, bridge=None) -> Dict:
@@ -409,6 +471,20 @@ async def _get_storage_status(client, args: Dict, bridge=None) -> Dict:
 
 async def _get_jobs(client, args: Dict, bridge=None) -> Dict:
     jobs = await client.get_jobs()
+    status_filter = args.get("status", "").lower()  # active, completed, failed, or empty=all
+    if status_filter:
+        filtered = []
+        for j in jobs:
+            is_failed = bool(j.get("Failed") or j.get("Dead"))
+            is_complete = bool(j.get("Completed"))
+            if status_filter == "active" and (is_failed or is_complete):
+                continue
+            elif status_filter == "failed" and not is_failed:
+                continue
+            elif status_filter == "completed" and not is_complete:
+                continue
+            filtered.append(j)
+        jobs = filtered
     return _ok(data=jobs, message=f"{len(jobs)} jobs")
 
 
@@ -418,6 +494,10 @@ async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
     from datetime import datetime, timedelta
     jobs = await client.get_jobs()
     now = time.time()
+
+    # Optional title/channel filters
+    title_filter = args.get("title", "").lower()
+    channel_filter = args.get("channel", "").lower()
 
     # Date filtering: support single date or start_date/end_date range
     start_date_str = args.get("start_date", "")
@@ -469,6 +549,7 @@ async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
             "duration_min": round(airing.get("Duration", 0) / 60),
             "original_date": airing.get("OriginalDate", ""),
             "description": airing.get("FullSummary") or airing.get("Summary", ""),
+            "image": airing.get("Image", ""),
             "genres": airing.get("Genres", []),
             "cast": airing.get("Cast", [])[:5],
             "content_rating": airing.get("ContentRating", ""),
@@ -486,6 +567,16 @@ async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
         start = airing.get("Time", j.get("Time", 0))
         if start < day_start or start >= day_end:
             continue
+        # Title filter
+        if title_filter:
+            j_title = (airing.get("Title", "") + " " + airing.get("EpisodeTitle", "")).lower()
+            if title_filter not in j_title:
+                continue
+        # Channel filter
+        if channel_filter:
+            j_channels = " ".join(j.get("Channels") or []).lower()
+            if channel_filter not in j_channels:
+                continue
         entry = _enrich(j)
         if j.get("Skipped"):
             skipped.append(entry)
@@ -499,7 +590,6 @@ async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
     if skipped:
         result["skipped"] = skipped
 
-    day_label = day.strftime("%Y-%m-%d")
     total = len(scheduled) + len(skipped)
     parts = [f"{len(scheduled)} scheduled"]
     if skipped:
@@ -778,15 +868,27 @@ TOOL_REGISTRY = {
         "safety": Safety.SAFE,
         "handler": _get_recordings,
     },
+    "channels_list_genres": {
+        "description": "List all distinct genres across Channels DVR recordings with counts.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": _list_genres,
+    },
     "channels_search_recordings": {
-        "description": "Search Channels DVR recordings with filters: title, channel, date range. Supports human-readable dates via start_date/end_date (YYYY-MM-DD).",
+        "description": "Search PAST recordings already saved on the DVR. USE THIS for 'what recorded yesterday/last week' or 'what has been recorded'. Supports title, episode_title, actor, genre, channel, season, episode, date range, and watched filters.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
+                "title": {"type": "string", "description": "Show name substring filter (case-insensitive). Use the SHOW NAME only."},
+                "episode_title": {"type": "string", "description": "Episode title/name substring filter (case-insensitive)."},
+                "actor": {"type": "string", "description": "Actor/cast member name substring filter (case-insensitive)."},
+                "genre": {"type": "string", "description": "Genre substring filter (e.g. 'drama', 'comedy', 'sci-fi'). Use channels_list_genres to see valid values."},
                 "channel": {"type": "string", "description": "Channel number filter"},
+                "season": {"type": "integer", "description": "Season number filter (e.g. 3 for S03)"},
+                "episode": {"type": "integer", "description": "Episode number filter (e.g. 14 for E14)"},
                 "start_date": {"type": "string", "description": "Minimum date (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD)"},
+                "watched": {"type": "boolean", "description": "Filter by watched status: true=watched only, false=unwatched only, omit=all"},
                 "limit": {"type": "integer", "description": "Max results (default 50)"},
             },
         },
@@ -822,17 +924,21 @@ TOOL_REGISTRY = {
         "handler": _get_storage_status,
     },
     "channels_get_jobs": {
-        "description": "Get all DVR jobs (recording, comskip, transcode).",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Get DVR jobs (recording, comskip, transcode). Use status filter to narrow results.",
+        "inputSchema": {"type": "object", "properties": {
+            "status": {"type": "string", "description": "Filter: 'active', 'completed', or 'failed'. Omit for all."},
+        }},
         "safety": Safety.SAFE,
         "handler": _get_jobs,
     },
     "channels_get_upcoming_recordings": {
-        "description": "List upcoming scheduled recordings (actual episodes about to record). USE THIS for 'what is recording today/tonight/this week'. Defaults to today if no date given.",
+        "description": "List FUTURE scheduled recordings (episodes about to record). USE THIS for 'what is recording today/tonight/this week' or 'what will record'. Do NOT use for past recordings.",
         "inputSchema": {"type": "object", "properties": {
             "date": {"type": "string", "description": "Single date YYYY-MM-DD. Defaults to today."},
             "start_date": {"type": "string", "description": "Range start YYYY-MM-DD (use with end_date for multi-day queries like 'this week')."},
             "end_date": {"type": "string", "description": "Range end YYYY-MM-DD (inclusive)."},
+            "title": {"type": "string", "description": "Title substring filter (case-insensitive)"},
+            "channel": {"type": "string", "description": "Channel filter"},
         }},
         "safety": Safety.SAFE,
         "handler": _get_upcoming_recordings,
