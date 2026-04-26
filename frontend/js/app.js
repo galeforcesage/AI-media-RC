@@ -550,6 +550,7 @@
       // Convert thinking indicator into a persistent status log
       if (statusLog.length > 0) {
         thinking.className = 'message status-log';
+        thinking.style.display = '';
         thinking.innerHTML = statusLog.map(s => `<div class="status-step">${esc(s)}</div>`).join('');
       } else {
         thinking.remove();

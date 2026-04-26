@@ -487,9 +487,15 @@ class AgentLoop:
         Returns a list of {"type": "function", "function": {...}} dicts
         ready to pass as the ``tools`` parameter to Ollama /api/chat.
         Only includes essential query/info tools to fit in context window.
+        Filters by temporal intent to reduce confusion for smaller models.
         """
         all_systems = {"sagetv", "channelsdvr"}
         active = set(systems) if systems else all_systems
+
+        # Temporal-based tool filtering — hide wrong-direction tools
+        temporal = getattr(self, "_temporal", "")
+        _HIDE_FOR_FUTURE = {"search_recordings", "get_recordings", "get_recent_recordings"}
+        _HIDE_FOR_PAST = {"get_upcoming_recordings", "get_scheduled_recordings", "search_epg"}
 
         tools: List[Dict[str, Any]] = []
 
@@ -505,8 +511,15 @@ class AgentLoop:
             try:
                 mcp_tools = await client.list_tools()
                 for t in mcp_tools:
-                    if t["name"] in self._ESSENTIAL_TOOLS:
-                        tools.append(self._mcp_to_openai_tool(t))
+                    if t["name"] not in self._ESSENTIAL_TOOLS:
+                        continue
+                    # Filter out wrong-direction tools based on temporal intent
+                    suffix = t["name"].split("_", 1)[1] if "_" in t["name"] else ""
+                    if temporal == "future" and suffix in _HIDE_FOR_FUTURE:
+                        continue
+                    if temporal == "past" and suffix in _HIDE_FOR_PAST:
+                        continue
+                    tools.append(self._mcp_to_openai_tool(t))
                 logger.info("Discovered %d OpenAI-format tools from %s (of %d total)",
                             sum(1 for t in mcp_tools if t["name"] in self._ESSENTIAL_TOOLS),
                             label, len(mcp_tools))
@@ -620,7 +633,13 @@ class AgentLoop:
         import datetime
         now = datetime.datetime.now().astimezone()
         today = now.strftime("%A, %B %d, %Y")
+        today_iso = now.strftime("%Y-%m-%d")
         current_time = now.strftime("%I:%M %p %Z")
+        yesterday = (now - datetime.timedelta(days=1))
+        yesterday_str = yesterday.strftime("%A, %B %d, %Y")
+        yesterday_iso = yesterday.strftime("%Y-%m-%d")
+        week_ago = (now - datetime.timedelta(days=7))
+        week_ago_iso = week_ago.strftime("%Y-%m-%d")
         channels_path_line = await self._discover_system_paths()
 
         # Determine which DVR systems are active
@@ -645,9 +664,38 @@ class AgentLoop:
         if has_channels:
             search_tools.append("channels_search_recordings")
 
+        # Pre-computed date reference block so the LLM doesn't do date math
+        _DAY_NAMES = {0: "Monday", 1: "Tuesday", 2: "Wednesday",
+                       3: "Thursday", 4: "Friday", 5: "Saturday", 6: "Sunday"}
+        current_dow = now.weekday()
+        # Build "last <day>" and "next <day>" references for all 7 days
+        day_lines = []
+        for dow, name in _DAY_NAMES.items():
+            # Last occurrence (past)
+            days_back = (current_dow - dow) % 7
+            if days_back == 0:
+                days_back = 7
+            last_date = (now - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+            # Next occurrence (future, including today if same day)
+            days_fwd = (dow - current_dow) % 7
+            if days_fwd == 0:
+                days_fwd = 7
+            next_date = (now + datetime.timedelta(days=days_fwd)).strftime("%Y-%m-%d")
+            day_lines.append(f"- Last {name}: {last_date}  |  Next {name}: {next_date}")
+        day_ref = "\n".join(day_lines)
+
+        date_block = (
+            f"DATE REFERENCE (use these exact dates — do NOT calculate your own):\n"
+            f"- Today: {today} = {today_iso}\n"
+            f"- Yesterday: {yesterday_str} = {yesterday_iso}\n"
+            f"- Last 7 days: {week_ago_iso} to {today_iso}\n"
+            f"{day_ref}\n"
+        )
+
         return (
             f"You are an AI media assistant. Today: {today}, {current_time}.\n"
             f"{scope_line}\n\n"
+            f"{date_block}\n"
 
             "MANDATORY TOOL USE:\n"
             "- You MUST call a tool to answer any question about recordings, schedules, playback, or system status.\n"
@@ -685,6 +733,8 @@ class AgentLoop:
             "- Never delete DVR files via linux_ tools. Use the DVR's delete tool.\n"
             "- Destructive tools require user confirmation first.\n"
             "- On tool error, tell the user briefly. Do NOT retry.\n"
+            "- NEVER claim a transcript exists or is available unless you received transcript data from a transcript_ tool or from the pre-searched transcript excerpts in the context. "
+            "If the user asks about transcripts and you have no transcript data, say 'No transcripts are available for these recordings.'\n"
             "- Final answers: plain language, concise. No JSON, no tool names, no code blocks, no IDs.\n"
             "- Never include server file paths or directory paths in answers.\n"
             "- Never describe your reasoning steps. Just give the answer.\n\n"
@@ -694,7 +744,10 @@ class AgentLoop:
             "- ALWAYS include the episode title from the tool result and wrap it in double quotes.\n"
             "- Format: \"ShowName\" \"EpisodeTitle\" S##E## — every line MUST have all three parts.\n"
             "- Example: \"NCIS\" \"Toil and Trouble\" S23E19\n"
-            "- If the recording has watched=true, append ✓ (watched). Example: \"NCIS\" \"Toil and Trouble\" S23E19 ✓\n"
+            "- If the recording has watched=true, append ✓. Example: \"NCIS\" \"Toil and Trouble\" S23E19 ✓\n"
+            "- You MUST list EVERY recording from the tool results. Do NOT skip any.\n"
+            "- Include episode_title exactly as returned by the tool.\n"
+            "- Before listing, repeat the summary from the tool message field.\n"
             "- Do NOT omit episode titles. Do NOT skip them. The user needs them.\n"
             "- Do NOT include descriptions, air times, or channel numbers unless asked.\n\n"
 
@@ -755,6 +808,7 @@ class AgentLoop:
 
         # Store active systems and temporal intent for tool-call guardrails
         self._active_systems = set(systems) if systems else {"sagetv", "channelsdvr"}
+        self._empty_retries = 0  # track consecutive empty LLM responses
         self._temporal = temporal or ""
 
         # Discover OpenAI-format tool schemas for native tool calling
@@ -763,7 +817,10 @@ class AgentLoop:
 
         # Build user message with pre-fetched context
         context_parts = []
-        if semantic_context:
+        # Skip semantic context for date-specific queries — the 7B model
+        # confuses "relevant recordings from index" with actual query results
+        # and filters by those titles instead of searching broadly.
+        if semantic_context and temporal not in ("past",):
             context_parts.append(
                 "Background context from media library (may not match the query date — "
                 "always use tools to answer date-specific questions):\n"
@@ -806,15 +863,31 @@ class AgentLoop:
             _buffer_len = 0
             _BUFFER_THRESHOLD = 20
 
+            _think_active = False
+
             async def _on_token(token: str):
-                nonlocal _forwarding, _tool_detected, _buffer, _buffer_len
+                nonlocal _forwarding, _tool_detected, _buffer, _buffer_len, _think_active
                 if _tool_detected:
                     return
                 _buffer.append(token)
                 _buffer_len += len(token)
+                buf_text = "".join(_buffer)
+                # Suppress <think>...</think> blocks (qwen3 thinking mode)
+                if not _think_active and "<think>" in buf_text:
+                    _think_active = True
+                if _think_active:
+                    if "</think>" in buf_text:
+                        _think_active = False
+                        # Discard the thinking block, keep anything after </think>
+                        after = buf_text.split("</think>", 1)[1].lstrip()
+                        _buffer.clear()
+                        _buffer_len = 0
+                        if after:
+                            _buffer.append(after)
+                            _buffer_len = len(after)
+                    return
                 # With native tool calling, the model shouldn't output
                 # <tool_call> tags, but check anyway for safety
-                buf_text = "".join(_buffer)
                 if re.search(r"<(?:tool|channel|function|api)_call>", buf_text) or "<tool" in buf_text:
                     _tool_detected = True
                     _forwarding = False
@@ -846,11 +919,24 @@ class AgentLoop:
             response_text = llm_result.get("response", "")
             native_tool_calls = llm_result.get("tool_calls", [])
 
+            # ── Retry on completely empty LLM response (no text, no tools) ──
+            # qwen3 with think=false sometimes produces nothing at all.
+            if not response_text and not native_tool_calls:
+                _empty_retries = getattr(self, "_empty_retries", 0) + 1
+                self._empty_retries = _empty_retries
+                if _empty_retries <= 2:
+                    logger.warning(
+                        "Empty LLM response (iter %d, retry %d) — retrying same messages",
+                        iteration + 1, _empty_retries,
+                    )
+                    continue  # retry same iteration without appending to messages
+
             logger.info(
                 "LLM response (iter %d, %d chars, %d native tool_calls): %s",
                 iteration + 1, len(response_text),
                 len(native_tool_calls), response_text[:200],
             )
+            self._empty_retries = 0  # reset on non-empty response
 
             # ── Determine tool calls: prefer native, fall back to text parsing ──
             tool_calls: List[Dict[str, Any]] = []
@@ -869,6 +955,37 @@ class AgentLoop:
                 tool_calls = self._parse_tool_calls(response_text)
                 if tool_calls:
                     logger.info("Fell back to text-parsed tool calls: %d", len(tool_calls))
+
+            # ── Dual-DVR guardrail ──
+            # When both systems are active and the LLM only called one
+            # *_search_recordings or *_get_upcoming_recordings, auto-inject
+            # the mirror call for the other DVR so results are never one-sided.
+            active = getattr(self, "_active_systems", set())
+            if len(active) >= 2 and tool_calls:
+                _MIRROR_SUFFIXES = {"search_recordings", "get_upcoming_recordings"}
+                called_tools = {tc["tool"] for tc in tool_calls}
+                for suffix in _MIRROR_SUFFIXES:
+                    sage_tool = f"sagetv_{suffix}"
+                    chan_tool = f"channels_{suffix}"
+                    if sage_tool in called_tools and chan_tool not in called_tools:
+                        # Copy args from the SageTV call
+                        src = next(tc for tc in tool_calls if tc["tool"] == sage_tool)
+                        tool_calls.append({"tool": chan_tool, "args": dict(src["args"])})
+                        # Also inject into native_tool_calls so the role:tool
+                        # message count stays consistent
+                        if native_tool_calls:
+                            native_tool_calls.append({
+                                "function": {"name": chan_tool, "arguments": dict(src["args"])},
+                            })
+                        logger.info("Dual-DVR guardrail: auto-injected %s", chan_tool)
+                    elif chan_tool in called_tools and sage_tool not in called_tools:
+                        src = next(tc for tc in tool_calls if tc["tool"] == chan_tool)
+                        tool_calls.append({"tool": sage_tool, "args": dict(src["args"])})
+                        if native_tool_calls:
+                            native_tool_calls.append({
+                                "function": {"name": sage_tool, "arguments": dict(src["args"])},
+                            })
+                        logger.info("Dual-DVR guardrail: auto-injected %s", sage_tool)
 
             if not tool_calls:
                 # No tool calls detected in any format
@@ -938,7 +1055,7 @@ class AgentLoop:
                 result = await self._execute_tool(tool_name, tool_args)
                 result_slim = _slim_for_llm(result)
                 result_str = json.dumps(result_slim, default=str)
-                logger.debug("Slimmed result for %s (%d chars): %.800s", tool_name, len(result_str), result_str)
+                logger.info("Slimmed result for %s (%d chars): %.2000s", tool_name, len(result_str), result_str)
 
                 # Send result-size status
                 if status_callback:
@@ -958,9 +1075,11 @@ class AgentLoop:
 
                 # Build role:tool message for native format
                 if native_tool_calls and idx < len(native_tool_calls):
+                    # Prefix with tool name so the LLM knows which source returned each result
+                    labeled_result = f"[{tool_name}] {result_str}"
                     tool_messages.append({
                         "role": "tool",
-                        "content": result_str,
+                        "content": labeled_result,
                     })
                 else:
                     tool_results.append(f"Tool: {tool_name}\nResult: {result_str}")

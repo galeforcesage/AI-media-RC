@@ -73,7 +73,7 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
     episode = airing.get("EpisodeNumber")
     se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
 
-    return {
+    enriched = {
         "id": rec.get("ID", ""),
         "title": airing.get("Title", ""),
         "episode_title": airing.get("EpisodeTitle", ""),
@@ -90,6 +90,11 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
         "watched": bool(rec.get("Watched") or rec.get("PlayedAt")),
         "path": rec.get("Path", ""),
     }
+    if rec.get("Deleted"):
+        enriched["status"] = "watched_and_removed"
+    else:
+        enriched["status"] = "available"
+    return enriched
 
 
 def _enrich_channels_recordings(data: Any) -> Any:
@@ -324,6 +329,18 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
     watched = args.get("watched")  # None=any, true=watched only, false=unwatched only
     limit = int(args.get("limit", 50))
 
+    # ── Sanitize LLM-provided args ──
+    # The 7B model often sends empty strings, zeros, and false as "defaults"
+    # when it means "no filter".  Normalize them all to None/empty.
+    if season is not None and (season == "" or int(season) == 0):
+        season = None
+    if episode is not None and (episode == "" or int(episode) == 0):
+        episode = None
+    # watched=false is sent by the LLM as a default — treat as "any"
+    # Only filter on watched when explicitly True (watched-only).
+    if watched is False:
+        watched = None
+
     start_epoch = None
     end_epoch = None
     if start_date:
@@ -337,7 +354,10 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
         except ValueError:
             return _fail("invalid_date", f"Invalid end_date: {end_date}. Use YYYY-MM-DD.")
 
-    recordings = await client.get_recordings()
+    # When searching by date, include deleted (trashed) recordings so the
+    # LLM can report what was recorded vs what's still available.
+    include_deleted = bool(start_epoch or end_epoch)
+    recordings = await client.get_recordings(include_deleted=include_deleted)
     results = []
     for rec in recordings:
         airing = rec.get("Airing") or {}
@@ -396,7 +416,8 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
         if len(results) >= limit:
             break
 
-    response = {"results": _enrich_channels_recordings(results)}
+    enriched = _enrich_channels_recordings(results)
+    response = {"results": enriched}
 
     # When searching by date, also include failed recordings from that period
     if start_epoch or end_epoch:
@@ -427,9 +448,19 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
         if failed:
             response["failed_recordings"] = failed
 
-    msg = f"Found {len(results)} matching recordings"
+    n_avail = sum(1 for r in enriched if r.get("status") == "available")
+    n_removed = sum(1 for r in enriched if r.get("status") == "watched_and_removed")
+    total = len(enriched)
+    # Build a summary message that the 7B LLM will reliably read.
+    lines = []
+    if n_removed:
+        lines.append(f"{total} shows were recorded. {n_avail} are still on the DVR. "
+                      f"{n_removed} were already watched and are no longer on the DVR")
+    else:
+        lines.append(f"Found {total} recording(s), all on the DVR")
     if response.get("failed_recordings"):
-        msg += f" and {len(response['failed_recordings'])} failed"
+        lines.append(f"{len(response['failed_recordings'])} failed recordings")
+    msg = ". ".join(lines)
     return _ok(data=response, message=msg)
 
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=AI-media-RC Services (watchdog-managed)
+After=network-online.target ollama.service docker.service
+Wants=network-online.target ollama.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=sagetv
+Group=sagetv
+WorkingDirectory=/home/sagetv/AI-media-RC
+ExecStart=/bin/bash /home/sagetv/AI-media-RC/scripts/watchdog.sh all
+ExecStop=/bin/bash /home/sagetv/AI-media-RC/scripts/watchdog.sh stop
+# Give Ollama a moment to be fully ready before starting services
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=multi-user.target

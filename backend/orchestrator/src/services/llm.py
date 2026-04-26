@@ -122,6 +122,8 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            if "qwen3" in self.model:
+                payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -177,6 +179,8 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            if "qwen3" in self.model:
+                payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -239,6 +243,14 @@ class LLMService:
             }
             if tools:
                 payload["tools"] = tools
+            # Disable qwen3 thinking mode — it wastes the token budget
+            # on <think> reasoning and produces empty responses with many tools
+            if "qwen3" in self.model:
+                payload["think"] = False
+            # Log payload size for debugging context overflow
+            payload_json = json.dumps(payload)
+            logger.info("stream_chat payload size: %d chars (~%d tokens est.)",
+                        len(payload_json), len(payload_json) // 4)
             accumulated = []
             accumulated_tool_calls = []
             timeout = aiohttp.ClientTimeout(total=600)
@@ -251,6 +263,7 @@ class LLMService:
                         body = await resp.text()
                         logger.error("Ollama stream_chat error %d: %s", resp.status, body[:200])
                         return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
+                    chunk_count = 0
                     async for line in resp.content:
                         if not line:
                             continue
@@ -258,7 +271,13 @@ class LLMService:
                             chunk = json.loads(line)
                         except json.JSONDecodeError:
                             continue
+                        chunk_count += 1
                         msg = chunk.get("message", {})
+                        # Log first chunk and any chunk with unexpected fields
+                        if chunk_count == 1 or (not msg.get("content") and not msg.get("tool_calls") and not chunk.get("done")):
+                            logger.info("Ollama chunk #%d keys: %s, msg keys: %s, content repr: %s",
+                                        chunk_count, list(chunk.keys()), list(msg.keys()),
+                                        repr(msg.get("content", ""))[:200])
                         # Native tool calls
                         tc = msg.get("tool_calls")
                         if tc:
@@ -268,11 +287,32 @@ class LLMService:
                             accumulated.append(token)
                             if token_callback:
                                 await token_callback(token)
+                        # Capture thinking content if present (qwen3 may think even with think=false)
+                        thinking = msg.get("thinking", "")
+                        if thinking:
+                            logger.warning("Ollama returned thinking content (%d chars): %s",
+                                           len(thinking), thinking[:100])
                         if chunk.get("done"):
+                            # Log full message when response appears empty
+                            if not accumulated and not accumulated_tool_calls:
+                                logger.warning(
+                                    "Ollama done with empty result — full message: %s",
+                                    json.dumps(msg)[:500],
+                                )
+                            logger.info(
+                                "Ollama stream done after %d chunks, eval_count=%s, prompt_eval_count=%s, msg_role=%s",
+                                chunk_count,
+                                chunk.get("eval_count", "?"),
+                                chunk.get("prompt_eval_count", "?"),
+                                msg.get("role", "?"),
+                            )
                             break
 
             response_text = "".join(accumulated).strip()
-
+            # Strip qwen3 thinking tags from response
+            if "<think>" in response_text:
+                import re as _re
+                response_text = _re.sub(r"<think>.*?</think>\s*", "", response_text, flags=_re.DOTALL).strip()
             if accumulated_tool_calls:
                 logger.info(
                     "LLM stream_chat returned %d native tool_calls",

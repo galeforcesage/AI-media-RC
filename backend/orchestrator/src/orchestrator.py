@@ -344,98 +344,121 @@ class Orchestrator:
     # High-level orchestration methods
     # ------------------------------------------------------------------
 
-    # Patterns for relative date expressions → (day_offset, label)
-    _DATE_PATTERNS: list[tuple[re.Pattern, int]] = [
-        (re.compile(r"\byesterday\b", re.IGNORECASE), -1),
-        (re.compile(r"\blast\s+night\b", re.IGNORECASE), -1),
-        (re.compile(r"\btoday\b", re.IGNORECASE), 0),
-        (re.compile(r"\btonight\b", re.IGNORECASE), 0),
-        (re.compile(r"\btomorrow\b", re.IGNORECASE), 1),
-    ]
-
-    # Day-of-week names for "last <day>" / "this <day>" resolution
-    _DAY_NAMES = {
-        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-        "friday": 4, "saturday": 5, "sunday": 6,
-    }
-    _LAST_DAY_RE = re.compile(
-        r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        re.IGNORECASE,
+    # Week-range patterns handled deterministically (dateparser returns
+    # single dates for these, but MCP tools need start..end ranges).
+    _WEEK_RANGE_RE = re.compile(
+        r"\b(last|past|this\s+past|previous)\s+week\b", re.IGNORECASE
     )
-    _THIS_DAY_RE = re.compile(
-        r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        re.IGNORECASE,
-    )
+    _THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
+    _NEXT_WEEK_RE = re.compile(r"\bnext\s+week\b", re.IGNORECASE)
     _LAST_N_DAYS_RE = re.compile(
-        r"\b(?:last|past)\s+(\d+)\s+days?\b",
-        re.IGNORECASE,
+        r"\b(?:last|past)\s+(\d+)\s+days?\b", re.IGNORECASE
     )
-    _LAST_WEEK_RE = re.compile(
-        r"\b(?:last|past|this past)\s+week\b",
-        re.IGNORECASE,
-    )
-    _THIS_WEEK_RE = re.compile(
-        r"\bthis\s+week\b",
-        re.IGNORECASE,
+
+    # dateparser settings — base config shared by all parses.
+    _DP_BASE = {
+        "RETURN_AS_TIMEZONE_AWARE": False,
+        "DATE_ORDER": "MDY",                 # US-style for numeric dates
+    }
+
+    def _week_bounds(self, ref: datetime, offset_weeks: int) -> tuple[str, str]:
+        """Return (start, end) YYYY-MM-DD for a Mon-Sun week relative to ref."""
+        mon = ref - timedelta(days=ref.weekday())  # this Monday
+        mon += timedelta(weeks=offset_weeks)
+        sun = mon + timedelta(days=6)
+        return mon.strftime("%Y-%m-%d"), sun.strftime("%Y-%m-%d")
+
+    # Phrases that signal the user is looking backward in time.
+    _PAST_HINT_RE = re.compile(
+        r"\b(?:last|past|previous|ago|yesterday|recorded|was)\b", re.IGNORECASE
     )
 
     def _resolve_dates(self, prompt: str) -> str:
-        """Replace relative date words with concrete YYYY-MM-DD dates."""
+        """Replace relative date expressions with concrete YYYY-MM-DD dates.
+
+        Uses the ``dateparser`` library for broad NL coverage (yesterday,
+        last Monday, next Friday, April 25th, 04/25/26, 2 days ago, …).
+        Week-range phrases are handled deterministically because MCP tools
+        need start..end pairs.
+        """
+        from dateparser.search import search_dates
+
         now = datetime.now()
-        for pattern, offset in self._DATE_PATTERNS:
-            match = pattern.search(prompt)
-            if match:
-                date_str = (now + timedelta(days=offset)).strftime("%Y-%m-%d")
-                original = match.group(0)
-                prompt = pattern.sub(f"{original} ({date_str})", prompt, count=1)
 
-        # "last <day>" — most recent past occurrence of that weekday
-        m = self._LAST_DAY_RE.search(prompt)
-        if m:
-            target_dow = self._DAY_NAMES[m.group(1).lower()]
-            current_dow = now.weekday()
-            days_back = (current_dow - target_dow) % 7
-            if days_back == 0:
-                days_back = 7  # "last Friday" on a Friday means 7 days ago
-            date_str = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
-            prompt = self._LAST_DAY_RE.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
-
-        # "this <day>" — this week's occurrence (past or future)
-        m = self._THIS_DAY_RE.search(prompt)
-        if m:
-            target_dow = self._DAY_NAMES[m.group(1).lower()]
-            current_dow = now.weekday()
-            delta = target_dow - current_dow
-            date_str = (now + timedelta(days=delta)).strftime("%Y-%m-%d")
-            prompt = self._THIS_DAY_RE.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
-
-        # "last N days" / "past N days"
+        # ── 1) Deterministic week ranges ─────────────────────────
         m = self._LAST_N_DAYS_RE.search(prompt)
         if m:
             n = int(m.group(1))
-            start_str = (now - timedelta(days=n)).strftime("%Y-%m-%d")
-            end_str = now.strftime("%Y-%m-%d")
+            s = (now - timedelta(days=n)).strftime("%Y-%m-%d")
+            e = now.strftime("%Y-%m-%d")
             prompt = self._LAST_N_DAYS_RE.sub(
-                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt  # range phrases are exclusive — skip NL parse
 
-        # "last week" / "past week"
-        m = self._LAST_WEEK_RE.search(prompt)
+        m = self._WEEK_RANGE_RE.search(prompt)
         if m:
-            start_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-            end_str = now.strftime("%Y-%m-%d")
-            prompt = self._LAST_WEEK_RE.sub(
-                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+            s, e = self._week_bounds(now, -1)
+            prompt = self._WEEK_RANGE_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
 
-        # "this week" — Sunday through Saturday of the current week
         m = self._THIS_WEEK_RE.search(prompt)
         if m:
-            days_since_sun = (now.weekday() + 1) % 7  # Mon=0..Sun=6 → Sun=0
-            week_start = now - timedelta(days=days_since_sun)
-            week_end = week_start + timedelta(days=6)
-            start_str = week_start.strftime("%Y-%m-%d")
-            end_str = week_end.strftime("%Y-%m-%d")
+            s, e = self._week_bounds(now, 0)
             prompt = self._THIS_WEEK_RE.sub(
-                f"{m.group(0)} ({start_str} to {end_str})", prompt, count=1)
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
+        m = self._NEXT_WEEK_RE.search(prompt)
+        if m:
+            s, e = self._week_bounds(now, 1)
+            prompt = self._NEXT_WEEK_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
+        # ── 2) General NL date parsing via dateparser ────────────
+        # Choose direction based on whether the prompt looks backward.
+        prefer = "past" if self._PAST_HINT_RE.search(prompt) else "future"
+        settings = {**self._DP_BASE, "PREFER_DATES_FROM": prefer}
+
+        try:
+            results = search_dates(
+                prompt,
+                settings=settings,
+                languages=["en"],
+            )
+        except Exception:
+            results = None
+
+        if not results:
+            # Fallback: "tonight" → today's date (dateparser may skip it)
+            tonight_re = re.compile(r"\btonight\b", re.IGNORECASE)
+            m = tonight_re.search(prompt)
+            if m:
+                date_str = now.strftime("%Y-%m-%d")
+                prompt = tonight_re.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
+            return prompt
+
+        # Annotate every found expression with (YYYY-MM-DD), working
+        # right-to-left so string offsets stay valid.
+        already_annotated = set()
+        for text_found, dt_found in reversed(results):
+            if text_found in already_annotated:
+                continue
+            # Skip if dateparser returned a nonsensical match (single digit, etc.)
+            if len(text_found.strip()) < 3:
+                continue
+            date_str = dt_found.strftime("%Y-%m-%d")
+            # Only annotate first occurrence
+            idx = prompt.rfind(text_found)
+            if idx == -1:
+                continue
+            end = idx + len(text_found)
+            # Don't double-annotate if already has (YYYY-
+            if end < len(prompt) and prompt[end:end + 2] == " (":
+                continue
+            prompt = prompt[:end] + f" ({date_str})" + prompt[end:]
+            already_annotated.add(text_found)
 
         return prompt
 

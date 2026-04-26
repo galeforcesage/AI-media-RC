@@ -92,7 +92,9 @@ class ChannelsDVRClient:
     async def dvr_info(self) -> Dict:
         return await self.get("/dvr")
 
-    async def get_recordings(self) -> List[Dict]:
+    async def get_recordings(self, include_deleted: bool = False) -> List[Dict]:
+        if include_deleted:
+            return await self.get("/dvr/files", params={"all": "true"})
         return await self.get("/dvr/files")
 
     async def get_recording(self, file_id: str) -> Dict:

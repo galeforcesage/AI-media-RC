@@ -129,7 +129,7 @@ def _slim_recording(mf: Dict) -> Dict:
         if rest:
             ep_title = rest
 
-    return {
+    result = {
         "id": str(mf.get("MediaFileID", "")),
         "title": title,
         "episode_title": ep_title,
@@ -144,6 +144,15 @@ def _slim_recording(mf: Dict) -> Dict:
         "content_rating": show.get("ShowParentalRating", ""),
         "watched": bool(airing.get("IsWatched", False)),
     }
+    # Status: SageTV files are always on disk (no trash concept).
+    # Distinguish between in-progress, archived (protected), and available.
+    if not mf.get("IsCompleteRecording", True):
+        result["status"] = "recording"
+    elif mf.get("IsLibraryFile", False):
+        result["status"] = "archived"
+    else:
+        result["status"] = "available"
+    return result
 
 
 def _slim_recordings(data: Any) -> Any:
@@ -871,6 +880,17 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     recording_state = args.get("recording_state")
     limit = int(args.get("limit", 50))
 
+    # ── Sanitize LLM-provided args ──
+    # The 7B model often sends empty strings, zeros, and false as "defaults"
+    # when it means "no filter".  Normalize them all to None/empty.
+    if season is not None and (season == "" or int(season) == 0):
+        season = None
+    if episode is not None and (episode == "" or int(episode) == 0):
+        episode = None
+    # watched=false is sent by the LLM as a default — treat as "any"
+    if watched is False:
+        watched = None
+
     data = await client.call("GetMediaFiles", ["T"])
     if not data or not isinstance(data, list):
         return _ok(data=[], message="No recordings found")
@@ -952,7 +972,17 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
         if len(results) >= limit:
             break
 
-    return _ok(data=_slim_recordings(results), message=f"Found {len(results)} matching recordings")
+    slimmed = _slim_recordings(results)
+    n_avail = sum(1 for r in slimmed if r.get("status") == "available")
+    n_arch = sum(1 for r in slimmed if r.get("status") == "archived")
+    n_rec = sum(1 for r in slimmed if r.get("status") == "recording")
+    parts = [f"{n_avail} available"]
+    if n_arch:
+        parts.append(f"{n_arch} archived")
+    if n_rec:
+        parts.append(f"{n_rec} currently recording")
+    msg = f"Found {len(results)} recording(s): " + ", ".join(parts)
+    return _ok(data=slimmed, message=msg)
 
 
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:

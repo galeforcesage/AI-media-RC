@@ -40,6 +40,10 @@ class AudioExtractor:
         If start_seconds is given, extract only from that point onward
         (used for incremental/live transcription).
         """
+        # Pre-check: bail early if the source file no longer exists
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Source file not found: {video_path}")
+
         suffix = ""
         if start_seconds is not None and start_seconds > 0:
             suffix = f"_from{int(start_seconds)}"
@@ -73,7 +77,15 @@ class AudioExtractor:
         _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            err = stderr.decode(errors="replace")[-500:]
+            err_text = stderr.decode(errors="replace")
+            # Extract the actual error line(s) — skip ffmpeg's version banner
+            err_lines = [l for l in err_text.splitlines()
+                         if l.strip() and not l.startswith("  ")
+                         and "ffmpeg version" not in l
+                         and "lib" not in l[:6]
+                         and "configuration:" not in l
+                         and "built with" not in l]
+            err = "\n".join(err_lines[-5:]) if err_lines else err_text[-300:]
             raise RuntimeError(f"ffmpeg extraction failed (rc={proc.returncode}): {err}")
 
         logger.info("Audio extracted: %s (%.1f MB)", output_path,
