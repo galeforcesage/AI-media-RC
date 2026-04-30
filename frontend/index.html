@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=3.4.0">
 </head>
 <body>
   <!-- Region 1: Header -->
@@ -83,7 +83,7 @@
           </button>
           <div class="volume-control">
             <button id="btn-mute" class="transport-btn small" title="Mute" aria-label="Mute">
-              <span class="icon" id="mute-icon">🔊</span>
+              <span class="icon" id="mute-icon">ðŸ”Š</span>
             </button>
             <input type="range" id="volume-slider" min="0" max="100" value="75" aria-label="Volume">
           </div>
@@ -117,10 +117,10 @@
             <button id="btn-toggle-cc-sage" class="dpad-btn small" title="Closed Captions" aria-label="Toggle CC">CC</button>
           </div>
           <div class="dpad-nav-row">
-            <button id="btn-open-home" class="nav-btn" title="Home" aria-label="Home">🏠</button>
-            <button id="btn-open-guide" class="nav-btn" title="Guide" aria-label="Program Guide">📺</button>
+            <button id="btn-open-home" class="nav-btn" title="Home" aria-label="Home">ðŸ </button>
+            <button id="btn-open-guide" class="nav-btn" title="Guide" aria-label="Program Guide">ðŸ“º</button>
             <button id="btn-open-recordings" class="nav-btn" title="Recordings" aria-label="Recordings">⏺</button>
-            <button id="btn-open-live-tv" class="nav-btn" title="Live TV" aria-label="Live TV">📡</button>
+            <button id="btn-open-live-tv" class="nav-btn" title="Live TV" aria-label="Live TV">ðŸ“¡</button>
           </div>
           <div class="dpad-ch-row">
             <button id="btn-ch-up-sage" class="dpad-btn small" title="Channel Up" aria-label="Channel Up">CH ▲</button>
@@ -207,7 +207,7 @@
       <div id="tab-services" class="tab-panel">
         <div class="services-header">
           <span class="services-title">AI Media RC Services</span>
-          <button id="btn-refresh-services" class="btn-tiny" title="Refresh">↻</button>
+          <button id="btn-refresh-services" class="btn-tiny" title="Refresh">â†»</button>
         </div>
         <div id="service-grid" class="service-grid"></div>
         <div class="services-header" style="margin-top:0.75rem">
@@ -307,17 +307,18 @@
       <p>Loading...</p>
     </div>
     <div class="transcript-actions" id="transcript-actions" hidden>
-      <button type="button" id="transcript-edit" class="btn-small">✏️ Edit</button>
-      <button type="button" id="transcript-save" class="btn-small" hidden>💾 Save</button>
+      <button type="button" id="transcript-edit" class="btn-small">âœï¸ Edit</button>
+      <button type="button" id="transcript-save" class="btn-small" hidden>ðŸ’¾ Save</button>
       <button type="button" id="transcript-cancel-edit" class="btn-small" hidden>Cancel</button>
     </div>
   </dialog>
 
-  <script src="js/api.js"></script>
-  <script src="js/state.js"></script>
-  <script src="js/ui.js"></script>
-  <script src="js/voice.js"></script>
-  <script src="js/app.js"></script>
+  <script src="js/api.js?v=3.4.0"></script>
+  <script src="js/state.js?v=3.4.0"></script>
+  <script src="js/ui.js?v=3.4.0"></script>
+  <script src="js/pcm16-streamer.js?v=3.4.0"></script>
+  <script src="js/voice.js?v=3.4.0"></script>
+  <script src="js/app.js?v=3.4.0"></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function(err) {

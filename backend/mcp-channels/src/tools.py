@@ -576,6 +576,7 @@ async def _get_upcoming_recordings(client, args: Dict, bridge=None) -> Dict:
             "season": airing.get("SeasonNumber"),
             "episode": airing.get("EpisodeNumber"),
             "channel": (j.get("Channels") or [""])[0],
+            "air_date": dt.strftime("%a %b %-d"),
             "start_time": dt.strftime("%Y-%m-%d %I:%M %p"),
             "duration_min": round(airing.get("Duration", 0) / 60),
             "original_date": airing.get("OriginalDate", ""),

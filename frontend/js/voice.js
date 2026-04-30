@@ -1,101 +1,154 @@
 /**
- * voice.js — Voice input via Web Speech API or MediaRecorder fallback.
+ * voice.js — Voice input via server-side Whisper STT over WebSocket.
+ *
+ * Captures microphone audio as 16kHz mono PCM16-LE using PCM16Streamer,
+ * streams it to /ws/stt, and renders committed + hypothesis text in the
+ * input box.  No word stacking — partials replace, finals append.
  */
 const Voice = (() => {
-  let recognition = null;
+  let onResult = null;       // callback(finalText)
   let recording = false;
-  let onResult = null;
+  let ws = null;
+  let streamer = null;
   let silenceTimer = null;
-  let pendingTranscript = '';
-  let finalTranscript = '';   // accumulated final text across onresult events
-  const SILENCE_DELAY = 2000; // ms to wait after last speech before submitting
 
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // Committed/hypothesis state
+  let committedText = '';    // finalized text (only grows via "final" messages)
+  let hypothesisText = '';   // latest partial (replaced, never appended)
+
+  const SILENCE_DELAY = 3000;  // ms after last partial before auto-stopping
 
   function isSupported() {
-    return !!SpeechRecognition;
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   }
 
   function init(callback) {
     onResult = callback;
-    if (!SpeechRecognition) {
-      console.warn('Web Speech API not supported in this browser.');
-      return false;
-    }
-    recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognition.onresult = (event) => {
-      // Only process new / changed results (from resultIndex onwards)
-      // to avoid re-concatenating already-finalized text.
-      let interim = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalTranscript += result[0].transcript;
-        } else {
-          interim += result[0].transcript;
-        }
-      }
-      pendingTranscript = finalTranscript + interim;
-      // Show words in the text box as they are spoken
-      const input = document.getElementById('text-input');
-      if (input) input.value = pendingTranscript;
-
-      // Reset the silence timer — submit after 2s of no new speech
-      clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(() => {
-        if (pendingTranscript.trim() && onResult) {
-          const text = pendingTranscript.trim();
-          pendingTranscript = '';
-          finalTranscript = '';
-          stop();
-          onResult(text);
-        }
-      }, SILENCE_DELAY);
-    };
-
-    recognition.onerror = (event) => {
-      console.warn('Speech recognition error:', event.error);
-      recording = false;
-      clearTimeout(silenceTimer);
-    };
-
-    recognition.onend = () => {
-      // If we're still supposed to be recording (browser auto-stopped), restart
-      if (recording) {
-        try { recognition.start(); } catch { /* noop */ }
-        return;
-      }
-      updateButton();
-    };
-
-    return true;
+    return isSupported();
   }
 
-  function start() {
-    if (!recognition) return;
+  function _wsUrl() {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}/ws/stt`;
+  }
+
+  function _updateInput() {
+    const input = document.getElementById('text-input');
+    if (input) input.value = (committedText + hypothesisText).trim();
+  }
+
+  function _resetSilenceTimer() {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+      // User stopped speaking — stop recording, leave text in input for review
+      if (recording) stop();
+    }, SILENCE_DELAY);
+  }
+
+  async function start() {
+    if (!isSupported()) return;
     if (recording) { stop(); return; }
+
+    committedText = '';
+    hypothesisText = '';
+    _updateInput();
+
     try {
-      pendingTranscript = '';
-      finalTranscript = '';
-      recognition.start();
+      ws = new WebSocket(_wsUrl());
+      ws.binaryType = 'arraybuffer';
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'partial') {
+            // Replace hypothesis — never append
+            hypothesisText = msg.text || '';
+            _updateInput();
+            _resetSilenceTimer();
+          } else if (msg.type === 'final') {
+            // Server sends the full final transcript — leave in input for user to review/send
+            committedText = msg.text || '';
+            hypothesisText = '';
+            _updateInput();
+            clearTimeout(silenceTimer);
+            _cleanup();
+          }
+        } catch (_) { /* ignore malformed */ }
+      };
+
+      ws.onerror = (err) => {
+        console.warn('STT WebSocket error:', err);
+        _cleanup();
+      };
+
+      ws.onclose = () => {
+        _cleanup();
+      };
+
+      // Wait for WS to open before starting audio
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        const origErr = ws.onerror;
+        ws.onerror = (e) => { if (origErr) origErr(e); reject(e); };
+        setTimeout(() => reject(new Error('WS connect timeout')), 5000);
+      });
+
+      // Start audio capture
+      streamer = new PCM16Streamer.Streamer({
+        onData: (pcmBuffer) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(pcmBuffer);
+          }
+        },
+        onError: (err) => {
+          console.warn('Audio capture error:', err);
+          stop();
+        },
+      });
+      await streamer.start();
       recording = true;
       updateButton();
-    } catch (e) {
-      console.warn('Recognition start failed:', e);
+      _resetSilenceTimer();
+    } catch (err) {
+      console.warn('Voice start failed:', err);
+      _cleanup();
     }
   }
 
   function stop() {
-    if (!recognition) return;
+    if (!recording) return;
+    clearTimeout(silenceTimer);
+    // Tell server we're done — it will respond with a final message
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ action: 'stop' })); } catch {}
+    }
+    // Stop audio capture
+    if (streamer) {
+      streamer.stop();
+      streamer = null;
+    }
+    recording = false;
+    updateButton();
+  }
+
+  function _finish() {
+    const text = (committedText + hypothesisText).trim();
+    committedText = '';
+    hypothesisText = '';
+    if (text && onResult) {
+      onResult(text);
+    }
+    _cleanup();
+  }
+
+  function _cleanup() {
     clearTimeout(silenceTimer);
     recording = false;
-    pendingTranscript = '';
-    finalTranscript = '';
-    try { recognition.stop(); } catch { /* noop */ }
+    if (streamer) { streamer.stop(); streamer = null; }
+    if (ws) {
+      try { ws.close(); } catch {}
+      ws = null;
+    }
     updateButton();
   }
 

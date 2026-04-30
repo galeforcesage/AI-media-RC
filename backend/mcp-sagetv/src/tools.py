@@ -308,23 +308,59 @@ async def sagetv_get_recordings(client: SageXClient, args: Dict) -> Dict:
 
 
 async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dict:
+    start_date_str = args.get("start_date", "")
+    end_date_str = args.get("end_date", "")
     data = await client.call("GetScheduledRecordings")
     if not data or not isinstance(data, list):
         return _ok(data=[], message="No upcoming recordings")
+
+    # Parse date range filter
+    range_start = None
+    range_end = None
+    if start_date_str or end_date_str:
+        from datetime import datetime as _dt, timedelta as _td
+        try:
+            if start_date_str:
+                range_start = _dt.strptime(start_date_str, "%Y-%m-%d")
+            if end_date_str:
+                range_end = _dt.strptime(end_date_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        except ValueError:
+            pass
+
     slimmed = []
     for item in data:
         airing = item if "AiringStartTime" in item else item.get("Airing", item)
         show = airing.get("Show") or {}
         channel = airing.get("Channel") or {}
         start_ms = airing.get("AiringStartTime", 0)
+
+        # Apply date range filter
+        if (range_start or range_end) and start_ms:
+            from datetime import datetime as _dt2
+            air_dt = _dt2.fromtimestamp(int(start_ms) / 1000)
+            if range_start and air_dt < range_start:
+                continue
+            if range_end and air_dt > range_end:
+                continue
+
         season = show.get("ShowSeasonNumber")
         episode = show.get("ShowEpisodeNumber")
         se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
+        # Short air_date for display
+        air_date_str = ""
+        if start_ms:
+            try:
+                import datetime as _dtmod
+                air_dt_val = _dtmod.datetime.fromtimestamp(int(start_ms) / 1000)
+                air_date_str = air_dt_val.strftime("%a %b %-d")
+            except Exception:
+                pass
         slimmed.append({
             "title": show.get("ShowTitle", ""),
             "episode_title": show.get("ShowEpisode", ""),
             "season_episode": se,
             "channel": channel.get("ChannelName", ""),
+            "air_date": air_date_str,
             "start_time": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
         })
     return _ok(data=slimmed, message=f"{len(slimmed)} upcoming recordings")
@@ -1173,8 +1209,11 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_get_recordings,
     },
     "sagetv_get_upcoming_recordings": {
-        "description": "List upcoming scheduled recordings.",
-        "input_schema": {"type": "object", "properties": {}},
+        "description": "List upcoming scheduled recordings, optionally filtered by date range.",
+        "input_schema": {"type": "object", "properties": {
+            "start_date": {"type": "string", "description": "Range start YYYY-MM-DD"},
+            "end_date": {"type": "string", "description": "Range end YYYY-MM-DD"},
+        }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_upcoming_recordings,
     },

@@ -10,6 +10,9 @@ import asyncio
 import json
 import logging
 import re
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
@@ -17,6 +20,75 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 MAX_ITERATIONS = 5  # default; overridden by config.agent.max_iterations
+
+
+@dataclass
+class RequestTrace:
+    """Structured trace for a single agent request, logged as JSON on completion."""
+    trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    query: str = ""
+    temporal: str = ""
+    domains: list = field(default_factory=list)
+    tools_offered: int = 0
+    steps: list = field(default_factory=list)  # [{tool, args_keys, duration_ms, result_size, error?}]
+    iterations: int = 0
+    model: str = ""
+    total_ms: float = 0.0
+    status: str = ""
+    validation: str = ""  # "PASS" or "FAIL(reason)"
+    validation_issues: list = field(default_factory=list)
+    context_tokens_est: int = 0
+    entity_count: int = 0
+
+    def add_step(self, tool: str, args: dict, duration_ms: float,
+                 result_size: int, error: str | None = None):
+        step = {
+            "tool": tool,
+            "args_keys": list(args.keys()),
+            "duration_ms": round(duration_ms, 1),
+            "result_size": result_size,
+        }
+        if error:
+            step["error"] = error[:200]
+        self.steps.append(step)
+
+    def log(self):
+        logger.info(
+            "REQUEST_TRACE %s",
+            json.dumps({
+                "trace_id": self.trace_id,
+                "query": self.query[:100],
+                "temporal": self.temporal,
+                "domains": self.domains,
+                "tools_offered": self.tools_offered,
+                "steps": self.steps,
+                "iterations": self.iterations,
+                "model": self.model,
+                "total_ms": round(self.total_ms, 1),
+                "status": self.status,
+                "validation": self.validation,
+                "validation_issues": self.validation_issues,
+                "context_tokens_est": self.context_tokens_est,
+                "entity_count": self.entity_count,
+            }, default=str),
+        )
+
+
+@dataclass
+class ValidationResult:
+    """Typed result from the post-hoc answer validator."""
+    status: str  # "PASS" or "FAIL"
+    issues: list = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "PASS"
+
+    def summary(self) -> str:
+        if self.passed:
+            return "PASS"
+        return f"FAIL({'; '.join(self.issues[:3])})"
+
 
 # Fields to strip from tool results before sending to the LLM.
 # These are useful for the frontend popup but waste LLM context tokens.
@@ -92,6 +164,119 @@ def _count_items(result) -> int | None:
             if isinstance(v, list):
                 return len(v)
     return None
+
+# ── Direct-format bypass for pure listing queries ──
+# When all tools return structured recording lists, format directly in
+# Python instead of burning an LLM iteration to reformat JSON → text.
+
+# Tools whose results can be directly formatted as recording lists
+_LISTING_TOOLS = {
+    "channels_get_upcoming_recordings",
+    "sagetv_get_upcoming_recordings",
+    "channels_search_recordings",
+    "sagetv_search_recordings",
+    "sagetv_get_recordings",
+    "sagetv_get_recent_recordings",
+}
+
+
+def _extract_recording_items(tool_name: str, result: dict) -> list[dict] | None:
+    """Extract a flat list of recording dicts from a tool result.
+
+    Returns None if the result isn't a simple recording list.
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return None
+    data = result.get("data")
+    if data is None:
+        return None
+    # Channels upcoming: data = {"scheduled": [...], "skipped": [...]}
+    if isinstance(data, dict):
+        items = data.get("scheduled") or data.get("results") or data.get("recordings")
+        if isinstance(items, list):
+            return items
+        return None
+    # SageTV: data = [...]
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _format_recording_line(idx: int, rec: dict) -> str:
+    """Format a single recording dict into the standard numbered line."""
+    title = rec.get("title", "")
+    ep_title = rec.get("episode_title", "")
+
+    # Season/episode: Channels uses season+episode ints, SageTV uses season_episode string
+    se = rec.get("season_episode", "")
+    if not se:
+        s = rec.get("season")
+        e = rec.get("episode")
+        if isinstance(s, int) and isinstance(e, int):
+            se = f"S{s:02d}E{e:02d}"
+
+    air_date = rec.get("air_date", "")
+    watched = rec.get("watched", rec.get("is_watched", False))
+    watched_str = "Watched" if watched else "Unwatched"
+
+    parts = [f'{idx}. "{title}"']
+    if ep_title:
+        parts.append(f'"{ep_title}"')
+    if se:
+        parts.append(se)
+    if air_date:
+        parts.append(f"— {air_date}")
+    parts.append(watched_str)
+    return " ".join(parts)
+
+
+def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
+                       tool_results: dict[str, dict]) -> str | None:
+    """Attempt to directly format tool results as a recording list.
+
+    Args:
+        tool_calls_executed: List of (tool_name, args) executed this iteration.
+        tool_results: Map of call_key -> result dict.
+
+    Returns:
+        Formatted string if direct-format applies, None to fall back to LLM.
+    """
+    # Only apply if ALL executed tools are listing tools
+    if not tool_calls_executed:
+        return None
+    for tool_name, _args in tool_calls_executed:
+        if tool_name not in _LISTING_TOOLS:
+            return None
+
+    # Collect all recording items
+    all_items: list[dict] = []
+    seen_keys: set[str] = set()  # dedup by title + episode_title + air_date
+
+    for call_key, result in tool_results.items():
+        items = _extract_recording_items(call_key.split(":")[0], result)
+        if items is None:
+            return None  # Non-list result — fall back to LLM
+        for item in items:
+            dedup_key = (
+                (item.get("title", "") + "|" +
+                 item.get("episode_title", "") + "|" +
+                 item.get("air_date", item.get("start_time", ""))).lower()
+            )
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                all_items.append(item)
+
+    if not all_items:
+        return "No recordings found."
+
+    # Sort by start_time or air_date for chronological order
+    def _sort_key(r):
+        return r.get("start_time", "") or r.get("air_date", "")
+    all_items.sort(key=_sort_key)
+
+    lines = [_format_recording_line(i + 1, rec) for i, rec in enumerate(all_items)]
+    return "\n".join(lines)
+
 
 # Tool definitions split by system for filtering based on user's LLM Focus selection.
 # Keys: "sagetv", "channelsdvr", "shared" (linux + transcript — always included)
@@ -298,6 +483,7 @@ class AgentLoop:
         )
         self._dynamic_tools: Dict[str, str] | None = None  # cached dynamic tool text
         self._openai_tools: List[Dict[str, Any]] | None = None  # cached OpenAI-format tools
+        self._tool_schemas: Dict[str, Dict[str, Any]] = {}  # cached schemas for validation
 
     # ------------------------------------------------------------------
     # OpenAI-format tool schema discovery
@@ -481,6 +667,62 @@ class AgentLoop:
         "transcript_list_recent",
     }
 
+    # Domain → tool suffix mapping for subsetting
+    _DOMAIN_TOOL_MAP: Dict[str, set[str]] = {
+        "recordings": {
+            "search_recordings", "get_recordings", "get_recent_recordings",
+            "get_recording", "get_active_recordings", "get_airing", "get_show",
+        },
+        "schedule": {
+            "get_upcoming_recordings", "get_scheduled_recordings",
+            "search_epg", "get_now_playing", "search_shows",
+        },
+        "playback": {
+            "pause_playback", "resume_playback", "stop_playback",
+            "skip_forward", "skip_back", "seek_relative", "seek_absolute",
+            "set_volume", "mute", "unmute", "commercial_skip",
+            "toggle_pause", "seek_forward", "seek_backward",
+            "skip_commercial", "previous_commercial", "toggle_mute",
+            "toggle_cc", "play_channel", "play_recording",
+            "channel_up", "channel_down", "get_bridge_devices",
+            "get_playback_status", "get_now_playing", "tune_channel",
+        },
+        "system": {
+            "disk_usage", "memory_info", "uptime", "network_info",
+            "service_status", "docker_ps", "docker_logs", "docker_restart",
+            "tail_log", "list_directory", "file_info", "count_files",
+            "find_large_files", "get_disk_space", "get_tuner_status",
+            "get_storage_status", "get_jobs", "get_clients",
+        },
+        "metadata": {
+            "list_genres", "get_channels", "get_channel",
+        },
+        "transcript": {
+            "search", "cross_search", "actors", "stats",
+            "get", "recording_summary", "list_recent", "jobs", "reindex",
+        },
+    }
+
+    def _tool_matches_domain(self, tool_name: str) -> bool:
+        """Check if a tool matches the current domain classification."""
+        domains = getattr(self, "_domains", [])
+        if not domains:
+            return True  # no filtering if no domains classified
+
+        # Extract suffix: channels_search_recordings → search_recordings
+        # transcript_search → search
+        suffix = ""
+        for prefix in ("channels_", "sagetv_", "linux_", "transcript_"):
+            if tool_name.startswith(prefix):
+                suffix = tool_name[len(prefix):]
+                break
+
+        for domain in domains:
+            allowed = self._DOMAIN_TOOL_MAP.get(domain, set())
+            if suffix in allowed:
+                return True
+        return False
+
     async def _discover_openai_tools(self, systems: list[str] | None = None) -> List[Dict[str, Any]]:
         """Query each MCP server and build OpenAI-format tool schemas.
 
@@ -511,7 +753,13 @@ class AgentLoop:
             try:
                 mcp_tools = await client.list_tools()
                 for t in mcp_tools:
+                    # Cache ALL tool schemas for validation (even non-essential)
+                    schema = t.get("inputSchema") or t.get("input_schema") or {"type": "object", "properties": {}}
+                    self._tool_schemas[t["name"]] = schema
                     if t["name"] not in self._ESSENTIAL_TOOLS:
+                        continue
+                    # Domain-based tool subsetting
+                    if not self._tool_matches_domain(t["name"]):
                         continue
                     # Filter out wrong-direction tools based on temporal intent
                     suffix = t["name"].split("_", 1)[1] if "_" in t["name"] else ""
@@ -526,10 +774,14 @@ class AgentLoop:
             except Exception as exc:
                 logger.warning("Could not discover %s tools for OpenAI format: %s", label, exc)
 
-        # Add transcript tools (filtered to essential only)
+        # Add transcript tools (filtered to essential + domain)
         for t in self._TRANSCRIPT_TOOLS_OPENAI:
-            if t["function"]["name"] in self._ESSENTIAL_TOOLS:
+            fn_name = t["function"]["name"]
+            if fn_name in self._ESSENTIAL_TOOLS and self._tool_matches_domain(fn_name):
                 tools.append(t)
+                # Cache transcript schemas for validation
+                fn = t["function"]
+                self._tool_schemas[fn["name"]] = fn.get("parameters", {})
         logger.info("Total OpenAI-format tools: %d", len(tools))
         return tools
 
@@ -702,6 +954,7 @@ class AgentLoop:
             "- You do NOT have access to live DVR data without calling a tool.\n"
             "- If you cannot determine which tool to use, respond with: \"I don't have enough information to answer that.\"\n"
             "- NEVER fabricate or guess DVR data. Only report what tools return.\n"
+            "- You may ONLY use dates provided in the DATE REFERENCE block above. Do NOT invent or calculate dates yourself.\n"
             + ("- BOTH DVR systems are active. For ANY recording search, you MUST call BOTH "
                "channels_search_recordings AND sagetv_search_recordings in the same turn. "
                "Do NOT call only one — you will miss results.\n" if both else "")
@@ -740,20 +993,35 @@ class AgentLoop:
             "- Never describe your reasoning steps. Just give the answer.\n\n"
 
             "OUTPUT FORMAT:\n"
-            "- ALWAYS wrap every show name in double quotes: \"NCIS\", \"Will Trent\"\n"
-            "- ALWAYS include the episode title from the tool result and wrap it in double quotes.\n"
-            "- Format: \"ShowName\" \"EpisodeTitle\" S##E## — every line MUST have all three parts.\n"
-            "- Example: \"NCIS\" \"Toil and Trouble\" S23E19\n"
-            "- If the recording has watched=true, append ✓. Example: \"NCIS\" \"Toil and Trouble\" S23E19 ✓\n"
-            "- You MUST list EVERY recording from the tool results. Do NOT skip any.\n"
-            "- Include episode_title exactly as returned by the tool.\n"
-            "- Before listing, repeat the summary from the tool message field.\n"
-            "- Do NOT omit episode titles. Do NOT skip them. The user needs them.\n"
-            "- Do NOT include descriptions, air times, or channel numbers unless asked.\n\n"
+            "- List recordings as a numbered list, ONE line each. No bullet sub-items.\n"
+            "- Each line MUST include the show name AND the episode title, both in quotes.\n"
+            "- The show name comes from the 'title' field, the episode title from 'episode_title'.\n"
+            "- Each line MUST end with the word Watched or Unwatched.\n"
+            "- For multi-day queries, include the date on each line.\n"
+            "- CORRECT single-day examples:\n"
+            "  1. \"NCIS\" \"Toil and Trouble\" S23E19 Watched\n"
+            "  2. \"The Floor\" \"Sister Act\" S05E05 Unwatched\n"
+            "- CORRECT multi-day example:\n"
+            "  1. \"NCIS\" \"Toil and Trouble\" S23E19 — Apr 28 Watched\n"
+            "  2. \"Will Trent\" \"Cold Case\" S03E11 — Apr 27 Unwatched\n"
+            "- WRONG (too many lines per entry):\n"
+            "  1. **NCIS**\n"
+            "     - Episode: \"Toil and Trouble\" S23E19\n"
+            "     - Watched: No\n"
+            "- NEVER use sub-bullets, extra lines, or bold **show names**.\n"
+            "- You MUST list EVERY recording. Do NOT skip any.\n"
+            "- Before the list, write a one-line summary count.\n"
+            "- Do NOT include descriptions, channel numbers, or file paths.\n\n"
 
             "PATHS:\n"
             + ("- SageTV: /var/media/tv\n" if has_sagetv else "")
             + (channels_path_line if has_channels else "")
+            + (
+                "\n" + getattr(self, "_entity_store", None).format_context_for_prompt()
+                if getattr(self, "_entity_store", None)
+                and getattr(self, "_entity_store").format_context_for_prompt()
+                else ""
+            )
         )
 
     async def run(
@@ -763,6 +1031,8 @@ class AgentLoop:
         semantic_context: str = "",
         systems: list[str] | None = None,
         temporal: str = "",
+        domains: list[str] | None = None,
+        entity_store: Any | None = None,
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
@@ -801,6 +1071,14 @@ class AgentLoop:
             }
         systems = list(reachable)
 
+        # Initialize request trace
+        trace = RequestTrace(
+            query=user_query,
+            temporal=temporal or "",
+            domains=domains or [],
+        )
+        trace_start = time.monotonic()
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": await self._build_system_prompt(systems)},
         ]
@@ -810,10 +1088,29 @@ class AgentLoop:
         self._active_systems = set(systems) if systems else {"sagetv", "channelsdvr"}
         self._empty_retries = 0  # track consecutive empty LLM responses
         self._temporal = temporal or ""
+        self._seen_calls: set[str] = set()  # RAC: track (tool, args) to detect duplicates
+        self._tool_results_cache: Dict[str, Any] = {}  # cache tool results for post-hoc validation
+        self._domains = domains or []  # domain classification for tool subsetting
+        self._entity_store = entity_store  # conversation-scoped entity memory
+
+        # Extract resolved dates from the rewritten query so we can
+        # override wrong dates hallucinated by the LLM in tool args.
+        # Patterns: "(2026-05-03)" or "(2026-05-03 to 2026-05-09)"
+        _qdate_m = re.search(
+            r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)\s*\??\s*$",
+            user_query,
+        )
+        if _qdate_m:
+            self._resolved_start = _qdate_m.group(1)
+            self._resolved_end = _qdate_m.group(2)  # None for single-day
+        else:
+            self._resolved_start = None
+            self._resolved_end = None
 
         # Discover OpenAI-format tool schemas for native tool calling
         openai_tools = await self._discover_openai_tools(systems)
-        logger.info("Passing %d tool schemas to Ollama", len(openai_tools))
+        trace.tools_offered = len(openai_tools)
+        logger.info("Passing %d tool schemas to Ollama (domains=%s)", len(openai_tools), self._domains)
 
         # Build user message with pre-fetched context
         context_parts = []
@@ -852,6 +1149,25 @@ class AgentLoop:
                     await status_callback("Thinking")
                 else:
                     await status_callback("Analyzing results")
+
+            # ── Context budget tracking ──
+            # Rough estimate: 1 token ≈ 4 chars for English
+            ctx_chars = sum(len(m.get("content", "")) for m in messages)
+            # Also count tool schemas
+            schema_chars = len(json.dumps(openai_tools, default=str)) if openai_tools else 0
+            est_tokens = (ctx_chars + schema_chars) // 4
+            ctx_limit = self._orch.llm.num_ctx  # typically 8192
+            trace.context_tokens_est = est_tokens
+
+            if est_tokens > ctx_limit * 0.85:
+                logger.warning(
+                    "Context budget tight: ~%d tokens estimated vs %d limit. Compressing history.",
+                    est_tokens, ctx_limit,
+                )
+                messages = self._compress_history(messages)
+                new_est = sum(len(m.get("content", "")) for m in messages) // 4
+                logger.info("After compression: ~%d tokens (was ~%d)", new_est, est_tokens)
+                trace.context_tokens_est = new_est
 
             # ── Call LLM with native tool schemas ──
             # On tool-call iterations we don't stream tokens to frontend
@@ -914,6 +1230,10 @@ class AgentLoop:
                 _buffer.clear()
 
             if llm_result.get("error"):
+                trace.status = "error"
+                trace.iterations = iteration + 1
+                trace.total_ms = (time.monotonic() - trace_start) * 1000
+                trace.log()
                 return llm_result
 
             response_text = llm_result.get("response", "")
@@ -990,6 +1310,22 @@ class AgentLoop:
             if not tool_calls:
                 # No tool calls detected in any format
                 if iteration == 0:
+                    # Clarification branch: if the LLM asks a question instead
+                    # of calling a tool, allow it — return as a clarification
+                    stripped = response_text.strip()
+                    if stripped.endswith("?") and len(stripped) < 500 and "\n" not in stripped:
+                        logger.info("Iter 0 clarification question detected: %s", stripped[:100])
+                        trace.status = "clarification"
+                        trace.iterations = 1
+                        trace.total_ms = (time.monotonic() - trace_start) * 1000
+                        trace.log()
+                        return {
+                            "status": "clarification",
+                            "response": self._strip_markers(stripped),
+                            "model": llm_result.get("model", ""),
+                            "iterations": 1,
+                        }
+
                     # Iter 0: the LLM MUST call a tool for factual queries.
                     # Try to salvage tool name from prose first.
                     salvaged = self._salvage_tool_call(response_text)
@@ -1012,6 +1348,20 @@ class AgentLoop:
                 else:
                     # Later iteration with no tool call = final answer
                     final = self._strip_markers(response_text)
+                    # Post-hoc answer validation (Layer 3 — Formal Validator)
+                    vr = self._validate_answer(final, user_query)
+                    trace.validation = vr.summary()
+                    if not vr.passed:
+                        final += f"\n\n_{vr.issues[0]}_"
+                        trace.validation_issues = vr.issues
+                    # Extract entities from tool results for conversation context
+                    if hasattr(self, "_entity_store") and self._entity_store:
+                        trace.entity_count = len(self._entity_store.entities)
+                    trace.status = "ok"
+                    trace.model = llm_result.get("model", "")
+                    trace.iterations = iteration + 1
+                    trace.total_ms = (time.monotonic() - trace_start) * 1000
+                    trace.log()
                     return {
                         "status": "ok",
                         "response": final,
@@ -1043,16 +1393,58 @@ class AgentLoop:
             tool_results: List[str] = []
             tool_messages: List[Dict[str, Any]] = []
             has_service_error = False
+            _iter_calls: list[tuple[str, dict]] = []  # track (tool_name, args) for direct-format
 
             for idx, tc in enumerate(tool_calls):
                 tool_name = tc.get("tool", "")
                 tool_args = tc.get("args") or {}
                 logger.info("Executing tool: %s(%s)", tool_name, json.dumps(tool_args, default=str)[:200])
 
-                if status_callback:
-                    await status_callback(_tool_status_message(tool_name, tool_args))
+                # ── RAC: Duplicate call detection ──
+                call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, default=str)}"
+                if call_key in self._seen_calls:
+                    logger.warning("RAC: duplicate call %s — returning cached or error", tool_name)
+                    result = self._tool_results_cache.get(call_key, {
+                        "error": f"Already called {tool_name} with these parameters. Use the previous result."
+                    })
+                    trace.add_step(tool_name, tool_args, 0, 0, error="duplicate_call")
+                else:
+                    self._seen_calls.add(call_key)
 
-                result = await self._execute_tool(tool_name, tool_args)
+                    if status_callback:
+                        await status_callback(_tool_status_message(tool_name, tool_args))
+
+                    step_start = time.monotonic()
+                    result = await self._execute_tool(tool_name, tool_args)
+                    step_ms = (time.monotonic() - step_start) * 1000
+                    self._tool_results_cache[call_key] = result
+                    # Extract entities from tool results for conversation context
+                    if self._entity_store and isinstance(result, dict):
+                        self._entity_store.extract_from_tool_result(tool_name, result)
+                    result_str_raw = json.dumps(result, default=str)
+                    trace.add_step(
+                        tool_name, tool_args, step_ms, len(result_str_raw),
+                        error=result.get("error"),
+                    )
+                    _iter_calls.append((tool_name, tool_args))
+
+                # ── Confirmation gate: return to user if confirmation needed ──
+                if result.get("requires_confirmation"):
+                    trace.status = "confirmation_required"
+                    trace.iterations = iteration + 1
+                    trace.total_ms = (time.monotonic() - trace_start) * 1000
+                    trace.log()
+                    return {
+                        "status": "confirmation_required",
+                        "response": result["message"],
+                        "confirmation": {
+                            "tool": result["tool"],
+                            "args": result["args"],
+                        },
+                        "model": llm_result.get("model", ""),
+                        "iterations": iteration + 1,
+                    }
+
                 result_slim = _slim_for_llm(result)
                 result_str = json.dumps(result_slim, default=str)
                 logger.info("Slimmed result for %s (%d chars): %.2000s", tool_name, len(result_str), result_str)
@@ -1084,7 +1476,43 @@ class AgentLoop:
                 else:
                     tool_results.append(f"Tool: {tool_name}\nResult: {result_str}")
 
+            # ── Direct-format bypass: skip LLM iteration 2 for pure listings ──
+            if not has_service_error and iteration == 0 and _iter_calls:
+                direct = _try_direct_format(_iter_calls, self._tool_results_cache)
+                if direct is not None:
+                    logger.info("Direct-format bypass: %d chars, skipping LLM iteration 2",
+                                len(direct))
+                    if status_callback:
+                        await status_callback("Formatting results")
+                    # Stream the formatted text to frontend
+                    if token_callback:
+                        for line in direct.split("\n"):
+                            await token_callback(line + "\n")
+                    trace.status = "ok"
+                    trace.iterations = iteration + 1
+                    trace.total_ms = (time.monotonic() - trace_start) * 1000
+                    trace.validation = "PASS"
+                    trace.model = llm_result.get("model", "")
+                    trace.log()
+                    return {
+                        "status": "ok",
+                        "response": direct,
+                        "model": llm_result.get("model", ""),
+                        "iterations": iteration + 1,
+                    }
+
             # ── Inject tool results back into conversation ──
+            _FORMAT_REMINDER = (
+                "REMINDER: List recordings as a numbered list, ONE line each. "
+                "Format: 1. \"ShowName\" \"EpisodeTitle\" S##E## — air_date Unwatched\n"
+                "You MUST include BOTH the show name AND the episode title from "
+                "the tool results. The show name is in the 'title' field and the "
+                "episode title is in the 'episode_title' field. Never omit either.\n"
+                "You MUST include the 'air_date' value from each tool result on every line. "
+                "Example: 1. \"FBI\" \"Roleplay\" S08E20 — Mon May 4 Unwatched\n"
+                "End each line with the word Watched or Unwatched. "
+                "Do NOT use sub-bullets or extra lines per entry."
+            )
             if tool_messages:
                 # Native path: add each tool result as a role:tool message
                 messages.extend(tool_messages)
@@ -1094,8 +1522,14 @@ class AgentLoop:
                         "content": (
                             "Some services are currently offline. "
                             "Do NOT retry the same tool. Tell the user which service "
-                            "is unavailable and answer with whatever information you have."
+                            "is unavailable and answer with whatever information you have. "
+                            + _FORMAT_REMINDER
                         ),
+                    })
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": _FORMAT_REMINDER,
                     })
             else:
                 # Text-parsed fallback path
@@ -1112,19 +1546,33 @@ class AgentLoop:
                         f"Tool results:\n{observation}\n\n"
                         "Use these results to answer the original question. "
                         "If a tool returned an error, do NOT retry it — tell the user. "
-                        "Otherwise, provide your final answer."
+                        "Otherwise, provide your final answer. "
+                        + _FORMAT_REMINDER
                     ),
                 })
 
         # Max iterations reached
         logger.warning("Agent loop reached max iterations (%d)", self._max_iterations)
         raw = llm_result.get("response", "")
+        final = self._strip_markers(raw)
+        # Post-hoc validation on max-iterations path too
+        vr = self._validate_answer(final, user_query)
+        trace.validation = vr.summary()
+        if not vr.passed:
+            trace.validation_issues = vr.issues
+        if hasattr(self, "_entity_store") and self._entity_store:
+            trace.entity_count = len(self._entity_store.entities)
+        trace.status = "max_iterations"
+        trace.model = llm_result.get("model", "")
+        trace.iterations = self._max_iterations
+        trace.total_ms = (time.monotonic() - trace_start) * 1000
+        trace.log()
         return {
             "status": "ok",
             "response": (
                 "I wasn't able to fully resolve your request within the "
                 "allowed steps. Here's what I found so far: "
-                + self._strip_markers(raw)
+                + final
             ),
             "model": llm_result.get("model", ""),
             "iterations": self._max_iterations,
@@ -1266,8 +1714,284 @@ class AgentLoop:
         return text.strip()
 
     # ------------------------------------------------------------------
+    # Post-hoc answer validation (Layer 3 — Formal Validator)
+    # ------------------------------------------------------------------
+
+    _DATE_IN_ANSWER_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+    _COUNT_RE = re.compile(r"\b(\d+)\s+(?:recording|episode|show|result|item)s?\b", re.I)
+
+    def _validate_answer(self, answer: str, user_query: str) -> ValidationResult:
+        """Rule-based checks on the final answer against tool results.
+
+        Returns a ValidationResult with PASS or FAIL status.
+        """
+        issues = []
+        temporal = getattr(self, "_temporal", "")
+        cache = getattr(self, "_tool_results_cache", {})
+
+        # 1) Temporal direction check: past query shouldn't mention future dates
+        if temporal == "past":
+            import datetime
+            today = datetime.date.today()
+            for date_str in self._DATE_IN_ANSWER_RE.findall(answer):
+                try:
+                    d = datetime.date.fromisoformat(date_str)
+                    if d > today:
+                        issues.append(f"Note: Date {date_str} is in the future but the query asked about past content.")
+                        break
+                except ValueError:
+                    pass
+
+        # 2) Count consistency: check if claimed count matches tool results
+        total_items = 0
+        for key, result in cache.items():
+            if isinstance(result, dict):
+                data = result.get("data", result)
+                if isinstance(data, list):
+                    total_items += len(data)
+                elif isinstance(data, dict):
+                    for sub in ("results", "scheduled", "items", "recordings"):
+                        v = data.get(sub)
+                        if isinstance(v, list):
+                            total_items += len(v)
+                            break
+
+        if total_items > 0:
+            for m in self._COUNT_RE.finditer(answer):
+                claimed = int(m.group(1))
+                # Skip season/episode numbering (e.g. "Season 25 Episode 3")
+                pre = answer[max(0, m.start() - 8):m.start()]
+                if re.search(r'(?:Season|S)\s*$', pre, re.I):
+                    continue
+                # Allow some tolerance (the answer might group/filter)
+                if claimed > total_items * 2 and claimed > total_items + 5:
+                    issues.append(
+                        f"Note: The answer mentions {claimed} items but tools returned {total_items}."
+                    )
+                    break
+
+        # 3) Existence check: quoted show titles should appear in tool results
+        quoted_titles = re.findall(r'"([^"]{3,50})"', answer)
+        if quoted_titles and cache:
+            all_results_str = " ".join(
+                json.dumps(r, default=str) for r in cache.values()
+            ).lower()
+            missing = []
+            for title in quoted_titles[:5]:  # check first 5
+                if title.lower() not in all_results_str:
+                    missing.append(title)
+            if missing and len(missing) > len(quoted_titles) // 2:
+                issues.append(
+                    f"Warning: Some titles ({', '.join(missing[:3])}) were not found in tool results."
+                )
+
+        result = ValidationResult(
+            status="FAIL" if issues else "PASS",
+            issues=issues,
+        )
+
+        if result.passed:
+            logger.info("Post-hoc validation: PASS")
+        else:
+            logger.warning("Post-hoc validation: %s", result.summary())
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Context budget management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compress_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compress conversation history to fit within context budget.
+
+        Strategy:
+        - Always keep system prompt (index 0) and latest user message
+        - Summarize older tool results to just their key counts/status
+        - Keep the most recent tool result in full
+        """
+        if len(messages) <= 3:
+            return messages  # nothing to compress
+
+        compressed = [messages[0]]  # keep system prompt
+
+        # Find the last tool/user message pair (most recent context)
+        # Compress everything in between
+        for i, msg in enumerate(messages[1:], 1):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if i >= len(messages) - 3:
+                # Keep the last 3 messages intact (recent context)
+                compressed.append(msg)
+                continue
+
+            if role == "tool" and len(content) > 500:
+                # Summarize old tool results
+                try:
+                    # Try to extract just the count
+                    data = json.loads(content.split("] ", 1)[-1] if "] " in content else content)
+                    if isinstance(data, dict):
+                        items = data.get("data", data)
+                        if isinstance(items, list):
+                            summary = f"[Previous tool result: {len(items)} items returned]"
+                        elif isinstance(items, dict):
+                            for k in ("results", "scheduled", "recordings"):
+                                if isinstance(items.get(k), list):
+                                    summary = f"[Previous tool result: {len(items[k])} {k}]"
+                                    break
+                            else:
+                                summary = f"[Previous tool result: {list(items.keys())[:5]}]"
+                        else:
+                            summary = content[:200] + "... (compressed)"
+                    else:
+                        summary = content[:200] + "... (compressed)"
+                except (json.JSONDecodeError, Exception):
+                    summary = content[:200] + "... (compressed)"
+
+                compressed.append({**msg, "content": summary})
+            elif role == "assistant" and len(content) > 300 and i < len(messages) - 3:
+                # Compress old assistant reasoning
+                compressed.append({**msg, "content": content[:200] + "..."})
+            else:
+                compressed.append(msg)
+
+        return compressed
+
+    # ------------------------------------------------------------------
     # Tool execution
     # ------------------------------------------------------------------
+
+    # Tools requiring explicit user confirmation before execution
+    _DANGEROUS_TOOLS = {
+        "linux_reboot_server", "linux_shutdown_server",
+        "sagetv_delete_media_file", "channels_delete_recording",
+        "channels_delete_recording_file",
+    }
+    _OWNER_TOOLS = {
+        "linux_restart_service", "linux_restart_nginx",
+        "linux_docker_restart", "sagetv_set_config_value",
+        "channels_clear_cache", "channels_rebuild_index",
+        "sagetv_run_library_scan", "transcript_reindex",
+    }
+
+    def _validate_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any] | None:
+        """Validate a tool call against cached schemas (IFN/IAN/IAT patterns).
+
+        Returns None if valid, or an error dict if invalid.
+        """
+        schema = self._tool_schemas.get(tool_name)
+        if not schema:
+            # IFN: tool name not found in any schema
+            # Check for close matches to suggest
+            prefixes = ("sagetv_", "channels_", "linux_", "transcript_")
+            prefix = ""
+            for p in prefixes:
+                if tool_name.startswith(p):
+                    prefix = p
+                    break
+            suggestions = [n for n in self._tool_schemas if n.startswith(prefix)][:5]
+            return {
+                "error": f"Unknown tool '{tool_name}'. "
+                f"Did you mean one of: {', '.join(suggestions)}?" if suggestions
+                else f"Unknown tool '{tool_name}'."
+            }
+
+        props = schema.get("properties", {})
+        required = set(schema.get("required", []))
+
+        # IAN: check for unknown parameter names
+        unknown_params = set(args.keys()) - set(props.keys()) - {"_confirmed"}
+        if unknown_params:
+            return {
+                "error": f"Unknown parameter(s) {list(unknown_params)} for {tool_name}. "
+                f"Valid parameters: {list(props.keys())}"
+            }
+
+        # Check required parameters are present
+        missing = required - set(args.keys())
+        if missing:
+            return {
+                "error": f"Missing required parameter(s) {list(missing)} for {tool_name}."
+            }
+
+        # IAT: type coercion — fix common type mismatches instead of rejecting
+        for pname, pdef in props.items():
+            if pname not in args:
+                continue
+            expected_type = pdef.get("type", "")
+            val = args[pname]
+            try:
+                if expected_type == "integer" and isinstance(val, str):
+                    args[pname] = int(val)
+                elif expected_type == "number" and isinstance(val, str):
+                    args[pname] = float(val)
+                elif expected_type == "boolean" and isinstance(val, str):
+                    args[pname] = val.lower() in ("true", "1", "yes")
+                elif expected_type == "string" and not isinstance(val, str):
+                    args[pname] = str(val)
+            except (ValueError, TypeError):
+                return {
+                    "error": f"Parameter '{pname}' for {tool_name} must be {expected_type}, "
+                    f"got {type(val).__name__}: {val!r}"
+                }
+
+        # Fix wrong-year hallucination in date parameters
+        import datetime as _dt_mod
+        current_year = str(_dt_mod.date.today().year)
+        _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+        for pname in ("date", "start_date", "end_date"):
+            val = args.get(pname)
+            if not isinstance(val, str):
+                continue
+            m = _DATE_RE.match(val)
+            if m and m.group(1) != current_year:
+                fixed = f"{current_year}-{m.group(2)}-{m.group(3)}"
+                logger.warning("Year fix: %s %s %s -> %s", tool_name, pname, val, fixed)
+                args[pname] = fixed
+
+        # Override LLM dates with orchestrator-resolved dates when available.
+        # The orchestrator resolves "Sunday" → "(2026-05-03)" and puts it in
+        # the query, but the 8b model still gets the date wrong sometimes.
+        resolved_start = getattr(self, "_resolved_start", None)
+        resolved_end = getattr(self, "_resolved_end", None)
+        if resolved_start:
+            _date_params = {p for p in ("date", "start_date", "end_date") if p in args}
+            if _date_params:
+                if resolved_end:
+                    # Range query: override start_date + end_date
+                    if "start_date" in args and args["start_date"] != resolved_start:
+                        logger.warning("Date override: %s start_date %s -> %s",
+                                       tool_name, args["start_date"], resolved_start)
+                        args["start_date"] = resolved_start
+                    if "end_date" in args and args["end_date"] != resolved_end:
+                        logger.warning("Date override: %s end_date %s -> %s",
+                                       tool_name, args["end_date"], resolved_end)
+                        args["end_date"] = resolved_end
+                else:
+                    # Single-day query: override date or start_date/end_date
+                    if "date" in args and args["date"] != resolved_start:
+                        logger.warning("Date override: %s date %s -> %s",
+                                       tool_name, args["date"], resolved_start)
+                        args["date"] = resolved_start
+                    if "start_date" in args and args["start_date"] != resolved_start:
+                        logger.warning("Date override: %s start_date %s -> %s",
+                                       tool_name, args["start_date"], resolved_start)
+                        args["start_date"] = resolved_start
+                    if "end_date" in args:
+                        # For single-day, end_date should be same day
+                        end_val = resolved_start.replace(
+                            resolved_start[-2:],
+                            str(int(resolved_start[-2:]) + 1).zfill(2)
+                        ) if "end_date" in args else resolved_start
+                        # Actually just use the same date — the tool handles
+                        # end_date as inclusive
+                        if args["end_date"] != resolved_start:
+                            logger.warning("Date override: %s end_date %s -> %s",
+                                           tool_name, args["end_date"], resolved_start)
+                            args["end_date"] = resolved_start
+
+        return None  # valid
 
     async def _execute_tool(
         self, tool_name: str, args: Dict[str, Any],
@@ -1280,6 +2004,23 @@ class AgentLoop:
                 return {"error": "SageTV is not active. Only Channels DVR tools are available."}
             if tool_name.startswith("channels_") and "channelsdvr" not in active:
                 return {"error": "Channels DVR is not active. Only SageTV tools are available."}
+
+            # Schema validation (IFN/IAN/IAT)
+            validation_error = self._validate_tool_call(tool_name, args)
+            if validation_error:
+                logger.warning("Schema validation failed for %s: %s", tool_name, validation_error["error"])
+                return validation_error
+
+            # Confirmation gate for destructive/owner tools
+            if tool_name in self._DANGEROUS_TOOLS or tool_name in self._OWNER_TOOLS:
+                if not args.pop("_confirmed", False):
+                    risk = "DANGEROUS" if tool_name in self._DANGEROUS_TOOLS else "requires authorization"
+                    return {
+                        "requires_confirmation": True,
+                        "tool": tool_name,
+                        "args": args,
+                        "message": f"This action ({tool_name}) is {risk} and requires your confirmation."
+                    }
 
             # Enforce temporal guardrail — reject wrong-direction tools
             temporal = getattr(self, "_temporal", "")

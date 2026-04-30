@@ -32,7 +32,7 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _embed_threads)
 os.environ.setdefault("NUMEXPR_NUM_THREADS", _embed_threads)
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from utils.config import load_config
@@ -40,6 +40,7 @@ from utils.logger import get_logger
 from orchestrator import Orchestrator
 from transport.http import router as http_router, init_http_transport
 from transport.mcp import MCPServer
+from services.stt import STTService
 
 logger = get_logger(__name__)
 
@@ -124,7 +125,7 @@ def build_config(args: argparse.Namespace) -> Dict[str, Any]:
 # Application factory
 # ------------------------------------------------------------------
 
-def create_app(orchestrator: Orchestrator) -> FastAPI:
+def create_app(orchestrator: Orchestrator, config: Dict[str, Any] | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="LLM Remote Orchestrator",
@@ -141,6 +142,87 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     init_http_transport(orchestrator)
     app.include_router(http_router, prefix="/api")
+
+    # ── STT WebSocket ───────────────────────────────────────
+    _config = config or {}
+    stt = STTService(model_name=_config.get("stt_model", "base"))
+
+    @app.websocket("/ws/stt")
+    async def ws_stt(ws: WebSocket):
+        """
+        Streaming speech-to-text via faster-whisper.
+
+        Protocol:
+          Client → Server: binary frames (PCM16-LE mono 16kHz)
+          Client → Server: JSON {"action": "stop"} to end
+          Server → Client: JSON {"type": "partial", "text": "..."}
+          Server → Client: JSON {"type": "final", "text": "..."}
+        """
+        await ws.accept()
+        audio_buf = bytearray()
+        partial_task = None
+        stop_event = asyncio.Event()
+
+        async def emit_partials():
+            """Periodically transcribe accumulated audio for live feedback."""
+            while not stop_event.is_set():
+                await asyncio.sleep(1.5)
+                if stop_event.is_set():
+                    break
+                buf_copy = bytes(audio_buf)
+                if len(buf_copy) < 6400:  # <0.2s
+                    continue
+                try:
+                    text = await stt.transcribe_pcm(buf_copy)
+                    if text:
+                        await ws.send_json({"type": "partial", "text": text})
+                except Exception:
+                    pass
+
+        try:
+            partial_task = asyncio.create_task(emit_partials())
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.receive":
+                    if "bytes" in msg and msg["bytes"]:
+                        audio_buf.extend(msg["bytes"])
+                    elif "text" in msg and msg["text"]:
+                        import json as _json
+                        try:
+                            data = _json.loads(msg["text"])
+                        except ValueError:
+                            continue
+                        if data.get("action") == "stop":
+                            break
+                elif msg["type"] == "websocket.disconnect":
+                    break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            stop_event.set()
+            if partial_task:
+                partial_task.cancel()
+                try:
+                    await partial_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Final transcription of full audio
+        if audio_buf:
+            try:
+                text = await stt.transcribe_pcm(bytes(audio_buf))
+                await ws.send_json({"type": "final", "text": text or ""})
+            except Exception as exc:
+                logger.warning("STT final transcription failed: %s", exc)
+                try:
+                    await ws.send_json({"type": "final", "text": ""})
+                except Exception:
+                    pass
+
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
     @app.on_event("startup")
     async def on_startup() -> None:
@@ -166,7 +248,7 @@ async def run(args: argparse.Namespace) -> None:
         logger.debug("Debug logging enabled")
 
     orchestrator = Orchestrator(config)
-    app = create_app(orchestrator)
+    app = create_app(orchestrator, config)
 
     # MCP server
     mcp = MCPServer(host="127.0.0.1", port=config["mcp_port"])

@@ -493,6 +493,8 @@
       setTimeout(() => input.classList.remove('input-blocked'), 400);
       return;
     }
+    // Stop mic if still recording
+    if (Voice.isRecording()) Voice.stop();
     input.value = '';
     const sendBtn = document.getElementById('btn-send');
     if (sendBtn) sendBtn.disabled = true;
@@ -742,7 +744,6 @@
         const desc = getDesc(r);
         const rating = r.content_rating || '';
         const system = r._system === 'upcoming' ? 'scheduled' : (r._system || '');
-        const watched = r.watched ? '✓ watched' : '';
         const img = r.image || '';
         const cast = r.cast || show.ShowCast || [];
         const genres = r.genres || show.ShowGenres || show.ShowCategory || [];
@@ -764,13 +765,20 @@
         if (seStr) html += ` <span class="si-ep">${esc(seStr)}</span>`;
         html += '</div>';
         if (ep) html += `<div class="si-episode">${esc(ep)}</div>`;
-        const meta = [channel, duration, airDate, rating, system, watched].filter(Boolean);
+        const meta = [channel, duration, airDate, rating, system].filter(Boolean);
         if (meta.length) html += `<div class="si-meta">${meta.map(esc).join(' · ')}</div>`;
+        if (r.watched != null) {
+          const wClass = r.watched ? 'si-watched' : 'si-unwatched';
+          const wText = r.watched ? '✅ Watched' : '❌ Unwatched';
+          html += `<div class="${wClass}">${wText}</div>`;
+        }
         if (desc) html += `<div class="si-desc">${esc(desc)}</div>`;
         if (genreList.length) html += `<div class="si-genres">${genreList.map(esc).join(', ')}</div>`;
         if (castList.length) html += `<div class="si-cast">Cast: ${castList.slice(0, 6).map(esc).join(', ')}</div>`;
         if (txMatch) {
           html += `<button class="btn-view-transcript" data-recording-id="${esc(txMatch.recording_id)}" data-title="${esc(showTitle + (ep ? ' — ' + ep : ''))}">📝 View Transcript</button>`;
+        } else {
+          html += `<div class="si-no-transcript">No transcript available</div>`;
         }
         html += '</div></div>';
       });

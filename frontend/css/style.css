@@ -425,12 +425,12 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
 
 /* ---- Show title links in messages ---- */
 .show-link {
-  color: var(--primary);
+  color: #1565c0;
   text-decoration: none;
   cursor: pointer;
-  border-bottom: 1px dotted var(--primary);
+  border-bottom: 1px dotted #1565c0;
 }
-.show-link:hover { color: #fff; border-bottom-color: #fff; }
+.show-link:hover { color: #0d47a1; border-bottom-color: #0d47a1; }
 
 /* ---- Show Info Popup ---- */
 #show-info-dialog { max-width: 460px; padding: 1rem 1.2rem; }
@@ -479,6 +479,9 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
 .si-desc { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.3rem; line-height: 1.4; }
 .si-genres { font-size: 0.75rem; color: var(--primary); margin-top: 0.25rem; }
 .si-cast { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.15rem; font-style: italic; }
+.si-watched { font-size: 0.8rem; color: #22c55e; margin-top: 0.25rem; font-weight: 600; }
+.si-unwatched { font-size: 0.8rem; color: #ef4444; margin-top: 0.25rem; font-weight: 600; }
+.si-no-transcript { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; font-style: italic; }
 .si-error { color: var(--danger); }
 
 /* View Transcript button in episode cards */

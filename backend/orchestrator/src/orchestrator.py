@@ -33,6 +33,7 @@ from services.voice_session import VoiceSessionManager
 from services.tool_router import ToolRouter
 from services.agent import AgentLoop
 from services.semantic_index import SemanticIndex
+from services.entity_context import EntityContextStore
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -112,6 +113,11 @@ class Orchestrator:
 
         # Agentic tool-calling loop
         self.agent = AgentLoop(orchestrator=self)
+
+        # Conversation-scoped entity memory for multi-turn context
+        self.entity_store = EntityContextStore(
+            ttl=config.get("entity_ttl", 600.0),
+        )
 
         # Transcription queue
         self.transcription_queue = TranscriptionQueue(
@@ -309,9 +315,10 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     _FUTURE_RE = re.compile(
-        r"\b(?:record(?:s|ing)?\s+(?:today|tonight|tomorrow|this\s+week)|"
+        r"\b(?:record(?:s|ing|ed)?\s+(?:today|tonight|tomorrow|this\s+week|next\s+\w+)|"
         r"what(?:'s| is| will)\s+(?:record|schedule|on\s+tonight)|"
         r"upcoming|scheduled|will\s+record|"
+        r"next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
         r"what\s+records\b|set\s+(?:a\s+)?recording|schedule\s+recording)\b",
         re.IGNORECASE,
     )
@@ -341,6 +348,44 @@ class Orchestrator:
         return "both"
 
     # ------------------------------------------------------------------
+    # Domain classifier for tool subsetting
+    # ------------------------------------------------------------------
+
+    _DOMAIN_PATTERNS = {
+        "recordings": re.compile(
+            r"\b(?:record|episode|show|series|movie|film|watch|"
+            r"recorded|unwatched|dvr|aired|season\b.*episode)\b", re.I),
+        "schedule": re.compile(
+            r"\b(?:upcom|schedul|tonight|today|what.s on|epg|guide|"
+            r"program\s*guide|airing|will\s+record|set\s+record|"
+            r"record(?:s|ing)?\s+(?:today|tonight|tomorrow|this\s+week|next\s+\w+)|"
+            r"next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+            r"this\s+week|"
+            r"auto.record|subscribe)\b", re.I),
+        "playback": re.compile(
+            r"\b(?:play|pause|stop|skip|seek|rewind|fast.forward|"
+            r"volume|mute|unmute|channel\s*up|channel\s*down|"
+            r"commercial|resume|live\s*tv|tune)\b", re.I),
+        "system": re.compile(
+            r"\b(?:disk|memory|uptime|service|docker|container|"
+            r"log|reboot|shutdown|restart|nginx|storage|cpu)\b", re.I),
+        "metadata": re.compile(
+            r"\b(?:genre|channel|actor|cast|rating|"
+            r"how many|count|list\s+genre|what\s+genre)\b", re.I),
+        "transcript": re.compile(
+            r"\b(?:transcript|said|quote|dialogue|mention|"
+            r"spoken|word|subtitle|caption)\b", re.I),
+    }
+
+    def _classify_domain(self, prompt: str) -> list[str]:
+        """Classify query into one or more tool domains for subsetting."""
+        domains = []
+        for domain, pattern in self._DOMAIN_PATTERNS.items():
+            if pattern.search(prompt):
+                domains.append(domain)
+        return domains if domains else ["recordings", "schedule", "metadata"]
+
+    # ------------------------------------------------------------------
     # High-level orchestration methods
     # ------------------------------------------------------------------
 
@@ -362,11 +407,13 @@ class Orchestrator:
     }
 
     def _week_bounds(self, ref: datetime, offset_weeks: int) -> tuple[str, str]:
-        """Return (start, end) YYYY-MM-DD for a Mon-Sun week relative to ref."""
-        mon = ref - timedelta(days=ref.weekday())  # this Monday
-        mon += timedelta(weeks=offset_weeks)
-        sun = mon + timedelta(days=6)
-        return mon.strftime("%Y-%m-%d"), sun.strftime("%Y-%m-%d")
+        """Return (start, end) YYYY-MM-DD for a Sun-Sat week relative to ref."""
+        # Sunday = 6 in Python's weekday() (Mon=0). Shift so Sunday is day 0.
+        days_since_sun = (ref.weekday() + 1) % 7
+        sun = ref - timedelta(days=days_since_sun)  # this Sunday
+        sun += timedelta(weeks=offset_weeks)
+        sat = sun + timedelta(days=6)
+        return sun.strftime("%Y-%m-%d"), sat.strftime("%Y-%m-%d")
 
     # Phrases that signal the user is looking backward in time.
     _PAST_HINT_RE = re.compile(
@@ -431,12 +478,22 @@ class Orchestrator:
             results = None
 
         if not results:
-            # Fallback: "tonight" → today's date (dateparser may skip it)
-            tonight_re = re.compile(r"\btonight\b", re.IGNORECASE)
-            m = tonight_re.search(prompt)
-            if m:
-                date_str = now.strftime("%Y-%m-%d")
-                prompt = tonight_re.sub(f"{m.group(0)} ({date_str})", prompt, count=1)
+            # Fallback: common time-of-day phrases that dateparser misses
+            _fallback_phrases = [
+                (re.compile(r"\blast\s+night\b", re.I), -1),      # last night → yesterday
+                (re.compile(r"\btonight\b", re.I), 0),            # tonight → today
+                (re.compile(r"\bthis\s+morning\b", re.I), 0),     # this morning → today
+                (re.compile(r"\bthis\s+afternoon\b", re.I), 0),   # this afternoon → today
+                (re.compile(r"\bthis\s+evening\b", re.I), 0),     # this evening → today
+                (re.compile(r"\bearlier\s+today\b", re.I), 0),    # earlier today → today
+                (re.compile(r"\blast\s+evening\b", re.I), -1),    # last evening → yesterday
+            ]
+            for pat, day_offset in _fallback_phrases:
+                m = pat.search(prompt)
+                if m:
+                    date_str = (now + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+                    prompt = prompt[:m.end()] + f" ({date_str})" + prompt[m.end():]
+                    break  # only annotate the first match
             return prompt
 
         # Annotate every found expression with (YYYY-MM-DD), working
@@ -508,6 +565,10 @@ class Orchestrator:
             temporal = self._classify_temporal(prompt)
             logger.info("Temporal intent: %s", temporal)
 
+            # Classify domain for tool subsetting
+            domains = self._classify_domain(prompt)
+            logger.info("Domain classification: %s", domains)
+
             # Pre-fetch transcript context (PAST only — transcripts can't exist for future content)
             transcript_context = ""
             transcript_hits: list = []
@@ -559,6 +620,8 @@ class Orchestrator:
                 semantic_context=semantic_context,
                 systems=systems,
                 temporal=temporal,
+                domains=domains,
+                entity_store=self.entity_store,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
