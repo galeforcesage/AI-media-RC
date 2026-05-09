@@ -57,7 +57,7 @@ SVC_DIR[transcription]="$ROOT/backend/transcription"
 _NCPU=$(nproc 2>/dev/null || echo 4)
 _WHISPER_THREADS=$(( _NCPU / 4 > 0 ? _NCPU / 4 : 1 ))
 _FFMPEG_THREADS=$(( _WHISPER_THREADS / 2 > 0 ? _WHISPER_THREADS / 2 : 1 ))
-SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Streaming /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
+SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
 SVC_LOG[transcription]="/tmp/transcription.log"
 SVC_PORT[transcription]=8770
 
@@ -77,6 +77,11 @@ rotate_log() {
         : > "$logfile"
     fi
 }
+
+# Health check interval (seconds) — how often to verify the port is alive
+HEALTH_CHECK_INTERVAL=30
+# Consecutive health check failures before declaring dead
+HEALTH_CHECK_FAILURES=3
 
 # ── Single service watchdog ──────────────────────────────────────────
 
@@ -114,9 +119,33 @@ run_watchdog() {
         echo "$child" > "$pidfile"
         echo "[$(date '+%F %T')] $svc started (pid=$child)" >> "$wlog"
 
-        # Wait for the process to exit — returns the child's exit code
-        wait "$child" 2>/dev/null
-        local exit_code=$?
+        # ── Monitor loop: check process + port health ──
+        local health_fails=0
+        local exit_code=""
+        while true; do
+            # Check if child is still alive
+            if ! kill -0 "$child" 2>/dev/null; then
+                wait "$child" 2>/dev/null
+                exit_code=$?
+                break
+            fi
+            # Port health check — verify the service is actually listening
+            if ! ss -tlnH "sport = :$port" 2>/dev/null | grep -q "$port"; then
+                health_fails=$((health_fails + 1))
+                if (( health_fails >= HEALTH_CHECK_FAILURES )); then
+                    echo "[$(date '+%F %T')] HEALTH CHECK FAILED: $svc port $port not listening after $health_fails checks — killing pid $child" >> "$wlog"
+                    kill "$child" 2>/dev/null
+                    sleep 2
+                    kill -9 "$child" 2>/dev/null
+                    wait "$child" 2>/dev/null
+                    exit_code=1  # treat as crash
+                    break
+                fi
+            else
+                health_fails=0
+            fi
+            sleep "$HEALTH_CHECK_INTERVAL"
+        done
 
         echo "[$(date '+%F %T')] $svc exited with code $exit_code" >> "$wlog"
 
@@ -127,12 +156,9 @@ run_watchdog() {
         #   130 = SIGINT  (Ctrl-C)
         # These are almost always intentional — do NOT restart.
         # A real crash (segfault=139, abort=134) or non-zero app exit SHOULD restart.
+        # Code 0 (clean exit) also restarts — services should run forever;
+        # a clean exit is unexpected and likely a bug.
         case $exit_code in
-            0)
-                echo "[$(date '+%F %T')] $svc exited cleanly (code 0), not restarting" >> "$wlog"
-                rm -f "$pidfile"
-                break
-                ;;
             130)  # SIGINT
                 echo "[$(date '+%F %T')] $svc killed by SIGINT (code 130), not restarting" >> "$wlog"
                 rm -f "$pidfile"
@@ -147,6 +173,9 @@ run_watchdog() {
                 echo "[$(date '+%F %T')] $svc killed by SIGTERM (code 143), not restarting" >> "$wlog"
                 rm -f "$pidfile"
                 break
+                ;;
+            0)
+                echo "[$(date '+%F %T')] $svc exited cleanly (code 0) — unexpected, will restart" >> "$wlog"
                 ;;
         esac
 
@@ -189,7 +218,7 @@ start_all() {
         if is_watchdog_running "$svc"; then
             echo "  $svc: already running (watchdog pid $(cat "$PIDFILE_DIR/${svc}-watchdog.pid"))"
         else
-            run_watchdog "$svc" &
+            run_watchdog "$svc" </dev/null >>"$WATCHDOG_LOG_DIR/${svc}-watchdog.log" 2>&1 &
             disown
             echo "  $svc: watchdog started"
             # Small delay between service starts
@@ -263,7 +292,17 @@ case "${1:-}" in
         start_all
         ;;
     stop)
-        stop_all
+        svc="${2:-}"
+        if [[ -z "$svc" ]]; then
+            stop_all
+        else
+            if [[ -z "${SVC_DIR[$svc]+x}" ]]; then
+                echo "Unknown service: $svc"
+                echo "Available: ${ALL_SERVICES[*]}"
+                exit 1
+            fi
+            stop_service "$svc"
+        fi
         ;;
     status)
         status_all
@@ -275,9 +314,15 @@ case "${1:-}" in
             sleep 2
             start_all
         else
+            if [[ -z "${SVC_DIR[$svc]+x}" ]]; then
+                echo "Unknown service: $svc"
+                echo "Available: ${ALL_SERVICES[*]}"
+                exit 1
+            fi
             stop_service "$svc"
             sleep 2
-            run_watchdog "$svc" &
+            # Detach watchdog from parent stdio so ssh can return immediately
+            run_watchdog "$svc" </dev/null >>"$WATCHDOG_LOG_DIR/${svc}-watchdog.log" 2>&1 &
             disown
             echo "$svc restarted with watchdog"
         fi

@@ -318,14 +318,16 @@ class Orchestrator:
         r"\b(?:record(?:s|ing|ed)?\s+(?:today|tonight|tomorrow|this\s+week|next\s+\w+)|"
         r"what(?:'s| is| will)\s+(?:record|schedule|on\s+tonight)|"
         r"upcoming|scheduled|will\s+record|"
-        r"next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+        r"next\s+(?:week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
         r"what\s+records\b|set\s+(?:a\s+)?recording|schedule\s+recording)\b",
         re.IGNORECASE,
     )
     _PAST_RE = re.compile(
         r"\b(?:recorded|watched|transcript|was\s+on|aired|"
-        r"yesterday|last\s+(?:night|week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
-        r"what\s+(?:has\s+)?recorded|past\s+\d+\s+days?)\b",
+        r"yesterday|last\s+(?:night|week|month|year|\d+\s+(?:days?|weeks?|months?))|"
+        r"this\s+(?:year|month)|over\s+this\s+year|"
+        r"past\s+(?:\d+\s+)?(?:days?|weeks?|months?|year)|"
+        r"what\s+(?:has\s+)?recorded)\b",
         re.IGNORECASE,
     )
     _PRESENT_RE = re.compile(
@@ -359,8 +361,8 @@ class Orchestrator:
             r"\b(?:upcom|schedul|tonight|today|what.s on|epg|guide|"
             r"program\s*guide|airing|will\s+record|set\s+record|"
             r"record(?:s|ing)?\s+(?:today|tonight|tomorrow|this\s+week|next\s+\w+)|"
-            r"next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
-            r"this\s+week|"
+            r"next\s+(?:week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+            r"this\s+(?:week|month|year)|last\s+(?:week|month|year)|"
             r"auto.record|subscribe)\b", re.I),
         "playback": re.compile(
             r"\b(?:play|pause|stop|skip|seek|rewind|fast.forward|"
@@ -373,17 +375,73 @@ class Orchestrator:
             r"\b(?:genre|channel|actor|cast|rating|"
             r"how many|count|list\s+genre|what\s+genre)\b", re.I),
         "transcript": re.compile(
-            r"\b(?:transcript|said|quote|dialogue|mention|"
-            r"spoken|word|subtitle|caption)\b", re.I),
+            r"\b(?:transcripts?|said|says?|quote|dialogue|mention|"
+            r"spoken|words?\s+(?:in|from|during)|subtitle|caption|"
+            r"what\s+(?:was|were)\s+said|who\s+said|"
+            r"did\s+\S+\s+say)\b", re.I),
     }
 
+    # ── Hard-route patterns ──
+    # A1: Metadata-only — episode facts, cast, dates (no dialogue needed)
+    _METADATA_ONLY_RE = re.compile(
+        r"\b(?:air\s*date|released|premiered|episode\s*list|"
+        r"how\s+many\s+episodes?|season\s+count|how\s+many\s+seasons?|"
+        r"cast|actors?|actress|director|writer|imdb|"
+        r"which\s+episode|what\s+episode|episode\s+name|episode\s+title|"
+        r"is\s+there\s+an?\s+episode\s+(?:where|about|with)|"
+        r"when\s+(?:did|does|was)\s+\S+\s+(?:air|premiere|release|start)|"
+        r"what\s+(?:year|date)\s+(?:did|was))\b", re.I)
+
+    # A2: Transcript quote — user wants exact dialogue/words
+    _TRANSCRIPT_QUOTE_RE = re.compile(
+        r"\b(?:quote|exact\s+words?|(?:what|who|where)\s+did\s+\S+\s+say|"
+        r"did\s+(?:they|he|she|someone|anyone|\S+)\s+say|"
+        r"verbatim|dialogue|transcript\s+says?|"
+        r"line\s+(?:from|in|about)|who\s+said|what\s+(?:was|were)\s+said|"
+        r"in\s+which\s+(?:show|episode)\s+(?:did|do|does)|"
+        r"word.for.word|spoken\s+(?:line|word))\b", re.I)
+
     def _classify_domain(self, prompt: str) -> list[str]:
-        """Classify query into one or more tool domains for subsetting."""
+        """Classify query into one or more tool domains for subsetting.
+
+        Hard routes override soft pattern matching:
+        - Transcript quote mode: user wants exact dialogue → transcript only
+        - Metadata-only mode: episode facts/cast with no dialogue ask → metadata + recordings
+        """
+        # ── Hard route: transcript quote mode ──
+        if self._TRANSCRIPT_QUOTE_RE.search(prompt):
+            logger.info("Hard route → transcript (quote mode)")
+            return ["transcript"]
+
+        # ── Hard route: metadata-only ──
+        if self._METADATA_ONLY_RE.search(prompt) and not self._DOMAIN_PATTERNS["transcript"].search(prompt):
+            logger.info("Hard route → metadata-only")
+            return ["metadata", "recordings"]
+
+        # ── Soft pattern matching ──
         domains = []
         for domain, pattern in self._DOMAIN_PATTERNS.items():
             if pattern.search(prompt):
                 domains.append(domain)
         return domains if domains else ["recordings", "schedule", "metadata"]
+
+    async def _check_transcript_dependency(self, query: str) -> bool:
+        """Ask the LLM a cheap yes/no: does this query require episode dialogue?"""
+        classification_prompt = (
+            "Does answering this question REQUIRE viewing episode dialogue or transcripts? "
+            "Answer only yes or no.\n\n"
+            f"Question: {query}"
+        )
+        try:
+            result = await self.llm.generate(
+                classification_prompt,
+                params={"num_predict": 10, "temperature": 0.0},
+            )
+            answer = result.get("response", "").strip().lower()
+            return answer.startswith("yes")
+        except Exception:
+            logger.warning("Transcript dependency check failed, skipping")
+            return False
 
     # ------------------------------------------------------------------
     # High-level orchestration methods
@@ -396,8 +454,22 @@ class Orchestrator:
     )
     _THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
     _NEXT_WEEK_RE = re.compile(r"\bnext\s+week\b", re.IGNORECASE)
+    _THIS_YEAR_RE = re.compile(
+        r"\b(?:this\s+year|over\s+this\s+year|all\s+(?:this\s+)?year)\b", re.IGNORECASE
+    )
+    _LAST_YEAR_RE = re.compile(r"\blast\s+year\b", re.IGNORECASE)
+    _NEXT_YEAR_RE = re.compile(r"\bnext\s+year\b", re.IGNORECASE)
+    _THIS_MONTH_RE = re.compile(r"\bthis\s+month\b", re.IGNORECASE)
+    _LAST_MONTH_RE = re.compile(r"\blast\s+month\b", re.IGNORECASE)
+    _NEXT_MONTH_RE = re.compile(r"\bnext\s+month\b", re.IGNORECASE)
     _LAST_N_DAYS_RE = re.compile(
         r"\b(?:last|past)\s+(\d+)\s+days?\b", re.IGNORECASE
+    )
+    _LAST_N_WEEKS_RE = re.compile(
+        r"\b(?:last|past)\s+(\d+)\s+weeks?\b", re.IGNORECASE
+    )
+    _LAST_N_MONTHS_RE = re.compile(
+        r"\b(?:last|past)\s+(\d+)\s+months?\b", re.IGNORECASE
     )
 
     # dateparser settings — base config shared by all parses.
@@ -461,6 +533,78 @@ class Orchestrator:
             s, e = self._week_bounds(now, 1)
             prompt = self._NEXT_WEEK_RE.sub(
                 f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
+        m = self._THIS_YEAR_RE.search(prompt)
+        if m:
+            s = f"{now.year}-01-01"
+            e = now.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._LAST_YEAR_RE.search(prompt)
+        if m:
+            s = f"{now.year - 1}-01-01"
+            e = f"{now.year - 1}-12-31"
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._THIS_MONTH_RE.search(prompt)
+        if m:
+            s = now.strftime("%Y-%m-01")
+            e = now.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._LAST_MONTH_RE.search(prompt)
+        if m:
+            first_of_this = now.replace(day=1)
+            last_month_end = first_of_this - timedelta(days=1)
+            last_month_start = last_month_end.replace(day=1)
+            s = last_month_start.strftime("%Y-%m-%d")
+            e = last_month_end.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._NEXT_MONTH_RE.search(prompt)
+        if m:
+            # First day of next month
+            if now.month == 12:
+                nm_start = now.replace(year=now.year + 1, month=1, day=1)
+            else:
+                nm_start = now.replace(month=now.month + 1, day=1)
+            # Last day of next month
+            if nm_start.month == 12:
+                nm_end = nm_start.replace(day=31)
+            else:
+                nm_end = nm_start.replace(month=nm_start.month + 1, day=1) - timedelta(days=1)
+            s = nm_start.strftime("%Y-%m-%d")
+            e = nm_end.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._NEXT_YEAR_RE.search(prompt)
+        if m:
+            s = f"{now.year + 1}-01-01"
+            e = f"{now.year + 1}-12-31"
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._LAST_N_WEEKS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            s = (now - timedelta(weeks=n)).strftime("%Y-%m-%d")
+            e = now.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
+            return prompt
+
+        m = self._LAST_N_MONTHS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            # Approximate: 30 days per month
+            s = (now - timedelta(days=n * 30)).strftime("%Y-%m-%d")
+            e = now.strftime("%Y-%m-%d")
+            prompt = prompt[:m.end()] + f" ({s} to {e})" + prompt[m.end():]
             return prompt
 
         # ── 2) General NL date parsing via dateparser ────────────
@@ -567,16 +711,209 @@ class Orchestrator:
 
             # Classify domain for tool subsetting
             domains = self._classify_domain(prompt)
+
             logger.info("Domain classification: %s", domains)
 
             # Pre-fetch transcript context (PAST only — transcripts can't exist for future content)
-            transcript_context = ""
             transcript_hits: list = []
+
+            # Detect "metadata-about-transcripts" queries (e.g. "are there
+            # transcripts for X", "do any recordings have transcripts").
+            # FTS MATCH on these wordy questions returns junk hits that the
+            # LLM then misattributes — better to skip and let the agent
+            # call transcript_list_recent / transcript_search itself.
+            _meta_transcript_re = re.compile(
+                r"\b(?:are\s+there|do\s+(?:any|we\s+have)|is\s+there|which|what|"
+                r"any|list|show\s+me|how\s+many)\b[^?]*\btranscripts?\b",
+                re.I,
+            )
+            _is_meta_transcript = bool(_meta_transcript_re.search(prompt))
+
+            if _is_meta_transcript:
+                logger.info("Meta-transcript query — using Python fast-path")
+                # Pull a wide list of recent transcripts directly from the
+                # transcription service and answer in Python. The 7B model
+                # cannot reliably invoke the right tool with the right args
+                # for these existence/inventory questions, and any LLM
+                # involvement risks fabrication.
+                if status_callback:
+                    await status_callback("Listing recent transcripts")
+
+                # Resolve user date window from rewritten prompt
+                _qd = re.search(
+                    r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)",
+                    prompt,
+                )
+                _start_ts = _end_ts = None
+                _label = ""
+                if _qd:
+                    try:
+                        from datetime import datetime as _dt
+                        _s = _dt.strptime(_qd.group(1), "%Y-%m-%d")
+                        _e = _dt.strptime(_qd.group(2) or _qd.group(1), "%Y-%m-%d")
+                        _start_ts = int(_s.timestamp())
+                        _end_ts = int(_e.timestamp()) + 86399
+                        _label = (
+                            _qd.group(1) if not _qd.group(2)
+                            else f"{_qd.group(1)} to {_qd.group(2)}"
+                        )
+                    except Exception:
+                        pass
+
+                # Call transcript_cross_search with date filter (or list_recent
+                # as fallback) and format the result deterministically.
+                _rows: list = []
+                try:
+                    import asyncio as _aio, json as _json
+                    _r, _w = await _aio.open_connection(
+                        "127.0.0.1", 8770, limit=1024 * 1024
+                    )
+                    if _start_ts is not None:
+                        _args = {"date_from": _start_ts, "date_to": _end_ts, "limit": 100}
+                        _tool = "transcript_cross_search"
+                    else:
+                        _args = {"limit": 50}
+                        _tool = "transcript_list_recent"
+                    _w.write((_json.dumps({
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": _tool, "arguments": _args},
+                    }) + "\n").encode())
+                    await _w.drain()
+                    _line = await _aio.wait_for(_r.readline(), timeout=5.0)
+                    _w.close(); await _w.wait_closed()
+                    if _line:
+                        _resp = _json.loads(_line.decode())
+                        _content = _resp.get("result", {}).get("content", [])
+                        if _content and _content[0].get("type") == "text":
+                            _payload = _json.loads(_content[0]["text"])
+                            _data = _payload.get("data", _payload)
+                            _rows = _data.get("results") or _data.get("recent") or []
+                except Exception:
+                    logger.exception("Meta-transcript fast-path query failed")
+
+                # ── Parse Channels DVR filename into clean components ──
+                import re as _re2
+                _cdvr_pat = _re2.compile(
+                    r'^(.+?)\s+(S\d{2}E\d{2})\s+(.+?)\s+\d{4}-\d{2}-\d{2}-\d{4}$'
+                )
+
+                def _parse_title(raw: str):
+                    """Parse 'Show S01E02 Episode Title 2026-04-28-1900' → (show, ep_title, se)."""
+                    m = _cdvr_pat.match(raw)
+                    if m:
+                        return m.group(1), m.group(3), m.group(2)
+                    # Fallback: strip trailing date
+                    cleaned = _re2.sub(r'\s+\d{4}-\d{2}-\d{2}-\d{4}$', '', raw)
+                    return cleaned, "", ""
+
+                # Build a clean Python-authored answer
+                from datetime import datetime as _dt2
+                _seen: set[str] = set()
+                _items: list[str] = []
+                _enriched: list[dict] = []
+                for _r2 in _rows:
+                    _t = _r2.get("title") or "Unknown"
+                    _e = _r2.get("episode_title") or _r2.get("episode") or ""
+                    _rd = _r2.get("record_date") or _r2.get("air_date") or _r2.get("created_at")
+                    _ds = ""
+                    try:
+                        _ds = _dt2.fromtimestamp(float(_rd)).strftime("%Y-%m-%d") if _rd else ""
+                    except Exception:
+                        _ds = ""
+
+                    # Parse show name and episode from Channels DVR filename
+                    _show, _ep_parsed, _se = _parse_title(_t)
+                    if not _e:
+                        _e = _ep_parsed
+
+                    _key = f"{_show}|{_e}|{_ds}"
+                    if _key in _seen:
+                        continue
+                    _seen.add(_key)
+
+                    # Format like the LLM does: "Show" "Episode" S##E##
+                    if _e and _se:
+                        _line2 = f'- "{_show}" "{_e}" {_se}'
+                    elif _e:
+                        _line2 = f'- "{_show}" "{_e}"'
+                    elif _se:
+                        _line2 = f'- "{_show}" {_se}'
+                    else:
+                        _line2 = f'- "{_show}"'
+                    if _ds:
+                        _line2 += f" ({_ds})"
+                    _items.append(_line2)
+
+                    # Enrich row for episode cards
+                    _enriched.append({
+                        **_r2,
+                        "display_title": _show,
+                        "episode_title": _e or None,
+                        "se_label": _se or None,
+                    })
+
+                if _items:
+                    if _label:
+                        _ans = (
+                            f"Yes — transcripts are available for {len(_items)} "
+                            f"recording(s) from {_label}:\n" + "\n".join(_items)
+                        )
+                    else:
+                        _ans = (
+                            f"There are transcripts available for {len(_items)} "
+                            f"recent recording(s):\n" + "\n".join(_items)
+                        )
+                else:
+                    if _label:
+                        _ans = f"No transcripts are available for recordings from {_label}."
+                    else:
+                        _ans = "No transcripts are available."
+
+                return {
+                    "status": "ok",
+                    "llm_response": _ans,
+                    "transcript_results": _enriched[:25] if _enriched else _rows[:25],
+                    "fast_path": True,
+                }
+
+            # ── FTS pre-fetch path (date-scoped content search) ──
+            transcript_context = ""
+            transcript_hits = []
             if temporal not in ("future", "present"):
                 try:
                     if status_callback:
                         await status_callback("Searching transcripts")
-                    transcript_results = await self.search.transcript_search(prompt)
+
+                    # Extract resolved date(s) from the rewritten prompt so we
+                    # filter transcripts to the user's date window. Without this
+                    # filter, fuzzy text matches return random shows that the
+                    # LLM may falsely attribute to "last night".
+                    _date_filters: Dict[str, Any] = {}
+                    _date_label = ""
+                    _qd = re.search(
+                        r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)",
+                        prompt,
+                    )
+                    if _qd:
+                        try:
+                            from datetime import datetime as _dt
+                            _start = _dt.strptime(_qd.group(1), "%Y-%m-%d")
+                            _end_str = _qd.group(2) or _qd.group(1)
+                            _end = _dt.strptime(_end_str, "%Y-%m-%d")
+                            # Inclusive end-of-day
+                            _date_filters["date_from"] = int(_start.timestamp())
+                            _date_filters["date_to"] = int(_end.timestamp()) + 86399
+                            _date_label = (
+                                _qd.group(1) if not _qd.group(2)
+                                else f"{_qd.group(1)} to {_qd.group(2)}"
+                            )
+                        except Exception:
+                            _date_filters = {}
+
+                    transcript_results = await self.search.transcript_search(
+                        prompt, filters=_date_filters or None
+                    )
                     if isinstance(transcript_results, dict):
                         data = transcript_results.get("data", transcript_results)
                         transcript_hits = data.get("results", [])
@@ -590,11 +927,26 @@ class Orchestrator:
                             mins = int(start // 60)
                             secs = int(start % 60)
                             time_str = f"{mins}:{secs:02d}"
+                            # Include record date so the LLM can verify date claims
+                            rec_date = r.get("record_date") or r.get("air_date")
+                            date_str = ""
+                            if rec_date:
+                                try:
+                                    from datetime import datetime as _dt2
+                                    date_str = " on " + _dt2.fromtimestamp(int(rec_date)).strftime("%Y-%m-%d")
+                                except Exception:
+                                    pass
                             if ep:
-                                lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                                lines.append(f'From "{title}" - "{ep}"{date_str} at {time_str}: {snippet}')
                             else:
-                                lines.append(f'From "{title}" at {time_str}: {snippet}')
+                                lines.append(f'From "{title}"{date_str} at {time_str}: {snippet}')
                         transcript_context = "\n".join(lines)
+                    elif _date_label:
+                        # Negative result is informative — surface it so the LLM
+                        # doesn't hallucinate transcripts for the requested date.
+                        transcript_context = (
+                            f"No transcripts found for recordings on {_date_label}."
+                        )
                 except Exception:
                     logger.warning("Transcript pre-fetch failed, continuing without")
 

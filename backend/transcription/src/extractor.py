@@ -119,3 +119,46 @@ class AudioExtractor:
                 logger.debug("Cleaned up temp audio: %s", audio_path)
         except OSError as e:
             logger.warning("Failed to clean up %s: %s", audio_path, e)
+
+    async def extract_region(
+        self,
+        audio_path: str,
+        start: float,
+        end: float,
+    ) -> Optional[str]:
+        """Slice a [start, end] region from an existing WAV into a temp WAV.
+
+        Returns the path to the sliced clip, or None on failure. Used by the
+        gap-fill STT path. Caller is responsible for cleanup().
+        """
+        if end <= start or not os.path.exists(audio_path):
+            return None
+        base = Path(audio_path).stem
+        clip_path = os.path.join(
+            self.ssd_temp_dir,
+            f"{base}_gap_{int(start * 1000)}_{int(end * 1000)}.wav",
+        )
+        cmd = [
+            "nice", "-n", "19", "ionice", "-c", "3",
+            "ffmpeg", "-loglevel", "error", "-y",
+            "-ss", f"{start:.3f}",
+            "-to", f"{end:.3f}",
+            "-i", audio_path,
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            clip_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(clip_path):
+            logger.warning(
+                "Gap slice failed [%.2f-%.2f]: %s",
+                start, end, stderr.decode(errors="replace")[-200:],
+            )
+            return None
+        return clip_path

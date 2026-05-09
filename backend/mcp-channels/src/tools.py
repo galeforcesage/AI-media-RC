@@ -73,6 +73,7 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
     episode = airing.get("EpisodeNumber")
     se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
 
+    dt = datetime.datetime.fromtimestamp(int(air_time)) if air_time else None
     enriched = {
         "id": rec.get("ID", ""),
         "title": airing.get("Title", ""),
@@ -80,6 +81,7 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
         "season_episode": se,
         "channel": airing.get("Channel", ""),
         "recorded": _epoch_to_readable(int(air_time)) if air_time else "",
+        "air_date": dt.strftime("%a %b %-d") if dt else "",
         "original_date": airing.get("OriginalDate", ""),
         "duration_min": round(rec.get("Duration", 0) / 60, 1),
         "description": airing.get("FullSummary", "") or airing.get("Summary", ""),

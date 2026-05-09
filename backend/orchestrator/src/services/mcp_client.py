@@ -10,9 +10,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Map MCP client names to watchdog service names
+_WATCHDOG_SERVICE_MAP = {
+    "sagetv": "mcp-sagetv",
+    "channels": "mcp-channels",
+    "linux": "mcp-linux",
+}
+_WATCHDOG_SCRIPT = "/home/sagetv/AI-media-RC/scripts/watchdog.sh"
+# Minimum seconds between auto-restart attempts per service
+_RESTART_COOLDOWN = 120
 
 
 class MCPClient:
@@ -29,6 +41,7 @@ class MCPClient:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
         self._req_id = 0
+        self._last_restart: float = 0.0  # epoch of last auto-restart attempt
 
     async def _connect(self) -> None:
         """Establish TCP connection to the MCP server."""
@@ -43,7 +56,37 @@ class MCPClient:
             logger.warning("MCPClient[%s] connect failed: %s", self.name, exc)
             self._reader = None
             self._writer = None
+            # Auto-restart: try to bring the service back via watchdog
+            await self._try_auto_restart()
             raise ConnectionError(f"Cannot reach {self.name} MCP at {self.host}:{self.port}") from exc
+
+    async def _try_auto_restart(self) -> None:
+        """Attempt to restart the MCP service via watchdog if cooldown allows."""
+        svc_name = _WATCHDOG_SERVICE_MAP.get(self.name)
+        if not svc_name:
+            return
+        now = time.monotonic()
+        if now - self._last_restart < _RESTART_COOLDOWN:
+            logger.info("MCPClient[%s] auto-restart skipped (cooldown %ds remaining)",
+                        self.name, int(_RESTART_COOLDOWN - (now - self._last_restart)))
+            return
+        self._last_restart = now
+        logger.warning("MCPClient[%s] auto-restarting %s via watchdog", self.name, svc_name)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", _WATCHDOG_SCRIPT, "restart", svc_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode == 0:
+                logger.info("MCPClient[%s] auto-restart succeeded: %s",
+                            self.name, stdout.decode().strip())
+            else:
+                logger.warning("MCPClient[%s] auto-restart failed (code %d): %s",
+                               self.name, proc.returncode, stderr.decode().strip())
+        except Exception as e:
+            logger.warning("MCPClient[%s] auto-restart error: %s", self.name, e)
 
     async def _disconnect(self) -> None:
         """Close the TCP connection."""

@@ -171,11 +171,11 @@ class TranscriptionServer:
         },
         {
             "name": "transcript_cross_search",
-            "description": "Cross-metadata transcript search. Search transcript text with optional filters for actor, genre, channel, date range, and system.",
+            "description": "Cross-metadata transcript search. Search transcript text with optional filters for actor, genre, channel, date range, and system. If query is omitted or empty, lists transcripts matching the filters (e.g. all transcripts in a date range).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Full-text search query"},
+                    "query": {"type": "string", "description": "Full-text search query (optional — omit to list transcripts by filter only)"},
                     "actor": {"type": "string", "description": "Filter by actor name"},
                     "genre": {"type": "string", "description": "Filter by genre"},
                     "channel": {"type": "string", "description": "Filter by channel name or number"},
@@ -184,7 +184,6 @@ class TranscriptionServer:
                     "system": {"type": "string", "description": "Filter by system (sagetv/channelsdvr)"},
                     "limit": {"type": "integer", "description": "Max results (default 20)"},
                 },
-                "required": ["query"],
             },
         },
         {
@@ -264,17 +263,31 @@ class TranscriptionServer:
             store_stats = self.store.stats()
             queue_stats = self.queue.stats()
             index_stats = self.index.get_stats()
-            return self._tool_ok({**store_stats, "queue": queue_stats, "index": index_stats})
+            from . import diarization as _diar
+            diar_info = {
+                "available": _diar.is_available(),
+                "pipeline_loaded": _diar._pipeline is not None,
+            }
+            return self._tool_ok({**store_stats, "queue": queue_stats, "index": index_stats, "diarization": diar_info})
 
         elif name == "transcript_cross_search":
-            query = args.get("query", "")
-            if not query:
-                return self._tool_err("query is required")
+            query = args.get("query", "") or ""
             filters = {}
             for key in ("actor", "genre", "channel", "date_from", "date_to", "system"):
                 if args.get(key):
                     filters[key] = args[key]
             limit = args.get("limit", 20)
+            if not query.strip():
+                # No full-text query — list transcripts matching the
+                # metadata filters (e.g. date range only).
+                rows = self.index.list_recordings(filters=filters, limit=limit)
+                return self._tool_ok({
+                    "results": rows,
+                    "total": len(rows),
+                    "query": "",
+                    "filters": filters,
+                    "mode": "list",
+                })
             result = self.search_service.search(query, filters=filters, limit=limit)
             return self._tool_ok(result)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 # File extensions to watch
 MEDIA_EXTENSIONS = {".mpg", ".ts", ".mkv", ".mp4", ".avi"}
+# Paths to skip (streaming cache, temp files)
+SKIP_PATH_FRAGMENTS = {"/Streaming/", "\\Streaming\\"}
+# Filename patterns to skip (HLS chunk files etc)
+SKIP_FILENAME_RE = re.compile(r"^stream\d+\.[a-z0-9]+$", re.IGNORECASE)
 # Debounce: wait this long after last modification before processing
 DEBOUNCE_SECONDS = 30
 # Poll interval
@@ -45,12 +50,14 @@ class FileWatcher:
         system: str,
         queue: TranscriptionQueue,
         enable_live: bool = True,
+        on_file_deleted=None,
     ):
         self.name = name
         self.watch_dir = watch_dir
         self.system = system
         self.queue = queue
         self.enable_live = enable_live
+        self.on_file_deleted = on_file_deleted  # callback(recording_id: str)
         self._known_files: Dict[str, float] = {}  # path -> mtime at first sight
         self._pending: Dict[str, float] = {}  # path -> last_modified
         self._pending_size: Dict[str, int] = {}  # path -> last known size
@@ -112,6 +119,14 @@ class FileWatcher:
                 continue
 
             path_str = str(entry)
+
+            # Skip streaming cache and temp directories
+            if any(frag in path_str for frag in SKIP_PATH_FRAGMENTS):
+                continue
+            # Skip HLS chunk filenames (streamNNNN.ts etc)
+            if SKIP_FILENAME_RE.match(entry.name):
+                continue
+
             current_files.add(path_str)
 
             try:
@@ -155,6 +170,24 @@ class FileWatcher:
         # Live transcription: if exactly one file is growing, send incremental jobs
         if self.enable_live:
             self._check_live(now)
+
+        # Detect deleted files and notify callback
+        if self.on_file_deleted:
+            gone = set(self._known_files.keys()) - current_files
+            for path_str in gone:
+                recording_id = Path(path_str).stem
+                logger.info("Watcher '%s' detected deletion: %s", self.name, recording_id)
+                try:
+                    self.on_file_deleted(recording_id)
+                except Exception:
+                    logger.exception("Error handling deletion for %s", recording_id)
+                del self._known_files[path_str]
+                self._pending.pop(path_str, None)
+                self._pending_size.pop(path_str, None)
+                self._pending_first_seen.pop(path_str, None)
+                self._live_offset.pop(path_str, None)
+                self._live_queued.pop(path_str, None)
+                self._live_job_id.pop(path_str, None)
 
     def _check_live(self, now: float) -> None:
         """Queue incremental transcription if exactly one recording is in progress.

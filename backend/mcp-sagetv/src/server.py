@@ -38,6 +38,12 @@ class SageTVMCPServer:
         self._subscriptions: Dict[asyncio.StreamWriter, Set[str]] = {}
         self._poll_task: Optional[asyncio.Task] = None
         self._last_active_ids: Optional[Dict[str, Any]] = None
+        # Health tracking
+        self._sagex_available: bool = True
+        self._last_failure_time: float = 0.0
+        self._consecutive_failures: int = 0
+        self._FAILURE_THRESHOLD: int = 2  # mark offline after N failures
+        self._RECOVERY_CHECK_INTERVAL: float = 30.0  # seconds between recovery probes
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -168,6 +174,36 @@ class SageTVMCPServer:
         if tool_name == "sagetv_unsubscribe_events":
             return self._handle_unsubscribe(arguments, writer)
 
+        # ---- Health gate: if SageTV is offline, check for recovery or reject ----
+        if not self._sagex_available:
+            now = time.time()
+            if now - self._last_failure_time >= self._RECOVERY_CHECK_INTERVAL:
+                # Probe SageTV to see if it's back
+                try:
+                    await self.sagex.call("GetServerName")
+                    self._sagex_available = True
+                    self._consecutive_failures = 0
+                    logger.info("SageTV is back online")
+                except Exception:
+                    self._last_failure_time = now
+                    return {
+                        "content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "sagetv_offline",
+                            "message": "SageTV is currently offline. The system will automatically retry when it comes back.",
+                        })}],
+                        "isError": False,
+                    }
+            else:
+                return {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "success": False,
+                        "error": "sagetv_offline",
+                        "message": "SageTV is currently offline. The system will automatically retry when it comes back.",
+                    })}],
+                    "isError": False,
+                }
+
         entry = TOOL_REGISTRY.get(tool_name)
         if entry is None:
             return {
@@ -201,9 +237,30 @@ class SageTVMCPServer:
             if result.get("success"):
                 await self._fire_mutation_event(tool_name, arguments)
 
+            # Success — reset failure tracking
+            if self._consecutive_failures > 0:
+                self._consecutive_failures = 0
+                logger.info("SageTV connection recovered")
+
             return {
                 "content": [{"type": "text", "text": json.dumps(result)}],
                 "isError": not result.get("success", False),
+            }
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            # Network/connection failure — track for health gate
+            self._consecutive_failures += 1
+            self._last_failure_time = time.time()
+            if self._consecutive_failures >= self._FAILURE_THRESHOLD:
+                self._sagex_available = False
+                logger.warning("SageTV marked offline after %d consecutive failures", self._consecutive_failures)
+            logger.exception("Tool %s connection failed", tool_name)
+            return {
+                "content": [{"type": "text", "text": json.dumps({
+                    "success": False,
+                    "error": "sagetv_offline",
+                    "message": "SageTV is currently offline. The system will automatically retry when it comes back.",
+                })}],
+                "isError": False,
             }
         except Exception as exc:
             logger.exception("Tool %s failed", tool_name)

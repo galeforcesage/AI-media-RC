@@ -160,6 +160,39 @@ class WhisperEngine:
 
         return full_text, segments, transcription_info
 
+    def transcribe_clip(self, audio_path: str, time_offset: float, language: str = "en") -> List[Dict]:
+        """Transcribe a sliced clip and shift timestamps by `time_offset`.
+
+        Returns a list of {start, end, text} segments in absolute (file-wide)
+        time. Used by the gap-fill STT path.
+        """
+        if self._model is None:
+            self.load()
+        if not os.path.exists(audio_path):
+            return []
+        try:
+            segments_iter, _info = self._model.transcribe(
+                audio_path,
+                language=language,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+            )
+        except Exception:
+            logger.exception("Gap-fill transcribe failed for %s", audio_path)
+            return []
+        out: List[Dict] = []
+        for seg in segments_iter:
+            text = seg.text.strip()
+            if not text:
+                continue
+            out.append({
+                "start": round(seg.start + time_offset, 2),
+                "end": round(seg.end + time_offset, 2),
+                "text": text,
+            })
+        return out
+
     def segments_to_vtt(self, segments: List[Dict]) -> str:
         """Convert segments to WebVTT subtitle format with optional speaker labels."""
         lines = ["WEBVTT", ""]

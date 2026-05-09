@@ -55,6 +55,30 @@ def _load_pipeline():
     try:
         from pyannote.audio import Pipeline
 
+        # pyannote 3.3.2 still passes the deprecated `use_auth_token=` kwarg
+        # down to huggingface_hub.hf_hub_download, but huggingface_hub >= 1.0
+        # removed that alias and only accepts `token=`. Wrap the function once
+        # to translate the kwarg so the upstream Pipeline keeps working.
+        try:
+            from huggingface_hub import file_download as _hf_file_download
+            _orig_dl = _hf_file_download.hf_hub_download
+            if not getattr(_orig_dl, "_aimedia_patched", False):
+                def _patched_dl(*args, **kwargs):
+                    if "use_auth_token" in kwargs and "token" not in kwargs:
+                        kwargs["token"] = kwargs.pop("use_auth_token")
+                    elif "use_auth_token" in kwargs:
+                        kwargs.pop("use_auth_token", None)
+                    return _orig_dl(*args, **kwargs)
+                _patched_dl._aimedia_patched = True  # type: ignore[attr-defined]
+                _hf_file_download.hf_hub_download = _patched_dl
+                # Also rebind the symbol that pyannote imported into its module.
+                import huggingface_hub as _hf
+                _hf.hf_hub_download = _patched_dl
+                from pyannote.audio.core import pipeline as _pa_pipeline
+                _pa_pipeline.hf_hub_download = _patched_dl
+        except Exception:
+            logger.debug("hf_hub_download patch skipped", exc_info=True)
+
         token = _get_hf_token()
         if not token:
             logger.warning(
@@ -68,7 +92,7 @@ def _load_pipeline():
         start = time.time()
         _pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            token=token,
+            use_auth_token=token,
         )
         logger.info("Diarization pipeline loaded in %.1fs", time.time() - start)
         return _pipeline

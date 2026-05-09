@@ -192,7 +192,12 @@ def _extract_recording_items(tool_name: str, result: dict) -> list[dict] | None:
         return None
     # Channels upcoming: data = {"scheduled": [...], "skipped": [...]}
     if isinstance(data, dict):
-        items = data.get("scheduled") or data.get("results") or data.get("recordings")
+        # Use explicit None checks — empty lists are valid results
+        items = data.get("scheduled")
+        if items is None:
+            items = data.get("results")
+        if items is None:
+            items = data.get("recordings")
         if isinstance(items, list):
             return items
         return None
@@ -218,6 +223,7 @@ def _format_recording_line(idx: int, rec: dict) -> str:
     air_date = rec.get("air_date", "")
     watched = rec.get("watched", rec.get("is_watched", False))
     watched_str = "Watched" if watched else "Unwatched"
+    status = rec.get("status", "available")
 
     parts = [f'{idx}. "{title}"']
     if ep_title:
@@ -227,6 +233,12 @@ def _format_recording_line(idx: int, rec: dict) -> str:
     if air_date:
         parts.append(f"— {air_date}")
     parts.append(watched_str)
+    if status == "watched_and_removed":
+        parts.append("[Removed]")
+    elif status == "failed":
+        parts.append("[Failed]")
+    elif status == "archived":
+        parts.append("[Archived]")
     return " ".join(parts)
 
 
@@ -265,6 +277,17 @@ def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
             if dedup_key not in seen_keys:
                 seen_keys.add(dedup_key)
                 all_items.append(item)
+        # Also include failed recordings from Channels search
+        if isinstance(result, dict) and result.get("success"):
+            data = result.get("data")
+            if isinstance(data, dict):
+                for fr in data.get("failed_recordings", []):
+                    dedup_key = (fr.get("title", "") + "|" +
+                                 fr.get("episode_title", "") + "|" +
+                                 fr.get("start_time", "")).lower()
+                    if dedup_key not in seen_keys:
+                        seen_keys.add(dedup_key)
+                        all_items.append(fr)
 
     if not all_items:
         return "No recordings found."
@@ -275,6 +298,21 @@ def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
     all_items.sort(key=_sort_key)
 
     lines = [_format_recording_line(i + 1, rec) for i, rec in enumerate(all_items)]
+
+    # Add summary counts
+    n_avail = sum(1 for r in all_items if r.get("status", "available") == "available")
+    n_removed = sum(1 for r in all_items if r.get("status") == "watched_and_removed")
+    n_failed = sum(1 for r in all_items if r.get("status") == "failed")
+    if n_removed or n_failed:
+        summary_parts = [f"{n_avail} available on the DVR"]
+        if n_removed:
+            summary_parts.append(f"{n_removed} removed")
+        if n_failed:
+            summary_parts.append(f"{n_failed} failed")
+        lines.append(f"\n({', '.join(summary_parts)})")
+    else:
+        lines.append("\n(Only recordings still on the DVR can be reported.)")
+
     return "\n".join(lines)
 
 
@@ -319,7 +357,10 @@ Services: linux_service_status(service_name) | linux_restart_service(service_nam
 Danger: linux_reboot_server() | linux_shutdown_server() | linux_restart_nginx()
 
 ## Transcript Tools (PAST ONLY — transcripts cannot exist for unaired content)
-transcript_search(query, limit?) | transcript_cross_search(query, actor?, genre?, channel?, date_from?, date_to?, limit?) | transcript_actors(actor_name, limit?) | transcript_stats() | transcript_get(recording_id) | transcript_recording_summary(recording_id) | transcript_jobs(status?) | transcript_reindex(directory?)
+transcript_cross_search(query, actor?, genre?, channel?, date_from?, date_to?, limit?) — FULL-TEXT search of transcript dialogue/spoken words. Use for "who said X", "what episode mentioned Y", finding quotes.
+transcript_search(query, limit?) — search transcript metadata (titles/episodes). Use for "does X have a transcript".
+transcript_list_recent(limit?) — list recordings that have transcripts, newest first. Use for "what recordings have transcripts".
+transcript_actors(actor_name, limit?) | transcript_stats() | transcript_get(recording_id) | transcript_recording_summary(recording_id) | transcript_jobs(status?) | transcript_reindex(directory?)
 """,
 }
 
@@ -774,10 +815,10 @@ class AgentLoop:
             except Exception as exc:
                 logger.warning("Could not discover %s tools for OpenAI format: %s", label, exc)
 
-        # Add transcript tools (filtered to essential + domain)
+        # Add transcript tools — always include (they're small and critical for routing)
         for t in self._TRANSCRIPT_TOOLS_OPENAI:
             fn_name = t["function"]["name"]
-            if fn_name in self._ESSENTIAL_TOOLS and self._tool_matches_domain(fn_name):
+            if fn_name in self._ESSENTIAL_TOOLS:
                 tools.append(t)
                 # Cache transcript schemas for validation
                 fn = t["function"]
@@ -969,6 +1010,10 @@ class AgentLoop:
             "- 'what's on today' = BOTH past + future → call search_recordings AND get_upcoming_recordings.\n"
             "- If temporal intent is unclear, return BOTH past + future results.\n"
             "- Transcript tools are PAST ONLY — transcripts cannot exist for unaired content.\n"
+            "- For 'who said X', 'what episode mentioned X', quotes, dialogue content → use transcript_cross_search (searches spoken words).\n"
+            "- For 'what recordings have transcripts', 'recent transcripts' → use transcript_list_recent.\n"
+            "- For 'does show X have a transcript' → use transcript_search with the show name.\n"
+            "- NEVER use DVR recording search tools (channels_search_recordings, sagetv_search_recordings) for transcript questions.\n"
             "- 'play recording' / 'delete recording' = PAST (the recording already exists).\n"
             "- 'record this show' / 'set recording' = FUTURE (verb overrides noun).\n\n"
 
@@ -1124,10 +1169,29 @@ class AgentLoop:
                 f"{semantic_context}"
             )
         if transcript_context:
-            context_parts.append(
-                "Relevant transcript excerpts (pre-searched for context):\n"
-                f"{transcript_context}"
-            )
+            # If the pre-fetch produced an authoritative list of recent
+            # transcripts (header starts with "Recent transcripts available"),
+            # tell the LLM it has the complete answer and should not call
+            # transcript_list_recent again.
+            if transcript_context.startswith("Recent transcripts available"):
+                context_parts.append(
+                    "AUTHORITATIVE transcript inventory (this is the complete list — "
+                    "do NOT call transcript_list_recent or transcript_search; "
+                    "answer directly from this list, filtering by the date(s) "
+                    "the user asked about):\n"
+                    f"{transcript_context}"
+                )
+            elif transcript_context.startswith("No transcripts"):
+                context_parts.append(
+                    "AUTHORITATIVE transcript inventory (do NOT call any "
+                    "transcript_ tool — answer directly from this):\n"
+                    f"{transcript_context}"
+                )
+            else:
+                context_parts.append(
+                    "Relevant transcript excerpts (pre-searched for context):\n"
+                    f"{transcript_context}"
+                )
 
         if context_parts:
             user_content = (
@@ -1900,13 +1964,17 @@ class AgentLoop:
         props = schema.get("properties", {})
         required = set(schema.get("required", []))
 
-        # IAN: check for unknown parameter names
+        # IAN: drop unknown parameter names with a warning instead of erroring.
+        # Hard-failing causes 7B models to abandon the task entirely; silently
+        # discarding extras lets the call succeed with the valid params.
         unknown_params = set(args.keys()) - set(props.keys()) - {"_confirmed"}
         if unknown_params:
-            return {
-                "error": f"Unknown parameter(s) {list(unknown_params)} for {tool_name}. "
-                f"Valid parameters: {list(props.keys())}"
-            }
+            logger.warning(
+                "Stripping unknown parameter(s) %s from %s call (valid: %s)",
+                list(unknown_params), tool_name, list(props.keys()),
+            )
+            for k in unknown_params:
+                args.pop(k, None)
 
         # Check required parameters are present
         missing = required - set(args.keys())

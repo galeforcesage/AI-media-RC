@@ -72,6 +72,16 @@ class MetadataEnrichmentPipeline:
             if not metadata.get("title"):
                 metadata["title"] = recording_id
 
+            # 1b. Fallback: extract record_date from filename if metadata didn't provide it
+            if not metadata.get("record_date"):
+                fname = job.get("file_path") or recording_id
+                parsed_epoch = self._extract_date_from_filename(fname)
+                if parsed_epoch:
+                    metadata["record_date"] = parsed_epoch
+                    if not metadata.get("air_date"):
+                        metadata["air_date"] = parsed_epoch
+                    logger.info("Extracted record_date from filename for %s: %d", recording_id, parsed_epoch)
+
             # 2. Extract actors
             actors = metadata.get("actors", [])
 
@@ -339,6 +349,30 @@ class MetadataEnrichmentPipeline:
             "source_id": show.get("ExternalID") or show.get("externalID"),
             "actors": actors,
         }
+
+    @staticmethod
+    def _extract_date_from_filename(name: str) -> Optional[int]:
+        """Extract record_date epoch from Channels DVR filename pattern.
+
+        Channels DVR filenames end with YYYY-MM-DD-HHMM (e.g.,
+        'NCIS S23E19 Deal With the Devil 2026-05-05-1900.mpg').
+        Returns epoch seconds or None.
+        """
+        import re
+        # Match YYYY-MM-DD-HHMM at end of stem (strip extension first)
+        stem = os.path.splitext(os.path.basename(name))[0] if "/" in name or "\\" in name else name
+        m = re.search(r'(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$', stem)
+        if m:
+            from datetime import datetime
+            try:
+                dt = datetime(
+                    int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    int(m.group(4)), int(m.group(5))
+                )
+                return int(dt.timestamp())
+            except (ValueError, OSError):
+                return None
+        return None
 
     @staticmethod
     def _parse_addr(addr: str) -> tuple[str, int]:

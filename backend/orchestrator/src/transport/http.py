@@ -228,12 +228,33 @@ async def search(
 async def search_transcripts(
     q: str = Query(..., min_length=1, description="Search query"),
 ):
-    """Search transcripts by title/episode."""
+    """Search transcripts by title/episode using FTS5 cross-search index."""
     orch = _require_orchestrator()
     result = await orch.agent._call_transcription(
+        "transcript_cross_search", {"query": q, "limit": 50}
+    )
+    # Normalize response for frontend: expects {results: [{recording_id, title, episode}]}
+    if isinstance(result, dict) and result.get("success") and "data" in result:
+        data = result["data"]
+        raw_results = data.get("results", [])
+        # Deduplicate by recording_id (cross_search returns per-chunk)
+        seen = {}
+        for r in raw_results:
+            rid = r.get("recording_id", "")
+            if rid and rid not in seen:
+                seen[rid] = {
+                    "recording_id": rid,
+                    "title": r.get("title", ""),
+                    "episode": r.get("episode_title", ""),
+                    "snippet": r.get("snippet", ""),
+                    "system": r.get("system", ""),
+                }
+        return {"results": list(seen.values()), "count": len(seen)}
+    # Fallback: try legacy transcript_search
+    fallback = await orch.agent._call_transcription(
         "transcript_search", {"query": q, "limit": 50}
     )
-    return result or {"results": [], "count": 0}
+    return fallback or {"results": [], "count": 0}
 
 
 @router.get("/transcript/{recording_id}")
@@ -245,6 +266,9 @@ async def get_transcript(recording_id: str):
     )
     if isinstance(result, dict) and result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
+    # Unwrap {success, data} envelope from transcription MCP server
+    if isinstance(result, dict) and "data" in result:
+        return result["data"]
     return result
 
 
@@ -379,6 +403,25 @@ async def services():
 
     await asyncio.gather(*tasks)
 
+    # Enrich transcription service with diarization/stats info
+    if "transcription" in results and results["transcription"]["status"] == "up":
+        try:
+            orch = _require_orchestrator()
+            stats = await orch.agent._call_transcription("transcript_stats", {})
+            if isinstance(stats, dict) and "data" in stats:
+                stats = stats["data"]
+            diar = stats.get("diarization", {})
+            results["transcription"]["diarization"] = diar.get("available", False)
+            results["transcription"]["queue"] = stats.get("queue", {})
+            results["transcription"]["total_transcripts"] = stats.get("total_transcripts", 0)
+            results["transcription"]["named_shows"] = stats.get("named_shows", 0)
+            results["transcription"]["diarized_shows"] = stats.get("diarized_shows", 0)
+            results["transcription"]["cc_only_count"] = stats.get("cc_only_count", 0)
+            results["transcription"]["stt_full_count"] = stats.get("stt_full_count", 0)
+            results["transcription"]["mixed_count"] = stats.get("mixed_count", 0)
+        except Exception:
+            pass
+
     # Split results into services vs dvr_backends
     dvr_backends = {}
     for sid in list(dvr_checks.keys()):
@@ -386,3 +429,95 @@ async def services():
             dvr_backends[sid] = results.pop(sid)
 
     return {"services": results, "dvr_backends": dvr_backends}
+
+
+@router.get("/gpu")
+async def gpu_status():
+    """
+    Report GPU/CUDA availability and Ollama model placement.
+    Returns:
+        {
+          "cuda_available": bool,
+          "driver_version": str | None,
+          "gpus": [{name, memory_total_mb, memory_used_mb, utilization_pct}],
+          "error": str | None,
+          "ollama_models": [{name, size, processor, context}],
+        }
+    """
+    import asyncio
+    out: Dict[str, Any] = {
+        "cuda_available": False,
+        "driver_version": None,
+        "gpus": [],
+        "error": None,
+        "ollama_models": [],
+    }
+
+    async def _run(cmd: list[str]) -> tuple[int, str, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=4)
+            return proc.returncode or 0, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
+        except FileNotFoundError:
+            return 127, "", "command not found"
+        except asyncio.TimeoutError:
+            return 124, "", "timeout"
+        except Exception as exc:  # noqa: BLE001
+            return 1, "", str(exc)
+
+    # nvidia-smi: GPU info
+    rc, stdout, stderr = await _run([
+        "nvidia-smi",
+        "--query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    if rc == 0 and stdout.strip():
+        out["cuda_available"] = True
+        for line in stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 5:
+                if not out["driver_version"]:
+                    out["driver_version"] = parts[1]
+                try:
+                    out["gpus"].append({
+                        "name": parts[0],
+                        "memory_total_mb": int(parts[2]),
+                        "memory_used_mb": int(parts[3]),
+                        "utilization_pct": int(parts[4]),
+                    })
+                except ValueError:
+                    out["gpus"].append({"name": parts[0]})
+    else:
+        out["error"] = (stderr or stdout or "nvidia-smi unavailable").strip().splitlines()[0][:200]
+
+    # ollama ps: which models are loaded and where (CPU/GPU)
+    rc, stdout, _ = await _run(["ollama", "ps"])
+    if rc == 0 and stdout.strip():
+        lines = stdout.strip().splitlines()
+        # Skip header line
+        for line in lines[1:]:
+            # Header columns: NAME ID SIZE PROCESSOR CONTEXT UNTIL
+            # Split into max 6 chunks; PROCESSOR may be e.g. "100% CPU" or "100% GPU" or "50%/50% CPU/GPU"
+            cols = line.split()
+            if len(cols) < 6:
+                continue
+            # Reconstruct: name, id, size+unit (2 tokens), processor (2 tokens like "100% CPU"), context, until...
+            try:
+                name = cols[0]
+                size = f"{cols[2]} {cols[3]}"
+                processor = f"{cols[4]} {cols[5]}"
+                context = cols[6] if len(cols) > 6 else ""
+                out["ollama_models"].append({
+                    "name": name,
+                    "size": size,
+                    "processor": processor,
+                    "context": context,
+                })
+            except IndexError:
+                continue
+
+    return out

@@ -290,9 +290,9 @@ body {
 .msg.user, .message.user { background: var(--primary-dark); margin-left: auto; }
 .msg.assistant, .message.assistant { background: var(--surface2); }
 .msg.error, .message.error { background: #4a1c1c; border: 1px solid var(--danger); }
-.message.thinking { background: var(--surface2); color: var(--text-muted); font-style: italic; position: relative; padding-right: 2rem; }
+.message.thinking { background: var(--surface2); color: var(--text); font-style: italic; position: relative; padding-right: 2rem; }
 .message.thinking .think-current::after { content: ''; animation: dots 1.5s steps(4,end) infinite; }
-.message.thinking .think-prev { opacity: 0.5; font-size: 0.85em; line-height: 1.4; }
+.message.thinking .think-prev { opacity: 0.6; font-size: 0.85em; line-height: 1.4; }
 .message.thinking .think-current { font-weight: 500; }
 .think-cancel {
   position: absolute; top: 50%; right: 0.4rem; transform: translateY(-50%);
@@ -302,8 +302,8 @@ body {
   line-height: 1;
 }
 @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
-.message.status-log { background: var(--surface1); color: var(--text-muted); font-size: 0.8em; line-height: 1.5; padding: 0.4rem 0.75rem; font-style: italic; border-left: 2px solid var(--primary); }
-.message.status-log .status-step { opacity: 0.7; }
+.message.status-log { background: var(--surface2); color: var(--text); font-size: 0.8em; line-height: 1.5; padding: 0.4rem 0.75rem; font-style: italic; border-left: 2px solid var(--primary); }
+.message.status-log .status-step { opacity: 0.8; }
 .message.status-log .status-step:last-child { opacity: 1; }
 .msg .confirm-btns { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .msg .confirm-btns button {
@@ -324,8 +324,9 @@ body {
 }
 .episode-card {
   display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
   width: 100%;
   text-align: left;
   padding: 0.6rem 0.75rem;
@@ -334,7 +335,6 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text);
-  cursor: pointer;
   font-size: 0.9rem;
   transition: background 0.15s, border-color 0.15s;
 }
@@ -342,10 +342,42 @@ body {
   background: var(--primary-dark);
   border-color: var(--primary);
 }
-.episode-card.loading {
-  opacity: 0.5;
-  pointer-events: none;
+.episode-card .ec-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
 }
+.episode-card .ec-transcript-link {
+  font-weight: 600;
+  color: var(--primary);
+  text-decoration: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.episode-card .ec-transcript-link:hover {
+  text-decoration: underline;
+}
+.ec-play-btn {
+  flex-shrink: 0;
+  width: 2rem;
+  height: 2rem;
+  border: none;
+  border-radius: 50%;
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.9rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s;
+}
+.ec-play-btn:hover { opacity: 0.8; }
+.ec-play-btn.loading { opacity: 0.4; pointer-events: none; }
 .ec-title { font-weight: 600; }
 .ec-meta { font-size: 0.8rem; color: var(--text-muted); }
 .ec-snippet { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
@@ -543,6 +575,26 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
   max-height: 50vh;
   overflow-y: auto;
 }
+.transcript-content {
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--text);
+  padding: 0.5rem;
+  background: var(--surface2);
+  border-radius: var(--radius);
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.tx-para {
+  margin: 0.4rem 0;
+}
+.tx-speaker {
+  font-weight: 600;
+  color: var(--primary);
+  margin-right: 0.3rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
 .transcript-text.editing {
   outline: 2px solid var(--primary);
   background: var(--bg);
@@ -628,7 +680,7 @@ dialog input, dialog select {
 }
 .service-card .svc-left {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.5rem;
   min-width: 0;
 }
@@ -644,6 +696,8 @@ dialog input, dialog select {
 .svc-dot.unknown { background: var(--text-muted); }
 .svc-name { font-weight: 600; white-space: nowrap; }
 .svc-detail { color: var(--text-muted); font-size: 0.75rem; }
+.svc-info { display: flex; flex-direction: column; gap: 0.1rem; }
+.svc-extras { color: var(--text-muted); font-size: 0.7rem; font-style: italic; }
 .svc-actions { display: flex; gap: 0.3rem; flex-shrink: 0; }
 .btn-tiny {
   padding: 0.2rem 0.5rem;

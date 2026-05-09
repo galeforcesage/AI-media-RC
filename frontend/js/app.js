@@ -202,15 +202,23 @@
       else Voice.start();
     });
 
-    // Episode card clicks — search + play on bound device
+    // Episode card clicks — play button plays on bound device
     document.getElementById('messages').addEventListener('click', async (e) => {
-      const card = e.target.closest('.episode-card');
+      const playBtn = e.target.closest('.ec-play-btn');
+      if (!playBtn) return;
+      const card = playBtn.closest('.episode-card');
       if (!card) return;
       const title = card.dataset.title;
       const system = card.dataset.system || State.get().system;
       if (!title) return;
 
-      card.classList.add('loading');
+      const deviceId = State.get().deviceId;
+      if (!deviceId) {
+        UI.addMessage('Please select a playback device first.', 'error');
+        return;
+      }
+
+      playBtn.classList.add('loading');
       UI.addMessage(`Playing "${title}" on ${system}…`, 'assistant');
 
       try {
@@ -223,8 +231,19 @@
       } catch (err) {
         UI.addMessage('Playback error: ' + err.message, 'error');
       } finally {
-        card.classList.remove('loading');
+        playBtn.classList.remove('loading');
       }
+    });
+
+    // Episode card title clicks — view transcript
+    document.getElementById('messages').addEventListener('click', (e) => {
+      const link = e.target.closest('.ec-transcript-link');
+      if (!link) return;
+      e.preventDefault();
+      const recordingId = link.dataset.recordingId;
+      const txTitle = link.dataset.title;
+      if (!recordingId) return;
+      showTranscriptDialog(recordingId, txTitle);
     });
 
     // Show title clicks — search and show metadata popup
@@ -262,8 +281,13 @@
     // Transcript edit/save/cancel
     document.getElementById('transcript-edit').addEventListener('click', () => {
       const body = document.getElementById('transcript-body');
-      const pre = body.querySelector('.transcript-text');
+      const pre = body.querySelector('.transcript-text') || body.querySelector('.transcript-content');
       if (!pre) return;
+      // For speaker-labeled view, switch to plain text for editing
+      if (pre.classList.contains('transcript-content') && pre.dataset.original) {
+        pre.textContent = pre.dataset.original;
+        pre.style.whiteSpace = 'pre-wrap';
+      }
       pre.contentEditable = 'true';
       pre.classList.add('editing');
       pre.focus();
@@ -274,7 +298,7 @@
 
     document.getElementById('transcript-cancel-edit').addEventListener('click', () => {
       const body = document.getElementById('transcript-body');
-      const pre = body.querySelector('.transcript-text');
+      const pre = body.querySelector('.transcript-text') || body.querySelector('.transcript-content');
       if (!pre) return;
       pre.contentEditable = 'false';
       pre.classList.remove('editing');
@@ -286,7 +310,7 @@
 
     document.getElementById('transcript-save').addEventListener('click', async () => {
       const body = document.getElementById('transcript-body');
-      const pre = body.querySelector('.transcript-text');
+      const pre = body.querySelector('.transcript-text') || body.querySelector('.transcript-content');
       if (!pre) return;
       const recordingId = pre.dataset.recordingId;
       const newText = pre.textContent;
@@ -326,7 +350,7 @@
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-        if (tab.dataset.tab === 'services') refreshServices();
+        if (tab.dataset.tab === 'services' || tab.dataset.tab === 'system' || tab.dataset.tab === 'transcription') refreshServices();
       });
     });
 
@@ -453,8 +477,16 @@
       const data = await API.services();
       if (data.services) UI.renderServiceGrid(data.services);
       if (data.dvr_backends) UI.renderDvrGrid(data.dvr_backends);
+      if (data.services && data.services.transcription) UI.renderTranscriptionTab(data.services.transcription);
     } catch (e) {
       console.error('Failed to refresh services:', e);
+    }
+    try {
+      const gpu = await API.gpu();
+      UI.renderGpuGrid(gpu);
+    } catch (e) {
+      console.error('Failed to refresh GPU info:', e);
+      UI.renderGpuGrid(null);
     }
   }
 
@@ -670,11 +702,17 @@
           return (show === sq || show.includes(sq)) &&
                  (ep === epQ || ep.includes(epQ));
         });
-        // Fallback: show all episodes of that show if exact episode not found
+        // Fallback: show all episodes of the EXACT show title only
         if (exact.length === 0) {
-          exact = items.filter(r => {
+          // Prefer exact title match; only use substring if no exact matches exist
+          const exactShow = items.filter(r => getShowTitle(r).toLowerCase() === sq);
+          const fuzzyShow = exactShow.length > 0 ? exactShow : items.filter(r => {
             const show = getShowTitle(r).toLowerCase();
-            return show === sq || show.includes(sq);
+            return show.startsWith(sq + ':') || show.startsWith(sq + ' ');
+          });
+          exact = fuzzyShow.length > 0 ? fuzzyShow : items.filter(r => {
+            const show = getShowTitle(r).toLowerCase();
+            return show === sq;
           });
         }
       } else {
@@ -753,10 +791,19 @@
         // Find matching transcript by title+episode
         const epLower = ep.toLowerCase();
         const showLower = showTitle.toLowerCase();
-        const txMatch = txResults.find(t =>
-          t.title && t.title.toLowerCase() === showLower &&
-          (!ep || (t.episode && t.episode.toLowerCase() === epLower))
-        );
+        const txMatch = txResults.find(t => {
+          if (!t.title) return false;
+          const tLower = t.title.toLowerCase();
+          // Exact match on title field
+          if (tLower === showLower) return !ep || (t.episode && t.episode.toLowerCase() === epLower);
+          // FTS5 titles include show+episode+date as recording_id; check if it starts with show name
+          if (tLower.startsWith(showLower + ' ') || tLower.includes(showLower)) {
+            // If we have an episode name, verify it appears in the title string
+            if (ep) return tLower.includes(epLower);
+            return true;
+          }
+          return false;
+        });
 
         html += '<div class="show-info-card">';
         if (img) html += `<img class="si-thumb" src="${esc(img)}" alt="" loading="lazy">`;
@@ -828,9 +875,18 @@
         html += `<div class="transcript-keywords">${data.keywords.map(k => `<span class="tx-keyword">${esc(k)}</span>`).join(' ')}</div>`;
       }
 
-      // Transcript text
+      // Transcript text — prefer VTT (segment timing → paragraphing). Falls back
+      // to the flat blob only if no VTT is stored.
       const text = data.transcript || '(No transcript text available)';
-      html += `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
+      let displayHtml;
+      if (data.vtt && data.vtt.includes('<v ')) {
+        displayHtml = formatVttWithSpeakers(data.vtt);
+      } else if (data.vtt && data.vtt.includes('-->')) {
+        displayHtml = formatVttAsParagraphs(data.vtt);
+      } else {
+        displayHtml = `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
+      }
+      html += `<div class="transcript-content" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${displayHtml}</div>`;
 
       bodyEl.innerHTML = html;
       actionsEl.hidden = false;
@@ -843,6 +899,104 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  function formatVttWithSpeakers(vtt) {
+    const lines = vtt.split('\n');
+    let html = '';
+    let currentSpeaker = null;
+    let paragraph = [];
+
+    for (const line of lines) {
+      if (line.startsWith('WEBVTT') || /^\d+$/.test(line.trim()) || /-->/.test(line) || !line.trim()) continue;
+      const speakerMatch = line.match(/^<v\s+([^>]+)>(.*)/);
+      if (speakerMatch) {
+        const speaker = speakerMatch[1];
+        const text = speakerMatch[2].trim();
+        if (speaker !== currentSpeaker) {
+          if (paragraph.length) {
+            html += `<p class="tx-para"><span class="tx-speaker">${esc(currentSpeaker)}</span> ${paragraph.map(esc).join(' ')}</p>`;
+          }
+          currentSpeaker = speaker;
+          paragraph = text ? [text] : [];
+        } else if (text) {
+          paragraph.push(text);
+        }
+      } else {
+        paragraph.push(line.trim());
+      }
+    }
+    if (paragraph.length && currentSpeaker) {
+      html += `<p class="tx-para"><span class="tx-speaker">${esc(currentSpeaker)}</span> ${paragraph.map(esc).join(' ')}</p>`;
+    }
+    return html || '<pre class="transcript-text">(No speaker data)</pre>';
+  }
+
+  // Parse VTT cues into paragraphs using time gaps + sentence boundaries.
+  // No speaker tags required — works for plain CC and STT transcripts.
+  function formatVttAsParagraphs(vtt) {
+    const cues = parseVttCues(vtt);
+    if (!cues.length) return '<pre class="transcript-text">(Empty transcript)</pre>';
+
+    const PARA_GAP_S = 2.5;          // pause that forces a new paragraph
+    const PARA_MIN_WORDS = 40;       // don't break paragraphs that are too short
+    const PARA_MAX_WORDS = 120;      // soft cap; flush at next sentence end after this
+
+    const paragraphs = [];
+    let buf = [];
+    let bufWords = 0;
+    let prevEnd = 0;
+
+    const flush = () => {
+      if (!buf.length) return;
+      paragraphs.push(buf.join(' ').replace(/\s+/g, ' ').trim());
+      buf = [];
+      bufWords = 0;
+    };
+
+    for (let i = 0; i < cues.length; i++) {
+      const cue = cues[i];
+      const gap = cue.start - prevEnd;
+      const endsSentence = /[.!?]['")\]]?$/.test(buf.length ? buf[buf.length - 1] : '');
+
+      if (buf.length && (
+        (gap >= PARA_GAP_S && bufWords >= PARA_MIN_WORDS && endsSentence) ||
+        (bufWords >= PARA_MAX_WORDS && endsSentence) ||
+        (gap >= PARA_GAP_S * 2 && bufWords >= 15)
+      )) {
+        flush();
+      }
+      buf.push(cue.text);
+      bufWords += cue.text.split(/\s+/).length;
+      prevEnd = cue.end;
+    }
+    flush();
+
+    return paragraphs.map(p => `<p class="tx-para">${esc(p)}</p>`).join('');
+  }
+
+  function parseVttCues(vtt) {
+    const cues = [];
+    const lines = vtt.split(/\r?\n/);
+    let i = 0;
+    while (i < lines.length) {
+      const m = lines[i].match(/(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})/);
+      if (m) {
+        const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+        const end   = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+        const buf = [];
+        i++;
+        while (i < lines.length && lines[i].trim() !== '') {
+          buf.push(lines[i].replace(/<v\s+[^>]+>/g, '').trim());
+          i++;
+        }
+        const text = buf.join(' ').replace(/\s+/g, ' ').trim();
+        if (text) cues.push({ start, end, text });
+      } else {
+        i++;
+      }
+    }
+    return cues;
   }
 
   async function sendPlayback(action, params = {}) {

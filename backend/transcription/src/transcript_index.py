@@ -249,6 +249,81 @@ class TranscriptIndex:
         ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _coerce_date_to_epoch(value: Any, end_of_day: bool = False) -> Optional[int]:
+        """Accept Unix epoch (int/str) or ISO YYYY-MM-DD; return epoch seconds."""
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+        try:
+            from datetime import datetime as _dt
+            s = str(value).strip()
+            # Accept "YYYY-MM-DD" or full ISO
+            if len(s) == 10 and s[4] == "-" and s[7] == "-":
+                d = _dt.strptime(s, "%Y-%m-%d")
+            else:
+                d = _dt.fromisoformat(s.replace("Z", "+00:00"))
+            ts = int(d.timestamp())
+            if end_of_day:
+                ts += 86399
+            return ts
+        except Exception:
+            logger.warning("Could not parse date filter: %r", value)
+            return None
+
+    def list_recordings(
+        self,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List recordings (with transcripts) matching metadata filters.
+
+        Used when the caller wants ``transcript_cross_search`` semantics
+        but has no full-text query — e.g. "list transcripts recorded
+        between X and Y".
+        """
+        filters = filters or {}
+        conditions: list[str] = []
+        params: list = []
+        if filters.get("actor"):
+            conditions.append(
+                "recording_id IN (SELECT recording_id FROM actors WHERE actor_name LIKE ?)"
+            )
+            params.append(f"%{filters['actor']}%")
+        if filters.get("genre"):
+            conditions.append("genre LIKE ?")
+            params.append(f"%{filters['genre']}%")
+        if filters.get("channel"):
+            conditions.append("(channel = ? OR channel_number = ?)")
+            params.extend([filters["channel"], filters["channel"]])
+        _df = self._coerce_date_to_epoch(filters.get("date_from"))
+        if _df is not None:
+            conditions.append("record_date >= ?")
+            params.append(_df)
+        _dt2 = self._coerce_date_to_epoch(filters.get("date_to"), end_of_day=True)
+        if _dt2 is not None:
+            conditions.append("record_date <= ?")
+            params.append(_dt2)
+        if filters.get("system"):
+            conditions.append("system = ?")
+            params.append(filters["system"])
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+        sql = (
+            "SELECT recording_id, title, episode_title, channel, genre, "
+            "system, record_date, air_date FROM recordings"
+            f"{where} ORDER BY record_date DESC LIMIT ?"
+        )
+        try:
+            rows = self._conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.OperationalError as e:
+            logger.error("list_recordings error: %s", e)
+            return []
+
     def search_transcripts(
         self,
         query: str,
@@ -271,12 +346,14 @@ class TranscriptIndex:
         if filters.get("channel"):
             conditions.append("(r.channel = ? OR r.channel_number = ?)")
             params.extend([filters["channel"], filters["channel"]])
-        if filters.get("date_from"):
+        _df = self._coerce_date_to_epoch(filters.get("date_from"))
+        if _df is not None:
             conditions.append("r.record_date >= ?")
-            params.append(int(filters["date_from"]))
-        if filters.get("date_to"):
+            params.append(_df)
+        _dt2 = self._coerce_date_to_epoch(filters.get("date_to"), end_of_day=True)
+        if _dt2 is not None:
             conditions.append("r.record_date <= ?")
-            params.append(int(filters["date_to"]))
+            params.append(_dt2)
         if filters.get("system"):
             conditions.append("r.system = ?")
             params.append(filters["system"])
@@ -286,7 +363,7 @@ class TranscriptIndex:
 
         sql = f"""
             SELECT r.recording_id, r.title, r.episode_title, r.channel,
-                   r.genre, r.system,
+                   r.genre, r.system, r.record_date, r.air_date,
                    tc.chunk_index, tc.start_time, tc.end_time,
                    snippet(transcript_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
                    rank

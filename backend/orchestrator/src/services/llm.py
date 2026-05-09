@@ -122,6 +122,8 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            if params:
+                payload["options"].update(params)
             if "qwen3" in self.model:
                 payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)

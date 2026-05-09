@@ -19,9 +19,11 @@ const UI = (() => {
     'settings-dialog', 'admin-dialog',
     'setting-default-system', 'setting-api-url',
     'device-list', 'system-output',
-    'transcription-stats', 'transcription-jobs',
+    'transcription-grid',
     'service-grid',
     'dvr-grid',
+    'gpu-grid',
+    'ollama-grid',
   ];
 
   function cacheElements() {
@@ -144,26 +146,35 @@ const UI = (() => {
 
     const heading = document.createElement('div');
     heading.className = 'episode-results-heading';
-    heading.textContent = 'Matching episodes — click to play:';
+    heading.textContent = 'Matching episodes:';
     bubble.appendChild(heading);
 
     results.forEach(r => {
-      const card = document.createElement('button');
+      const card = document.createElement('div');
       card.className = 'episode-card';
       card.dataset.recordingId = r.recording_id || '';
-      card.dataset.title = r.title || '';
+      card.dataset.title = r.display_title || r.title || '';
       card.dataset.system = r.system || '';
 
-      const title = r.title || 'Unknown';
-      const ep = r.episode_title ? ` — ${r.episode_title}` : '';
+      // Use parsed display_title if available, otherwise strip date from raw title
+      const showName = r.display_title || (r.title || 'Unknown').replace(/\s+\d{4}-\d{2}-\d{2}-\d{4}$/, '');
+      const epTitle = r.episode_title || '';
+      const se = r.se_label || '';
+      const displayTitle = epTitle
+        ? `${showName} — ${epTitle}${se ? ' ' + se : ''}`
+        : showName;
+      const linkTitle = epTitle ? `${showName} — ${epTitle}` : showName;
       const time = r.start_time != null ? ` at ${formatTime(r.start_time)}` : '';
       const channel = r.channel ? ` (${r.channel})` : '';
       const snippet = (r.snippet || '').replace(/<b>/g, '').replace(/<\/b>/g, '');
 
       card.innerHTML =
-        `<span class="ec-title">${esc(title)}${esc(ep)}</span>` +
+        `<div class="ec-text">` +
+        `<a class="ec-title ec-transcript-link" href="#" data-recording-id="${esc(r.recording_id || '')}" data-title="${esc(linkTitle)}">${esc(displayTitle)}</a>` +
         `<span class="ec-meta">${esc(channel)}${esc(time)}</span>` +
-        (snippet ? `<span class="ec-snippet">${esc(snippet.substring(0, 120))}…</span>` : '');
+        (snippet ? `<span class="ec-snippet">${esc(snippet.substring(0, 120))}…</span>` : '') +
+        `</div>` +
+        `<button class="ec-play-btn" title="Play on device">▶</button>`;
 
       bubble.appendChild(card);
     });
@@ -303,11 +314,21 @@ const UI = (() => {
       card.className = 'service-card';
       const statusCls = svc.status === 'up' ? 'up' : svc.status === 'degraded' ? 'degraded' : 'down';
       const latency = svc.latency_ms != null ? `${svc.latency_ms}ms` : '';
+
+      let detailParts = [`:${svc.port}`];
+      if (latency) detailParts.push(latency);
+
+      // Transcription extras (shown in Transcription tab now)
+      let extras = '';
+
       card.innerHTML =
         `<div class="svc-left">` +
           `<span class="svc-dot ${statusCls}"></span>` +
-          `<span class="svc-name">${esc(svc.name)}</span>` +
-          `<span class="svc-detail">:${svc.port}${latency ? ' · ' + latency : ''}</span>` +
+          `<div class="svc-info">` +
+            `<span class="svc-name">${esc(svc.name)}</span>` +
+            `<span class="svc-detail">${esc(detailParts.join(' · '))}</span>` +
+            extras +
+          `</div>` +
         `</div>` +
         `<div class="svc-actions">` +
           `<button class="btn-tiny btn-restart" data-service-id="${esc(id)}">↻ Restart</button>` +
@@ -342,15 +363,134 @@ const UI = (() => {
     el['system-output'].textContent = text;
   }
 
-  function renderTranscriptionStats(stats) {
-    if (!stats) {
-      el['transcription-stats'].innerHTML = '<p class="empty">No stats available.</p>';
+  function renderGpuGrid(info) {
+    const grid = el['gpu-grid'];
+    if (!grid) return;
+    if (!info) {
+      grid.innerHTML = '<p class="empty">No GPU info available.</p>';
       return;
     }
-    el['transcription-stats'].innerHTML = `
-      <p>Total transcripts: <strong>${stats.total || 0}</strong></p>
-      <p>Pending jobs: <strong>${stats.pending || 0}</strong></p>
-      <p>In progress: <strong>${stats.in_progress || 0}</strong></p>`;
+    const cards = [];
+    const cudaUp = !!info.cuda_available;
+    const cudaCls = cudaUp ? 'up' : 'down';
+    const cudaText = cudaUp
+      ? `Driver ${esc(info.driver_version || '?')}`
+      : `unavailable${info.error ? ' · ' + esc(info.error) : ''}`;
+    cards.push(
+      `<div class="service-card">` +
+        `<div class="svc-left">` +
+          `<span class="svc-dot ${cudaCls}"></span>` +
+          `<span class="svc-name">CUDA</span>` +
+          `<span class="svc-detail">${cudaText}</span>` +
+        `</div>` +
+      `</div>`
+    );
+    (info.gpus || []).forEach(g => {
+      const usedPct = g.memory_total_mb
+        ? Math.round((g.memory_used_mb || 0) / g.memory_total_mb * 100)
+        : null;
+      const memStr = g.memory_total_mb
+        ? `${g.memory_used_mb || 0} / ${g.memory_total_mb} MB${usedPct != null ? ' (' + usedPct + '%)' : ''}`
+        : '';
+      const utilStr = g.utilization_pct != null ? ` · util ${g.utilization_pct}%` : '';
+      cards.push(
+        `<div class="service-card">` +
+          `<div class="svc-left">` +
+            `<span class="svc-dot up"></span>` +
+            `<span class="svc-name">${esc(g.name)}</span>` +
+            `<span class="svc-detail">${memStr}${utilStr}</span>` +
+          `</div>` +
+        `</div>`
+      );
+    });
+    grid.innerHTML = cards.join('');
+
+    // Ollama models -> Services tab
+    const ollamaGrid = el['ollama-grid'];
+    if (!ollamaGrid) return;
+    const oCards = [];
+    (info.ollama_models || []).forEach(m => {
+      const onGpu = /GPU/i.test(m.processor) && !/100% CPU/i.test(m.processor);
+      const cls = onGpu ? 'up' : 'degraded';
+      oCards.push(
+        `<div class="service-card">` +
+          `<div class="svc-left">` +
+            `<span class="svc-dot ${cls}"></span>` +
+            `<span class="svc-name">${esc(m.name)}</span>` +
+            `<span class="svc-detail">${esc(m.size)} · ${esc(m.processor)}${m.context ? ' · ctx ' + esc(m.context) : ''}</span>` +
+          `</div>` +
+        `</div>`
+      );
+    });
+    if (oCards.length === 0) {
+      oCards.push(`<div class="service-card"><div class="svc-left"><span class="svc-dot unknown"></span><span class="svc-name">Ollama</span><span class="svc-detail">no models loaded</span></div></div>`);
+    }
+    ollamaGrid.innerHTML = oCards.join('');
+  }
+
+  function renderTranscriptionTab(svc) {
+    const grid = el['transcription-grid'];
+    if (!grid) return;
+    if (!svc) {
+      grid.innerHTML = '<p class="empty">Transcription service unavailable.</p>';
+      return;
+    }
+    const cards = [];
+    // Service status card
+    const statusCls = svc.status === 'up' ? 'up' : 'down';
+    const latency = svc.latency_ms != null ? `${svc.latency_ms}ms` : '';
+    cards.push(
+      `<div class="service-card"><div class="svc-left">` +
+        `<span class="svc-dot ${statusCls}"></span>` +
+        `<span class="svc-name">Transcription</span>` +
+        `<span class="svc-detail">:${svc.port}${latency ? ' · ' + latency : ''}</span>` +
+      `</div></div>`
+    );
+    // Diarization + queue
+    if (svc.diarization != null) {
+      const diarCls = svc.diarization ? 'up' : 'down';
+      const diarLabel = svc.diarization ? 'on' : 'off';
+      let queueStr = '';
+      if (svc.queue) {
+        const parts = [];
+        if (svc.queue.processing > 0) parts.push(`${svc.queue.processing} processing`);
+        if (svc.queue.pending > 0) parts.push(`${svc.queue.pending} pending`);
+        if (parts.length) queueStr = ' · ' + parts.join(' · ');
+      }
+      cards.push(
+        `<div class="service-card"><div class="svc-left">` +
+          `<span class="svc-dot ${diarCls}"></span>` +
+          `<span class="svc-name">Diarization</span>` +
+          `<span class="svc-detail">${diarLabel}${queueStr}</span>` +
+        `</div></div>`
+      );
+    }
+    // Named shows + diarized (combined info card, no status dot)
+    if (svc.named_shows != null) {
+      let detail = `${svc.named_shows} shows transcribed`;
+      if (svc.diarized_shows != null) detail += ` · ${svc.diarized_shows} with speakers`;
+      cards.push(
+        `<div class="service-card"><div class="svc-left">` +
+          `<span class="svc-name">Library</span>` +
+          `<span class="svc-detail">${detail}</span>` +
+        `</div></div>`
+      );
+    }
+    // Source breakdown: how many shows came from CC vs STT vs mixed
+    if (svc.cc_only_count != null || svc.stt_full_count != null) {
+      const cc = svc.cc_only_count || 0;
+      const stt = svc.stt_full_count || 0;
+      const mixed = svc.mixed_count || 0;
+      const parts = [`CC: ${cc}`, `STT: ${stt}`];
+      if (mixed > 0) parts.push(`Mixed: ${mixed}`);
+      cards.push(
+        `<div class="service-card"><div class="svc-left">` +
+          `<span class="svc-name">Sources</span>` +
+          `<span class="svc-detail">${esc(parts.join(' · '))}</span>` +
+        `</div></div>`
+      );
+    }
+    grid.innerHTML = cards.join('');
   }
 
   // ─── Settings Dialog ──────────────────────────────────────
@@ -401,7 +541,7 @@ const UI = (() => {
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
-    renderDeviceList, renderServiceGrid, renderDvrGrid, renderSystemOutput, renderTranscriptionStats,
+    renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab,
     openSettings, openAdmin, refreshAdminDevices,
     el: () => el,
   };

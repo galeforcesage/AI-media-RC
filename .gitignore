@@ -77,3 +77,28 @@ scripts/move_sidecars.py
 scripts/rebuild_index.py
 scripts/reset_stale_jobs.py
 scripts/test_genres.py
+
+# Throwaway scratch SQL / shell (leading underscore signals temp work)
+scripts/_*.sql
+scripts/_*.sh
+scripts/_*.py
+scripts/_*.json
+
+# One-off diagnostic shell scripts (host-specific paths, not portable)
+scripts/check_*.sh
+scripts/diag_*.sh
+scripts/diag_*.py
+scripts/verify_*.sh
+scripts/test_gpu_*.sh
+scripts/test_routing.py
+scripts/test_transcript_api.sh
+scripts/test_tx_api*.sh
+scripts/test_q_*.json
+scripts/reprocess_*.sh
+scripts/reprocess_*.py
+
+# Host-recovery scripts (CONTAIN SUDO PASSWORD — never commit)
+scripts/cleanup_r8168.sh
+scripts/diag_gpu.sh
+scripts/fix_gpu_*.sh
+scripts/force_remove_*.sh

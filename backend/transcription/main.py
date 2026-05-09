@@ -113,16 +113,24 @@ async def run(args: argparse.Namespace) -> None:
             if not channels_dirs:
                 channels_dirs = discovered.get("channelsdvr", [])
 
+        # Deletion callback — remove transcript data when media file disappears
+        def on_file_deleted(recording_id: str):
+            store.delete(recording_id)
+            server.index.delete_recording(recording_id)
+            logging.getLogger(__name__).info("Cleaned up transcript data for deleted file: %s", recording_id)
+
         # Start watchers for each discovered directory
         for i, d in enumerate(sagetv_dirs):
             name = f"sagetv-{i}" if len(sagetv_dirs) > 1 else "sagetv"
-            watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live)
+            watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live,
+                                  on_file_deleted=on_file_deleted)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching SageTV dir: %s", d)
 
         for i, d in enumerate(channels_dirs):
             name = f"channels-{i}" if len(channels_dirs) > 1 else "channels"
-            watcher = FileWatcher(name, d, "channelsdvr", queue, enable_live=not args.no_live)
+            watcher = FileWatcher(name, d, "channelsdvr", queue, enable_live=not args.no_live,
+                                  on_file_deleted=on_file_deleted)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching Channels DVR dir: %s", d)
 

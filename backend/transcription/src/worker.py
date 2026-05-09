@@ -20,6 +20,7 @@ from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .whisper_engine import WhisperEngine
 from . import diarization
+from . import cc_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -123,18 +124,124 @@ class TranscriptionWorker:
             self.queue.mark_for_retry(job.job_id, f"Extraction: {e}")
             return
 
-        # Step 2: Transcribe
-        try:
-            # Run whisper in thread pool to avoid blocking event loop
-            loop = asyncio.get_running_loop()
-            full_text, segments, info = await loop.run_in_executor(
-                None, self.engine.transcribe, audio_path
+        # Step 1.5: Try closed caption extraction (fast probe, free if no CC).
+        # Decision tree:
+        #   coverage >= 85% && max_gap < 6s        -> cc      (skip whisper)
+        #   coverage < 30% || cc_segments < 20     -> stt     (current behavior)
+        #   else                                   -> mixed   (cc + gap-fill stt)
+        # Skip CC for incremental jobs - they need whisper on the partial audio.
+        loop = asyncio.get_running_loop()
+        cc_segments: Optional[list] = None
+        cc_analysis: Optional[Dict] = None
+        transcription_mode = "stt"
+        if not is_incremental and cc_extractor.is_available():
+            try:
+                cc_segments = await loop.run_in_executor(None, cc_extractor.extract, job.file_path)
+            except Exception:
+                logger.exception("CC extraction failed for %s (non-blocking)", job.job_id)
+                cc_segments = None
+            if not cc_segments:
+                logger.info("No CC found for %s, falling back to STT", job.recording_id)
+            if cc_segments:
+                try:
+                    total_duration = await self.extractor.get_duration(job.file_path)
+                except Exception:
+                    total_duration = 0.0
+                if total_duration > 0:
+                    cc_analysis = cc_extractor.analyze(cc_segments, total_duration)
+                    logger.info(
+                        "CC analysis for %s: %d segments, %.1f%% coverage, max_gap=%.1fs",
+                        job.recording_id, cc_analysis["segment_count"],
+                        cc_analysis["coverage_pct"], cc_analysis["max_gap"],
+                    )
+                    if cc_analysis["coverage_pct"] >= 85.0 and cc_analysis["max_gap"] < 6.0:
+                        transcription_mode = "cc"
+                    elif cc_analysis["coverage_pct"] >= 30.0 and cc_analysis["segment_count"] >= 20:
+                        transcription_mode = "mixed"
+
+        # Step 2: Transcribe according to chosen mode
+        if transcription_mode == "cc":
+            # Use CC segments verbatim, strip any speaker prefixes for clean text.
+            segments = []
+            for seg in cc_segments:
+                clean_text, _hint = cc_extractor.strip_speaker_prefix(seg["text"])
+                segments.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": clean_text,
+                    "source": "cc",
+                })
+            full_text = " ".join(s["text"] for s in segments).strip()
+            info = {
+                "language": "en",
+                "language_probability": 1.0,
+                "duration": cc_analysis["last_end"] if cc_analysis else 0.0,
+                "model": "cc",
+                "elapsed_seconds": 0.0,
+                "realtime_factor": 0.0,
+            }
+            logger.info("CC-only path for %s: %d segments, skipped whisper", job.recording_id, len(segments))
+        elif transcription_mode == "mixed":
+            # Gap-fill: use CC where it covers, run whisper only on gaps >= 6s.
+            cc_clean = []
+            for seg in cc_segments:
+                clean_text, _hint = cc_extractor.strip_speaker_prefix(seg["text"])
+                cc_clean.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": clean_text,
+                })
+            gaps = cc_extractor.find_gaps(
+                cc_clean, cc_analysis["last_end"] or total_duration, min_gap=6.0, pad=0.5,
             )
-        except Exception as e:
-            logger.error("Transcription failed for %s: %s", job.job_id, e)
-            self.queue.mark_for_retry(job.job_id, f"Transcription: {e}")
-            self.extractor.cleanup(audio_path)
-            return
+            gap_total = sum(e - s for s, e in gaps)
+            logger.info(
+                "Mixed path for %s: %d CC segments + %d gap regions (%.1fs to whisper)",
+                job.recording_id, len(cc_clean), len(gaps), gap_total,
+            )
+            stt_segments: list = []
+            mix_start = time.time()
+            for gap_start, gap_end in gaps:
+                clip_path = await self.extractor.extract_region(audio_path, gap_start, gap_end)
+                if not clip_path:
+                    continue
+                try:
+                    new_segs = await loop.run_in_executor(
+                        None, self.engine.transcribe_clip, clip_path, gap_start
+                    )
+                    stt_segments.extend(new_segs)
+                except Exception:
+                    logger.exception("Gap-fill transcribe failed [%.2f-%.2f]", gap_start, gap_end)
+                finally:
+                    self.extractor.cleanup(clip_path)
+            segments = cc_extractor.merge_cc_stt(cc_clean, stt_segments)
+            full_text = " ".join(s["text"] for s in segments).strip()
+            mix_elapsed = time.time() - mix_start
+            info = {
+                "language": "en",
+                "language_probability": 1.0,
+                "duration": cc_analysis["last_end"] if cc_analysis else total_duration,
+                "model": f"cc+{self.engine.model_name}",
+                "elapsed_seconds": round(mix_elapsed, 1),
+                "realtime_factor": round(mix_elapsed / max(gap_total, 1), 2),
+            }
+            logger.info(
+                "Mixed path complete for %s: %d total segments (cc=%d, stt=%d) in %.1fs",
+                job.recording_id, len(segments), len(cc_clean), len(stt_segments), mix_elapsed,
+            )
+        else:
+            try:
+                full_text, segments, info = await loop.run_in_executor(
+                    None, self.engine.transcribe, audio_path
+                )
+                # Tag STT segments with source for downstream consumers
+                for seg in segments:
+                    seg.setdefault("source", "stt")
+            except Exception as e:
+                logger.error("Transcription failed for %s: %s", job.job_id, e)
+                self.queue.mark_for_retry(job.job_id, f"Transcription: {e}")
+                self.extractor.cleanup(audio_path)
+                return
 
         # For incremental jobs, shift segment timestamps to absolute time
         if is_incremental and start_seconds and start_seconds > 0:
@@ -175,6 +282,7 @@ class TranscriptionWorker:
             transcript=full_text,
             keywords=self._extract_keywords(full_text),
             vtt=vtt,
+            source=transcription_mode,
         )
 
         # Step 5: Store (append for incremental, overwrite otherwise)
@@ -208,8 +316,14 @@ class TranscriptionWorker:
 
     @staticmethod
     def _extract_keywords(text: str, top_n: int = 10) -> list:
-        """Simple keyword extraction (word frequency)."""
+        """Simple keyword extraction (word frequency, lightly TF-weighted).
+
+        Filters stopwords, common contractions, and high-frequency low-info words
+        (discourse markers, hedges, vocatives) so the resulting chip list is
+        actually informative rather than full of "it's", "okay", "well".
+        """
         stop_words = {
+            # articles / aux / prepositions
             "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
             "have", "has", "had", "do", "does", "did", "will", "would", "could",
             "should", "may", "might", "shall", "can", "need", "dare", "ought",
@@ -219,16 +333,56 @@ class TranscriptionWorker:
             "when", "where", "why", "how", "all", "each", "every", "both", "few",
             "more", "most", "other", "some", "such", "no", "not", "only", "own",
             "same", "so", "than", "too", "very", "just", "because", "but", "and",
-            "or", "if", "while", "that", "this", "it", "i", "you", "he", "she",
-            "we", "they", "me", "him", "her", "us", "them", "my", "your", "his",
-            "its", "our", "their", "what", "which", "who", "whom",
+            "or", "if", "while", "that", "this", "these", "those", "it", "i",
+            "you", "he", "she", "we", "they", "me", "him", "her", "us", "them",
+            "my", "your", "his", "its", "our", "their", "what", "which", "who",
+            "whom", "whose",
+            # contractions (kept whole AND split forms below also covered)
+            "i'm", "i've", "i'll", "i'd", "you're", "you've", "you'll", "you'd",
+            "he's", "he'll", "he'd", "she's", "she'll", "she'd", "it's", "it'll",
+            "we're", "we've", "we'll", "we'd", "they're", "they've", "they'll",
+            "that's", "there's", "there're", "here's", "what's", "who's", "let's",
+            "don't", "doesn't", "didn't", "won't", "wouldn't", "shouldn't",
+            "couldn't", "can't", "cannot", "isn't", "aren't", "wasn't", "weren't",
+            "haven't", "hasn't", "hadn't", "ain't", "y'all",
+            # discourse markers / hedges / vocatives that swamp TV dialogue
+            "okay", "ok", "yeah", "yes", "yep", "nope", "nah", "oh", "um", "uh",
+            "er", "ah", "ahh", "hmm", "huh", "mm", "mmm", "hey", "hi", "hello",
+            "well", "now", "like", "really", "actually", "basically", "literally",
+            "maybe", "probably", "sort", "kind", "thing", "things", "stuff",
+            "way", "time", "day", "days", "year", "years", "one", "two", "first",
+            "still", "even", "much", "many", "long", "good", "bad", "back",
+            "right", "left", "down", "up", "out", "off", "over", "about",
+            "around", "away", "got", "get", "gets", "gotten", "getting",
+            "go", "goes", "going", "gonna", "wanna", "gotta", "went", "come",
+            "comes", "coming", "came", "see", "sees", "seeing", "saw", "seen",
+            "look", "looks", "looking", "looked", "say", "says", "said",
+            "saying", "tell", "tells", "told", "telling", "think", "thinks",
+            "thought", "thinking", "know", "knows", "knew", "known", "knowing",
+            "want", "wants", "wanted", "wanting", "make", "makes", "made",
+            "making", "take", "takes", "took", "taken", "taking", "give",
+            "gives", "gave", "given", "giving", "put", "puts", "putting",
+            "let", "lets", "letting", "keep", "keeps", "kept", "keeping",
+            "please", "thanks", "thank", "sorry", "sure", "fine", "great",
+            "little", "big", "old", "new", "people", "man", "men", "woman",
+            "women", "guy", "guys", "thing", "something", "anything",
+            "everything", "nothing", "someone", "anyone", "everyone", "nobody",
+            "somebody", "anybody", "everybody",
         }
-        words = text.lower().split()
+        # Frequency map
         freq: Dict[str, int] = {}
-        for w in words:
-            w = w.strip(".,!?;:'\"()-")
-            if len(w) < 3 or w in stop_words:
+        for raw in text.lower().split():
+            w = raw.strip(".,!?;:'\"()-—–")
+            if not w or len(w) < 4 or w in stop_words:
+                continue
+            # also reject the part before an apostrophe if that's a stopword
+            # (e.g. "don" from "don't" wouldn't normally show but be safe)
+            if "'" in w and w.split("'", 1)[0] in stop_words:
                 continue
             freq[w] = freq.get(w, 0) + 1
-        sorted_words = sorted(freq.items(), key=lambda x: -x[1])
+        # Require minimum support so single mentions don't dominate
+        sorted_words = sorted(
+            ((w, c) for w, c in freq.items() if c >= 2),
+            key=lambda x: -x[1],
+        )
         return [w for w, _ in sorted_words[:top_n]]

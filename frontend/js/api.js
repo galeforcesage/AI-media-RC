@@ -156,6 +156,10 @@ const API = (() => {
     return request(`${baseUrl}/api/services`);
   }
 
+  async function gpu() {
+    return request(`${baseUrl}/api/gpu`);
+  }
+
   // Session Manager endpoints
   async function listDevices() {
     return request(`${sessionUrl}/devices`);
@@ -204,7 +208,7 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services,
+    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu,
     listDevices, bridgeDevices, bridgeStatus, addDevice, updateDevice, discoverDevices, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,

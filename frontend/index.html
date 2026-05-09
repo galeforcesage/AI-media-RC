@@ -207,21 +207,28 @@
       <div id="tab-services" class="tab-panel">
         <div class="services-header">
           <span class="services-title">AI Media RC Services</span>
-          <button id="btn-refresh-services" class="btn-tiny" title="Refresh">â†»</button>
+          <button id="btn-refresh-services" class="btn-tiny" title="Refresh">&#8635;</button>
         </div>
         <div id="service-grid" class="service-grid"></div>
+        <div class="services-header" style="margin-top:0.75rem">
+          <span class="services-title">Ollama</span>
+        </div>
+        <div id="ollama-grid" class="service-grid"></div>
+      </div>
+      <div id="tab-system" class="tab-panel">
+        <div class="services-header">
+          <span class="services-title">GPU / CUDA</span>
+        </div>
+        <div id="gpu-grid" class="service-grid"></div>
         <div class="services-header" style="margin-top:0.75rem">
           <span class="services-title">DVR Backends</span>
         </div>
         <div id="dvr-grid" class="service-grid"></div>
-      </div>
-      <div id="tab-system" class="tab-panel">
-        <button id="btn-docker-status" class="btn-small">Docker Status</button>
+        <button id="btn-docker-status" class="btn-small" style="margin-top:0.75rem">Docker Status</button>
         <div id="system-output"></div>
       </div>
       <div id="tab-transcription" class="tab-panel">
-        <div id="transcription-stats"></div>
-        <div id="transcription-jobs"></div>
+        <div id="transcription-grid" class="service-grid"></div>
       </div>
     </div>
     <div class="dialog-actions">
@@ -307,8 +314,8 @@
       <p>Loading...</p>
     </div>
     <div class="transcript-actions" id="transcript-actions" hidden>
-      <button type="button" id="transcript-edit" class="btn-small">âœï¸ Edit</button>
-      <button type="button" id="transcript-save" class="btn-small" hidden>ðŸ’¾ Save</button>
+      <button type="button" id="transcript-edit" class="btn-small">&#9998; Edit</button>
+      <button type="button" id="transcript-save" class="btn-small" hidden>&#128190; Save</button>
       <button type="button" id="transcript-cancel-edit" class="btn-small" hidden>Cancel</button>
     </div>
   </dialog>

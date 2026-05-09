@@ -50,6 +50,7 @@ class TranscriptMetadata:
     topics: List[str] = field(default_factory=list)
     scenes: List[Dict] = field(default_factory=list)
     vtt: str = ""
+    source: str = "stt"  # 'stt' | 'cc' | 'mixed' — how the transcript was produced
     created_at: float = 0.0
 
     def __post_init__(self):

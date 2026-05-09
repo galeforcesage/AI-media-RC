@@ -140,7 +140,7 @@ def _slim_recording(mf: Dict) -> Dict:
         "description": show.get("ShowDescription", ""),
         "genres": show.get("ShowCategory", ""),
         "image": show.get("ShowImage", ""),
-        "cast": show.get("ShowCast", []),
+        "cast": show.get("PeopleListInShow", []),
         "content_rating": show.get("ShowParentalRating", ""),
         "watched": bool(airing.get("IsWatched", False)),
     }
@@ -956,12 +956,11 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
                 continue
 
         if actor:
-            rec_cast = show.get("ShowCast") or []
-            if isinstance(rec_cast, str):
-                cast_str = rec_cast.lower()
-            else:
-                cast_str = " ".join(rec_cast).lower()
-            if actor.lower() not in cast_str:
+            # SageX uses PeopleInShow (comma-separated string)
+            people_str = show.get("PeopleInShow", "")
+            if not isinstance(people_str, str):
+                people_str = " ".join(str(p) for p in people_str)
+            if actor.lower() not in people_str.lower():
                 continue
 
         if genre:
