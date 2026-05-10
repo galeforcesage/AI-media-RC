@@ -76,6 +76,13 @@ def _load_pipeline():
                 _hf.hf_hub_download = _patched_dl
                 from pyannote.audio.core import pipeline as _pa_pipeline
                 _pa_pipeline.hf_hub_download = _patched_dl
+                # pyannote.audio.core.model also imports hf_hub_download
+                # directly and uses it during Model.from_pretrained.
+                try:
+                    from pyannote.audio.core import model as _pa_model
+                    _pa_model.hf_hub_download = _patched_dl
+                except Exception:
+                    logger.debug("pyannote.audio.core.model patch skipped", exc_info=True)
         except Exception:
             logger.debug("hf_hub_download patch skipped", exc_info=True)
 
