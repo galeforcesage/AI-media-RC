@@ -72,14 +72,20 @@ class MetadataEnrichmentPipeline:
             if not metadata.get("title"):
                 metadata["title"] = recording_id
 
-            # 1b. Fallback: extract record_date from filename if metadata didn't provide it
+            # 1a. Promote channels-dvr `original_air_epoch` to `air_date` if MCP
+            # supplied it (true broadcast date, not the recording date).
+            if metadata.get("original_air_epoch") and not metadata.get("air_date_epoch"):
+                metadata["air_date"] = metadata["original_air_epoch"]
+
+            # 1b. Fallback: extract record_date from filename if metadata didn't provide it.
+            # IMPORTANT: filename gives the *recording* timestamp, not the original
+            # air date. Only fill record_date here; leave air_date NULL so a future
+            # re-enrich can populate it from MCP without false data sticking.
             if not metadata.get("record_date"):
                 fname = job.get("file_path") or recording_id
                 parsed_epoch = self._extract_date_from_filename(fname)
                 if parsed_epoch:
                     metadata["record_date"] = parsed_epoch
-                    if not metadata.get("air_date"):
-                        metadata["air_date"] = parsed_epoch
                     logger.info("Extracted record_date from filename for %s: %d", recording_id, parsed_epoch)
 
             # 2. Extract actors
@@ -301,6 +307,12 @@ class MetadataEnrichmentPipeline:
                 # Normalize SageTV response structure
                 if system == "sagetv":
                     return self._normalize_sagetv_metadata(raw)
+                # Channels-DVR (and others) wrap the payload in an envelope:
+                # {"success": true, "data": {...real fields...}, "message": "..."}
+                if isinstance(raw, dict) and isinstance(raw.get("data"), dict) and (
+                    "success" in raw or "ok" in raw
+                ):
+                    return raw["data"]
                 return raw
 
             return result

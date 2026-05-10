@@ -74,6 +74,18 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
     se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
 
     dt = datetime.datetime.fromtimestamp(int(air_time)) if air_time else None
+    # Parse OriginalDate (YYYY-MM-DD) into epoch for downstream consumers
+    # (transcription enrichment, sidecars). Display string stays under
+    # `original_date`; the parsed epoch goes under `original_air_epoch`.
+    original_date_str = airing.get("OriginalDate", "")
+    original_air_epoch = None
+    if isinstance(original_date_str, str) and len(original_date_str) >= 10:
+        try:
+            original_air_epoch = int(datetime.datetime.strptime(
+                original_date_str[:10], "%Y-%m-%d"
+            ).timestamp())
+        except (ValueError, OSError):
+            original_air_epoch = None
     enriched = {
         "id": rec.get("ID", ""),
         "title": airing.get("Title", ""),
@@ -82,7 +94,12 @@ def _enrich_channels_recording(rec: Dict) -> Dict:
         "channel": airing.get("Channel", ""),
         "recorded": _epoch_to_readable(int(air_time)) if air_time else "",
         "air_date": dt.strftime("%a %b %-d") if dt else "",
-        "original_date": airing.get("OriginalDate", ""),
+        "original_date": original_date_str,
+        # Raw epoch fields for non-display consumers (transcription enrichment).
+        # `record_date` = when the DVR captured the airing (Airing.Time / CreatedAt).
+        # `original_air_epoch` = when the episode originally aired (OriginalDate).
+        "record_date": int(air_time) if air_time else None,
+        "original_air_epoch": original_air_epoch,
         "duration_min": round(rec.get("Duration", 0) / 60, 1),
         "description": airing.get("FullSummary", "") or airing.get("Summary", ""),
         "genres": airing.get("Genres", []),
@@ -299,6 +316,30 @@ async def _get_recordings(client, args: Dict, bridge=None) -> Dict:
     recordings = await client.get_recordings()
     limit = args.get("limit", 50)
     return _ok(data=_enrich_channels_recordings(recordings[:limit]), message=f"{len(recordings)} recordings total, returning {min(limit, len(recordings))}")
+
+
+async def _get_recording(client, args: Dict, bridge=None) -> Dict:
+    """Look up a single recording by its DVR ID (or filename stem)."""
+    rec_id = args.get("recording_id") or args.get("id") or ""
+    if not rec_id:
+        return _fail("missing_param", "recording_id is required")
+    recordings = await client.get_recordings()
+    # Match by exact DVR ID first, then by Path basename / filename stem.
+    target = None
+    for r in recordings:
+        if str(r.get("ID", "")) == str(rec_id):
+            target = r
+            break
+    if target is None:
+        for r in recordings:
+            path = r.get("Path", "") or ""
+            if path and (path.endswith(rec_id) or path.endswith(f"{rec_id}.mpg") or
+                         rec_id in path):
+                target = r
+                break
+    if target is None:
+        return _fail("not_found", f"No recording with id {rec_id}")
+    return _ok(data=_enrich_channels_recording(target), message="recording")
 
 
 async def _list_genres(client, args: Dict, bridge=None) -> Dict:
@@ -901,6 +942,18 @@ TOOL_REGISTRY = {
         },
         "safety": Safety.SAFE,
         "handler": _get_recordings,
+    },
+    "channels_get_recording": {
+        "description": "Get a single recording by DVR ID or filename stem (with full enriched metadata including air dates, cast, episode info).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "recording_id": {"type": "string", "description": "DVR recording ID or filename stem (without extension)"},
+            },
+            "required": ["recording_id"],
+        },
+        "safety": Safety.SAFE,
+        "handler": _get_recording,
     },
     "channels_list_genres": {
         "description": "List all distinct genres across Channels DVR recordings with counts.",
