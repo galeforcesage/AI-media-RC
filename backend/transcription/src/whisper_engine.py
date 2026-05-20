@@ -54,11 +54,12 @@ def _detect_device() -> str:
         import torch
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            vram_mb = torch.cuda.get_device_properties(0).total_mem / (1024 * 1024)
+            vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
             logger.info("GPU detected: %s (%.0f MB VRAM) — using CUDA", gpu_name, vram_mb)
             return "cuda"
     except Exception:
-        pass
+        logger.exception("GPU detection failed; falling back to CPU")
+        return "cpu"
     logger.info("No GPU detected — using CPU")
     return "cpu"
 
