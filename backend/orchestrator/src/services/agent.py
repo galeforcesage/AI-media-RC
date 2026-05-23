@@ -553,19 +553,19 @@ class AgentLoop:
             "type": "function",
             "function": {
                 "name": "transcript_cross_search",
-                "description": "Cross-metadata transcript search with optional filters for actor, genre, channel, date range.",
+                "description": "Cross-metadata transcript search. Searches transcript text with optional filters for actor, genre, channel, date range, system. If query is omitted/empty, lists transcripts matching the filters (e.g. all transcripts in a date range). Use date_from/date_to (YYYY-MM-DD) to find transcripts of recordings made within a date range — for 'this week's recordings' use the Last 7 days dates from the DATE REFERENCE.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Full-text search query"},
+                        "query": {"type": "string", "description": "Full-text search query (optional — omit to list all transcripts matching the filters)"},
                         "actor": {"type": "string", "description": "Filter by actor name"},
                         "genre": {"type": "string", "description": "Filter by genre"},
-                        "channel": {"type": "string", "description": "Filter by channel"},
-                        "date_from": {"type": "string", "description": "Filter from date (ISO)"},
-                        "date_to": {"type": "string", "description": "Filter to date (ISO)"},
+                        "channel": {"type": "string", "description": "Filter by channel name or number"},
+                        "date_from": {"type": "string", "description": "Filter from date (YYYY-MM-DD) — use ONLY dates from the DATE REFERENCE block"},
+                        "date_to": {"type": "string", "description": "Filter to date (YYYY-MM-DD) — use ONLY dates from the DATE REFERENCE block"},
+                        "system": {"type": "string", "description": "Filter by system (sagetv or channelsdvr)"},
                         "limit": {"type": "integer", "description": "Max results (default 20)"},
                     },
-                    "required": ["query"],
                 },
             },
         },
@@ -981,8 +981,12 @@ class AgentLoop:
             f"DATE REFERENCE (use these exact dates — do NOT calculate your own):\n"
             f"- Today: {today} = {today_iso}\n"
             f"- Yesterday: {yesterday_str} = {yesterday_iso}\n"
-            f"- Last 7 days: {week_ago_iso} to {today_iso}\n"
+            f"- This week / last 7 days: {week_ago_iso} to {today_iso}\n"
+            f"- Last week: {week_ago_iso} to {today_iso}\n"
             f"{day_ref}\n"
+            f"WHEN THE USER SAYS 'this week', 'last week', 'past week', 'recent', or 'lately' — "
+            f"set date_from={week_ago_iso} and date_to={today_iso}. "
+            f"NEVER use any other date. NEVER use a year other than {today_iso[:4]}.\n"
         )
 
         return (
@@ -2008,7 +2012,7 @@ class AgentLoop:
         import datetime as _dt_mod
         current_year = str(_dt_mod.date.today().year)
         _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
-        for pname in ("date", "start_date", "end_date"):
+        for pname in ("date", "start_date", "end_date", "date_from", "date_to"):
             val = args.get(pname)
             if not isinstance(val, str):
                 continue
