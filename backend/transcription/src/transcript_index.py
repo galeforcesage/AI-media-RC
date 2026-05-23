@@ -332,8 +332,15 @@ class TranscriptIndex:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         filters = filters or {}
+        # Sanitize user query for FTS5: extract alphanumeric tokens and quote each
+        # to avoid syntax errors from punctuation like '&', "'", '-', etc.
+        import re as _re
+        _tokens = [t for t in _re.findall(r"[A-Za-z0-9]+", query or "") if t]
+        if not _tokens:
+            return []
+        _fts_query = " AND ".join(f'"{t}"' for t in _tokens)
         conditions = ["transcript_fts MATCH ?"]
-        params: list = [query]
+        params: list = [_fts_query]
 
         if filters.get("actor"):
             conditions.append(

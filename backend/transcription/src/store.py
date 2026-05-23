@@ -185,14 +185,29 @@ class MetadataStore:
         return False
 
     def search(self, query: str, limit: int = 20) -> List[TranscriptMetadata]:
-        rows = self._conn.execute(
-            """SELECT t.* FROM transcripts t
-               INNER JOIN transcripts_fts f ON t.recording_id = f.recording_id
-               WHERE transcripts_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (query, limit),
-        ).fetchall()
+        # FTS5's default tokenizer breaks on punctuation (`&`, `'`, `:`, etc.) and
+        # treats unquoted bare words as a special syntax. Sanitize the user query:
+        # split into alphanumeric terms, drop empties, then quote each term so it's
+        # treated as a literal (case-insensitive prefix search via the *) and AND'd
+        # together. This way `"Georgie & Mandy's First Marriage"` becomes
+        # `"georgie" AND "mandy" AND "first" AND "marriage"`.
+        import re
+        terms = [t for t in re.findall(r"[A-Za-z0-9]+", query or "") if t]
+        if not terms:
+            return []
+        fts_query = " AND ".join(f'"{t}"' for t in terms)
+        try:
+            rows = self._conn.execute(
+                """SELECT t.* FROM transcripts t
+                   INNER JOIN transcripts_fts f ON t.recording_id = f.recording_id
+                   WHERE transcripts_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            logger.warning("FTS search failed for %r (sanitized=%r): %s", query, fts_query, exc)
+            return []
         return [self._row_to_meta(r) for r in rows]
 
     def list_recent(self, limit: int = 50) -> List[TranscriptMetadata]:
