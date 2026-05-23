@@ -788,19 +788,40 @@
         const genreList = Array.isArray(genres) ? genres : (genres ? [genres] : []);
         const castList = Array.isArray(cast) ? cast : (cast ? [cast] : []);
 
-        // Find matching transcript by title+episode
+        // Find matching transcript by title+episode.
+        // Backend may return either:
+        //   - clean fields: t.title = show, t.episode_title = full episode name
+        //   - legacy: t.title = full recording_id (with truncated episode), t.episode = ""
         const epLower = ep.toLowerCase();
         const showLower = showTitle.toLowerCase();
         const txMatch = txResults.find(t => {
           if (!t.title) return false;
           const tLower = t.title.toLowerCase();
-          // Exact match on title field
-          if (tLower === showLower) return !ep || (t.episode && t.episode.toLowerCase() === epLower);
-          // FTS5 titles include show+episode+date as recording_id; check if it starts with show name
+          const tEpTitle = (t.episode_title || '').toLowerCase();
+
+          // Preferred: clean fields. Exact show match + episode_title match.
+          if (tLower === showLower) {
+            if (!ep) return true;
+            if (tEpTitle && tEpTitle === epLower) return true;
+            if (t.episode && typeof t.episode === 'string' && t.episode.toLowerCase() === epLower) return true;
+            // Episode title set but mismatched → not our episode.
+            if (tEpTitle) return false;
+            // No episode info at all on transcript side → cautious match.
+            return false;
+          }
+
+          // Legacy: transcript title is the full recording_id including show prefix.
           if (tLower.startsWith(showLower + ' ') || tLower.includes(showLower)) {
-            // If we have an episode name, verify it appears in the title string
-            if (ep) return tLower.includes(epLower);
-            return true;
+            if (!ep) return true;
+            // Whole episode title present? Good.
+            if (tLower.includes(epLower)) return true;
+            // Recording_id often truncates the episode title (filesystem limit).
+            // Fall back to a prefix match using the first 5+ chars of the episode
+            // title, requiring it to appear after the season/episode marker (SxxEyy)
+            // or just somewhere in the trailing portion of the recording_id.
+            const epPrefix = epLower.slice(0, Math.min(15, epLower.length)).trim();
+            if (epPrefix.length >= 5 && tLower.includes(epPrefix)) return true;
+            return false;
           }
           return false;
         });

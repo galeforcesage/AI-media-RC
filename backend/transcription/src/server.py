@@ -240,9 +240,13 @@ class TranscriptionServer:
 
         if name == "transcript_search":
             results = self.store.search(args.get("query", ""), args.get("limit", 20))
-            data = [{"recording_id": r.recording_id, "title": r.title,
-                      "episode": r.episode, "word_count": r.word_count,
-                      "snippet": r.transcript[:200]} for r in results]
+            data = [self._enrich_with_index({
+                "recording_id": r.recording_id,
+                "title": r.title,
+                "episode": r.episode,
+                "word_count": r.word_count,
+                "snippet": r.transcript[:200],
+            }) for r in results]
             return self._tool_ok({"results": data, "count": len(data)})
 
         elif name == "transcript_get":
@@ -310,9 +314,13 @@ class TranscriptionServer:
         elif name == "transcript_list_recent":
             limit = args.get("limit", 10)
             recent = self.store.list_recent(limit=limit)
-            data = [{"recording_id": r.recording_id, "title": r.title,
-                      "episode": r.episode, "word_count": r.word_count,
-                      "created_at": r.created_at} for r in recent]
+            data = [self._enrich_with_index({
+                "recording_id": r.recording_id,
+                "title": r.title,
+                "episode": r.episode,
+                "word_count": r.word_count,
+                "created_at": r.created_at,
+            }) for r in recent]
             stats = self.store.stats()
             return self._tool_ok({"total": stats["total_transcripts"],
                                   "recent": data, "count": len(data)})
@@ -380,6 +388,43 @@ class TranscriptionServer:
 
     def _tool_err(self, msg):
         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": msg})}], "isError": True}
+
+    def _enrich_with_index(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge clean parsed fields from the transcript_index into a store-derived result.
+
+        The MetadataStore keeps `title` as the raw recording_id (long form, often with
+        a truncated episode title) and `episode` as a free-form string that may be empty.
+        The TranscriptIndex has cleanly parsed fields (title, episode_title, season,
+        episode number, channel, dates). Prefer the index values when present so
+        consumers (frontend, agent) can match by show + episode_title.
+        """
+        rec_id = base.get("recording_id")
+        if not rec_id:
+            return base
+        try:
+            row = self.index.get_recording(rec_id)
+        except Exception:
+            row = None
+        if not row:
+            return base
+        clean_title = row.get("title")
+        if clean_title:
+            base["title"] = clean_title
+        ep_title = row.get("episode_title")
+        if ep_title:
+            base["episode_title"] = ep_title
+        if row.get("season") is not None:
+            base["season"] = row["season"]
+        if row.get("episode") is not None:
+            base["episode_number"] = row["episode"]
+        if row.get("channel"):
+            base["channel"] = row["channel"]
+        if row.get("record_date") is not None:
+            base["record_date"] = row["record_date"]
+        if row.get("system"):
+            base["system"] = row["system"]
+        return base
+
 
     def _res(self, uri, data):
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(data)}]}
