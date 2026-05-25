@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -173,6 +174,28 @@ def _normalize_text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _parse_sxxexx(value: Any) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """Extract season/episode/episode_title from strings like 'Show S02E17 Name ...'."""
+    text = _normalize_text(value)
+    if not text:
+        return None, None, None
+
+    m = re.search(r"\bS(\d{1,2})E(\d{1,3})\b", text, flags=re.IGNORECASE)
+    if not m:
+        return None, None, None
+
+    season = _normalize_int(m.group(1))
+    episode = _normalize_int(m.group(2))
+
+    # Heuristic: use the text after SxxExx as episode title, dropping common timestamp tails.
+    tail = text[m.end():].strip(" -._")
+    tail = re.sub(r"\s+\d{4}-\d{2}-\d{2}-\d{3,4}$", "", tail).strip(" -._")
+    tail = re.sub(r"\s{2,}", " ", tail)
+    episode_title = _normalize_text(tail)
+
+    return season, episode, episode_title
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -230,10 +253,23 @@ async def main() -> None:
             failed += 1
             continue
 
+        parsed_season = parsed_episode = None
+        parsed_episode_title = None
+        for candidate in (metadata.get("title"), row["title"], rid):
+            s_val, e_val, ep_title = _parse_sxxexx(candidate)
+            if parsed_season is None and s_val is not None:
+                parsed_season = s_val
+            if parsed_episode is None and e_val is not None:
+                parsed_episode = e_val
+            if parsed_episode_title is None and ep_title:
+                parsed_episode_title = ep_title
+            if parsed_season is not None and parsed_episode is not None and parsed_episode_title:
+                break
+
         new_values: Dict[str, Any] = {
-            "episode_title": _normalize_text(metadata.get("episode_title")),
-            "season": _normalize_int(metadata.get("season")),
-            "episode": _normalize_int(metadata.get("episode")),
+            "episode_title": _normalize_text(metadata.get("episode_title")) or parsed_episode_title,
+            "season": _normalize_int(metadata.get("season")) or parsed_season,
+            "episode": _normalize_int(metadata.get("episode")) or parsed_episode,
             "channel": _normalize_text(metadata.get("channel")),
             "channel_number": _normalize_text(metadata.get("channel_number")),
             "genre": _normalize_genre(metadata.get("genre")),
