@@ -272,7 +272,15 @@ class TranscriptionServer:
                 "available": _diar.is_available(),
                 "pipeline_loaded": _diar._pipeline is not None,
             }
-            return self._tool_ok({**store_stats, "queue": queue_stats, "index": index_stats, "diarization": diar_info})
+            stale_jobs = self.queue.find_stale_jobs(stale_seconds=1800)
+            return self._tool_ok({
+                **store_stats,
+                "queue": queue_stats,
+                "index": index_stats,
+                "diarization": diar_info,
+                "stale_jobs": stale_jobs,
+                "stale_job_count": len(stale_jobs),
+            })
 
         elif name == "transcript_cross_search":
             query = args.get("query", "") or ""

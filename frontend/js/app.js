@@ -351,6 +351,7 @@
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
         if (tab.dataset.tab === 'services' || tab.dataset.tab === 'system' || tab.dataset.tab === 'transcription') refreshServices();
+        if (tab.dataset.tab === 'alerts') refreshAlerts();
       });
     });
 
@@ -430,6 +431,18 @@
     // Service grid: refresh button
     document.getElementById('btn-refresh-services').addEventListener('click', refreshServices);
 
+    // Alerts: refresh & clear
+    document.getElementById('btn-refresh-alerts').addEventListener('click', refreshAlerts);
+    document.getElementById('btn-clear-alerts').addEventListener('click', async () => {
+      if (!confirm('Clear all alerts?')) return;
+      try {
+        await API.clearAlerts();
+        refreshAlerts();
+      } catch (e) {
+        console.error('Failed to clear alerts:', e);
+      }
+    });
+
     // Auto-refresh services when admin dialog opens
     document.getElementById('admin-dialog').addEventListener('admin-opened', refreshServices);
 
@@ -487,6 +500,16 @@
     } catch (e) {
       console.error('Failed to refresh GPU info:', e);
       UI.renderGpuGrid(null);
+    }
+  }
+
+  async function refreshAlerts() {
+    try {
+      const data = await API.alerts();
+      UI.renderAlerts(data);
+    } catch (e) {
+      console.error('Failed to refresh alerts:', e);
+      UI.renderAlerts(null);
     }
   }
 

@@ -218,6 +218,37 @@ async def _restart_nginx(args: Dict) -> Dict:
 
 
 # ==================================================================
+# GPU + Alerts
+# ==================================================================
+
+async def _gpu_stats(args: Dict) -> Dict:
+    result = await system.gpu_stats()
+    gpus = result.get("gpus", [])
+    if not gpus:
+        return _ok(data=result, message="No GPU detected")
+    g = gpus[0]
+    used = g.get("memory_used_mb") or 0
+    total = g.get("memory_total_mb") or 0
+    util = g.get("utilization_pct") or 0
+    return _ok(data=result, message=f"{g.get('name')}: {used:.0f}/{total:.0f} MB, util {util:.0f}%")
+
+
+async def _get_alerts(args: Dict) -> Dict:
+    limit = int(args.get("limit", 50))
+    severity = args.get("severity")
+    since_ts = args.get("since_ts")
+    result = await system.get_alerts(limit=limit, severity=severity, since_ts=since_ts)
+    return _ok(data=result, message=f"{result.get('count', 0)} alerts")
+
+
+async def _clear_alerts(args: Dict) -> Dict:
+    result = await system.clear_alerts()
+    if "error" in result:
+        return _fail("clear_failed", result["error"])
+    return _ok(data=result, message=f"Cleared {result.get('cleared', 0)} alerts")
+
+
+# ==================================================================
 # Tool registry
 # ==================================================================
 
@@ -405,5 +436,32 @@ TOOL_REGISTRY = {
         },
         "safety": Safety.OWNER,
         "handler": _restart_nginx,
+    },
+
+    # --- GPU + Alerts ---
+    "linux_gpu_stats": {
+        "description": "Live GPU statistics via nvidia-smi: utilization, memory used/free, temperature, power draw. Returns one entry per GPU. Use for 'is the GPU being used', 'GPU memory', 'GPU temperature' questions.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "safety": Safety.SAFE,
+        "handler": _gpu_stats,
+    },
+    "linux_get_alerts": {
+        "description": "Get recent system alerts emitted by the watchdog (service crashes, crash loops, health-check failures). Each alert has ts, svc, severity (info/warning/error/critical), code, message.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max alerts to return (default 50, newest first)"},
+                "severity": {"type": "string", "description": "Filter by severity: info, warning, error, critical"},
+                "since_ts": {"type": "string", "description": "Only return alerts at or after this ISO timestamp"},
+            },
+        },
+        "safety": Safety.SAFE,
+        "handler": _get_alerts,
+    },
+    "linux_clear_alerts": {
+        "description": "Clear the alerts file. Returns count cleared. Safety: OWNER.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "safety": Safety.OWNER,
+        "handler": _clear_alerts,
     },
 }

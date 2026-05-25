@@ -63,7 +63,32 @@ SVC_PORT[transcription]=8770
 
 WATCHDOG_LOG_DIR="/tmp"
 PIDFILE_DIR="/tmp/ai-media-rc"
+ALERTS_FILE="$PIDFILE_DIR/alerts.jsonl"
+ALERTS_MAX_LINES=500
 mkdir -p "$PIDFILE_DIR"
+
+# ── Alert emission ───────────────────────────────────────────────────
+# Append a JSON line to alerts.jsonl. Each alert: {ts, svc, severity, code, message}
+# Severities: info, warning, error, critical
+emit_alert() {
+    local svc="$1" severity="$2" code="$3" message="$4"
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # JSON escape the message (basic: backslashes and double-quotes)
+    local esc_msg=${message//\\/\\\\}
+    esc_msg=${esc_msg//\"/\\\"}
+    printf '{"ts":"%s","svc":"%s","severity":"%s","code":"%s","message":"%s"}\n' \
+        "$ts" "$svc" "$severity" "$code" "$esc_msg" >> "$ALERTS_FILE"
+    # Trim to ALERTS_MAX_LINES
+    if [[ -f "$ALERTS_FILE" ]]; then
+        local lines
+        lines=$(wc -l < "$ALERTS_FILE" 2>/dev/null || echo 0)
+        if (( lines > ALERTS_MAX_LINES )); then
+            tail -n "$ALERTS_MAX_LINES" "$ALERTS_FILE" > "${ALERTS_FILE}.tmp" \
+                && mv -f "${ALERTS_FILE}.tmp" "$ALERTS_FILE"
+        fi
+    fi
+}
 
 # ── Log rotation ─────────────────────────────────────────────────────
 
@@ -134,6 +159,7 @@ run_watchdog() {
                 health_fails=$((health_fails + 1))
                 if (( health_fails >= HEALTH_CHECK_FAILURES )); then
                     echo "[$(date '+%F %T')] HEALTH CHECK FAILED: $svc port $port not listening after $health_fails checks — killing pid $child" >> "$wlog"
+                    emit_alert "$svc" "warning" "health_check_failed" "port $port not listening after $health_fails checks; killing pid $child"
                     kill "$child" 2>/dev/null
                     sleep 2
                     kill -9 "$child" 2>/dev/null
@@ -198,11 +224,13 @@ run_watchdog() {
         # Check crash-loop
         if (( ${#crash_times[@]} >= MAX_CRASHES )); then
             echo "[$(date '+%F %T')] CRASH LOOP DETECTED: $svc crashed ${#crash_times[@]} times in ${CRASH_WINDOW}s — giving up" >> "$wlog"
+            emit_alert "$svc" "critical" "crash_loop" "crashed ${#crash_times[@]} times in ${CRASH_WINDOW}s; watchdog giving up"
             rm -f "$pidfile"
             break
         fi
 
         echo "[$(date '+%F %T')] Restarting $svc in 5s (crash ${#crash_times[@]}/$MAX_CRASHES in window)" >> "$wlog"
+        emit_alert "$svc" "warning" "restart" "restarting after crash (${#crash_times[@]}/$MAX_CRASHES in ${CRASH_WINDOW}s window, exit_code=$exit_code)"
         sleep 5
     done
 }

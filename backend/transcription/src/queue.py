@@ -147,6 +147,33 @@ class TranscriptionQueue:
         ).fetchall()
         return {r["status"]: r["cnt"] for r in rows}
 
+    def find_stale_jobs(self, stale_seconds: int = 1800) -> List[Dict]:
+        """Find jobs in 'extracting' or 'processing' state that have not been
+        updated in `stale_seconds` (default 30 min). These are likely hung."""
+        cutoff = time.time() - stale_seconds
+        rows = self._conn.execute(
+            """SELECT job_id, system, recording_id, status, attempts,
+                      created_at, updated_at, error
+               FROM jobs
+               WHERE status IN ('extracting', 'processing')
+                 AND updated_at < ?
+               ORDER BY updated_at ASC""",
+            (cutoff,),
+        ).fetchall()
+        now = time.time()
+        return [
+            {
+                "job_id": r["job_id"],
+                "system": r["system"],
+                "recording_id": r["recording_id"],
+                "status": r["status"],
+                "attempts": r["attempts"],
+                "stuck_seconds": int(now - (r["updated_at"] or now)),
+                "error": r["error"],
+            }
+            for r in rows
+        ]
+
     def _row_to_job(self, row) -> TranscriptionJob:
         return TranscriptionJob(
             job_id=row["job_id"],

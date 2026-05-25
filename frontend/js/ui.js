@@ -24,6 +24,8 @@ const UI = (() => {
     'dvr-grid',
     'gpu-grid',
     'ollama-grid',
+    'alerts-list',
+    'alerts-badge',
   ];
 
   function cacheElements() {
@@ -428,6 +430,34 @@ const UI = (() => {
     ollamaGrid.innerHTML = oCards.join('');
   }
 
+  function renderAlerts(data) {
+    const list = el['alerts-list'];
+    if (!list) return;
+    const alerts = (data && data.alerts) || [];
+    const badge = el['alerts-badge'];
+    const critCount = alerts.filter(a => a.severity === 'critical' || a.severity === 'error').length;
+    if (badge) {
+      if (critCount > 0) { badge.textContent = critCount; badge.hidden = false; }
+      else { badge.hidden = true; }
+    }
+    if (alerts.length === 0) {
+      list.innerHTML = '<p class="empty">No alerts.</p>';
+      return;
+    }
+    const sevClass = s => ({ critical: 'down', error: 'down', warning: 'degraded', info: 'up' }[s] || 'unknown');
+    const cards = alerts.map(a => {
+      const ts = a.ts ? new Date(a.ts).toLocaleString() : '';
+      return `<div class="service-card alert-${esc(a.severity || 'info')}">` +
+        `<div class="svc-left">` +
+          `<span class="svc-dot ${sevClass(a.severity)}"></span>` +
+          `<span class="svc-name">${esc(a.svc || '?')}</span>` +
+          `<span class="svc-detail">${esc(a.message || '')}${ts ? ' · ' + esc(ts) : ''}</span>` +
+        `</div>` +
+      `</div>`;
+    });
+    list.innerHTML = cards.join('');
+  }
+
   function renderTranscriptionTab(svc) {
     const grid = el['transcription-grid'];
     if (!grid) return;
@@ -541,7 +571,7 @@ const UI = (() => {
     addMessage, addMessageHTML, addEpisodeCards, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
-    renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab,
+    renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab, renderAlerts,
     openSettings, openAdmin, refreshAdminDevices,
     el: () => el,
   };

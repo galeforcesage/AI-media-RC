@@ -464,3 +464,105 @@ async def restart_nginx() -> Dict:
         err_clean = "\n".join(l for l in err.strip().splitlines() if not l.startswith("[sudo]"))
         return {"error": f"Nginx restart failed: {err_clean.strip()}"}
     return {"service": "nginx", "action": "restarted"}
+
+
+# ------------------------------------------------------------------
+# GPU stats (live nvidia-smi)
+# ------------------------------------------------------------------
+
+async def gpu_stats() -> Dict:
+    """Return live GPU stats via nvidia-smi. Empty list if no GPU."""
+    rc, out, err = await _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=5,
+    )
+    if rc != 0:
+        return {"available": False, "gpus": [], "error": (err or out).strip()[:200]}
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        gpus.append({
+            "index": int(parts[0]) if parts[0].isdigit() else 0,
+            "name": parts[1],
+            "driver_version": parts[2],
+            "memory_total_mb": _f(parts[3]),
+            "memory_used_mb": _f(parts[4]),
+            "memory_free_mb": _f(parts[5]),
+            "utilization_pct": _f(parts[6]),
+            "memory_utilization_pct": _f(parts[7]) if len(parts) > 7 else None,
+            "temperature_c": _f(parts[8]) if len(parts) > 8 else None,
+            "power_draw_w": _f(parts[9]) if len(parts) > 9 else None,
+            "power_limit_w": _f(parts[10]) if len(parts) > 10 else None,
+        })
+    return {
+        "available": len(gpus) > 0,
+        "gpus": gpus,
+        "driver_version": gpus[0]["driver_version"] if gpus else None,
+    }
+
+
+# ------------------------------------------------------------------
+# Alerts (watchdog-emitted JSONL)
+# ------------------------------------------------------------------
+
+ALERTS_FILE = "/tmp/ai-media-rc/alerts.jsonl"
+
+
+async def get_alerts(limit: int = 50, severity: Optional[str] = None,
+                     since_ts: Optional[str] = None) -> Dict:
+    """Read recent alerts from /tmp/ai-media-rc/alerts.jsonl.
+
+    Alerts are emitted by watchdog.sh on crashes, health failures,
+    crash loops, etc. Each line is JSON: {ts, svc, severity, code, message}.
+    """
+    import json
+    if not os.path.exists(ALERTS_FILE):
+        return {"alerts": [], "count": 0}
+    sev_filter = severity.lower() if severity else None
+    alerts = []
+    try:
+        with open(ALERTS_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if sev_filter and entry.get("severity", "").lower() != sev_filter:
+                    continue
+                if since_ts and entry.get("ts", "") < since_ts:
+                    continue
+                alerts.append(entry)
+    except OSError as exc:
+        return {"alerts": [], "count": 0, "error": str(exc)}
+    # Newest first
+    alerts.reverse()
+    if limit and limit > 0:
+        alerts = alerts[:limit]
+    return {"alerts": alerts, "count": len(alerts)}
+
+
+async def clear_alerts() -> Dict:
+    """Clear the alerts file. Returns number of alerts cleared."""
+    count = 0
+    if os.path.exists(ALERTS_FILE):
+        try:
+            with open(ALERTS_FILE, "r") as f:
+                count = sum(1 for _ in f)
+            os.remove(ALERTS_FILE)
+        except OSError as exc:
+            return {"error": str(exc), "cleared": 0}
+    return {"cleared": count}

@@ -521,3 +521,109 @@ async def gpu_status():
                 continue
 
     return out
+
+
+@router.get("/alerts")
+async def alerts(
+    limit: int = 50,
+    severity: Optional[str] = None,
+    since_ts: Optional[str] = None,
+):
+    """Return recent system alerts emitted by the watchdog.
+
+    Each alert: ts, svc, severity (info/warning/error/critical), code, message.
+    Sorted newest-first. Augmented with synthetic alerts for stuck transcription
+    jobs and low-disk conditions.
+    """
+    orch = _require_orchestrator()
+    out: list[dict] = []
+
+    # 1) Real watchdog alerts via mcp-linux
+    try:
+        args: Dict[str, Any] = {"limit": limit}
+        if severity:
+            args["severity"] = severity
+        if since_ts:
+            args["since_ts"] = since_ts
+        result = await orch._linux.call_tool("linux_get_alerts", args)
+        if isinstance(result, dict) and result.get("success"):
+            out.extend(result.get("data", {}).get("alerts", []) or [])
+    except Exception as exc:
+        logger.warning("alerts: linux_get_alerts failed: %s", exc)
+
+    # 2) Synthetic: stuck transcription jobs
+    try:
+        import asyncio as _asyncio
+        import json as _json
+        reader, writer = await _asyncio.open_connection("127.0.0.1", 8770)
+        req = _json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "transcript_stats", "arguments": {}},
+        }) + "\n"
+        writer.write(req.encode()); await writer.drain()
+        line = await _asyncio.wait_for(reader.readline(), timeout=3)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        if line:
+            resp = _json.loads(line.decode())
+            content = resp.get("result", {}).get("content", [])
+            if content and content[0].get("type") == "text":
+                data = _json.loads(content[0]["text"])
+                payload = data.get("data", data) if isinstance(data, dict) else {}
+                stale = payload.get("stale_jobs") or []
+                for j in stale:
+                    mins = int((j.get("stuck_seconds") or 0) // 60)
+                    rid = (j.get("recording_id") or "?")[:40]
+                    jid = (j.get("job_id") or "?")[:12]
+                    out.append({
+                        "ts": "",
+                        "svc": "transcription",
+                        "severity": "warning",
+                        "code": "stale_job",
+                        "message": f"job {jid} ({rid}) stuck in {j.get('status')} for {mins} min",
+                    })
+    except Exception as exc:
+        logger.debug("alerts: stale-job probe failed: %s", exc)
+
+    # 3) Synthetic: low disk (>=90%)
+    try:
+        result = await orch._linux.call_tool("linux_disk_usage", {})
+        if isinstance(result, dict) and result.get("success"):
+            mounts = result.get("data", {}).get("mounts", []) or []
+            for m in mounts:
+                raw = m.get("use_percent") if "use_percent" in m else m.get("percent")
+                try:
+                    pct = float(str(raw).rstrip("%")) if raw is not None else 0.0
+                except (TypeError, ValueError):
+                    pct = 0.0
+                if pct >= 90.0:
+                    out.append({
+                        "ts": "",
+                        "svc": "system",
+                        "severity": "error" if pct >= 95.0 else "warning",
+                        "code": "low_disk",
+                        "message": f"{m.get('mount','?')} is {pct:.0f}% full",
+                    })
+    except Exception as exc:
+        logger.debug("alerts: disk probe failed: %s", exc)
+
+    if severity:
+        sev = severity.lower()
+        out = [a for a in out if (a.get("severity") or "").lower() == sev]
+    return {"alerts": out[:limit], "count": len(out[:limit])}
+
+
+@router.post("/alerts/clear")
+async def alerts_clear():
+    """Clear the watchdog alerts file (OWNER scope)."""
+    orch = _require_orchestrator()
+    try:
+        result = await orch._linux.call_tool("linux_clear_alerts", {})
+        if isinstance(result, dict):
+            return result
+        return {"success": False, "error": "unexpected response"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

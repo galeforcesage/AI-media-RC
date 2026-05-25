@@ -160,6 +160,19 @@ const API = (() => {
     return request(`${baseUrl}/api/gpu`);
   }
 
+  async function alerts(opts = {}) {
+    const params = new URLSearchParams();
+    if (opts.limit) params.set('limit', opts.limit);
+    if (opts.severity) params.set('severity', opts.severity);
+    if (opts.since_ts) params.set('since_ts', opts.since_ts);
+    const qs = params.toString();
+    return request(`${baseUrl}/api/alerts${qs ? '?' + qs : ''}`);
+  }
+
+  async function clearAlerts() {
+    return request(`${baseUrl}/api/alerts/clear`, 'POST');
+  }
+
   // Session Manager endpoints
   async function listDevices() {
     return request(`${sessionUrl}/devices`);
@@ -208,7 +221,7 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu,
+    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu, alerts, clearAlerts,
     listDevices, bridgeDevices, bridgeStatus, addDevice, updateDevice, discoverDevices, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,

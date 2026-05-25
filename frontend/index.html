@@ -198,6 +198,7 @@
       <button class="tab" data-tab="services">Services</button>
       <button class="tab" data-tab="system">System</button>
       <button class="tab" data-tab="transcription">Transcription</button>
+      <button class="tab" data-tab="alerts">Alerts <span id="alerts-badge" class="alerts-badge" hidden></span></button>
     </div>
     <div class="admin-content" id="admin-content">
       <div id="tab-devices" class="tab-panel active">
@@ -229,6 +230,15 @@
       </div>
       <div id="tab-transcription" class="tab-panel">
         <div id="transcription-grid" class="service-grid"></div>
+      </div>
+      <div id="tab-alerts" class="tab-panel">
+        <div class="services-header">
+          <span class="services-title">System Alerts</span>
+          <span style="flex:1"></span>
+          <button id="btn-refresh-alerts" class="btn-tiny" title="Refresh">&#8635;</button>
+          <button id="btn-clear-alerts" class="btn-tiny" title="Clear all">Clear</button>
+        </div>
+        <div id="alerts-list" class="alerts-list"></div>
       </div>
     </div>
     <div class="dialog-actions">
