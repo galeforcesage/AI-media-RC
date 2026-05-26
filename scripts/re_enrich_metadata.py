@@ -174,13 +174,23 @@ def _normalize_text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _derive_episode_title_fallback(system: str, title: Any) -> Optional[str]:
+    """Conservative fallback for one-off programs that have no episodic metadata.
+
+    Only applies to Channels rows, where titles are usually human readable.
+    """
+    if system != "channelsdvr":
+        return None
+    return _normalize_text(title)
+
+
 def _parse_sxxexx(value: Any) -> tuple[Optional[int], Optional[int], Optional[str]]:
     """Extract season/episode/episode_title from strings like 'Show S02E17 Name ...'."""
     text = _normalize_text(value)
     if not text:
         return None, None, None
 
-    m = re.search(r"\bS(\d{1,2})E(\d{1,3})\b", text, flags=re.IGNORECASE)
+    m = re.search(r"\bS(\d{1,4})E(\d{1,4})\b", text, flags=re.IGNORECASE)
     if not m:
         return None, None, None
 
@@ -266,8 +276,12 @@ async def main() -> None:
             if parsed_season is not None and parsed_episode is not None and parsed_episode_title:
                 break
 
+        episode_title = _normalize_text(metadata.get("episode_title")) or parsed_episode_title
+        if not episode_title:
+            episode_title = _derive_episode_title_fallback(system, row["title"])
+
         new_values: Dict[str, Any] = {
-            "episode_title": _normalize_text(metadata.get("episode_title")) or parsed_episode_title,
+            "episode_title": episode_title,
             "season": _normalize_int(metadata.get("season")) or parsed_season,
             "episode": _normalize_int(metadata.get("episode")) or parsed_episode,
             "channel": _normalize_text(metadata.get("channel")),
