@@ -260,7 +260,8 @@ class FileWatcher:
         )
         # Attach incremental metadata as extra fields in the job
         if incremental:
-            job.recording_id = f"{recording_id}__inc_{offset}"
+            suffix = "__final" if final else ""
+            job.recording_id = f"{recording_id}__inc_{offset}{suffix}"
             job._incremental = True
             job._offset = offset
             job._final = final

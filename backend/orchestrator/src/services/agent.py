@@ -553,7 +553,7 @@ class AgentLoop:
             "type": "function",
             "function": {
                 "name": "transcript_cross_search",
-                "description": "Cross-metadata transcript search. Searches transcript text with optional filters for actor, genre, channel, date range, system. If query is omitted/empty, lists transcripts matching the filters (e.g. all transcripts in a date range). Use date_from/date_to (YYYY-MM-DD) to find transcripts of recordings made within a date range — for 'this week's recordings' use the Last 7 days dates from the DATE REFERENCE.",
+                "description": "Cross-metadata transcript search. Searches transcript text with optional filters for actor, genre, channel, date range, system. If query is omitted/empty, lists transcripts matching the filters (e.g. all transcripts in a date range). Use date_from/date_to (YYYY-MM-DD) from the DATE REFERENCE block. For 'this week', use This week (Sun-Sat). For 'last week', use Last week (Sun-Sat).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -933,6 +933,16 @@ class AgentLoop:
         yesterday_iso = yesterday.strftime("%Y-%m-%d")
         week_ago = (now - datetime.timedelta(days=7))
         week_ago_iso = week_ago.strftime("%Y-%m-%d")
+        # Week boundaries are Sunday -> Saturday (not rolling 7-day windows).
+        days_since_sunday = (now.weekday() + 1) % 7
+        this_week_start = now - datetime.timedelta(days=days_since_sunday)
+        this_week_end = this_week_start + datetime.timedelta(days=6)
+        last_week_start = this_week_start - datetime.timedelta(days=7)
+        last_week_end = this_week_start - datetime.timedelta(days=1)
+        this_week_start_iso = this_week_start.strftime("%Y-%m-%d")
+        this_week_end_iso = this_week_end.strftime("%Y-%m-%d")
+        last_week_start_iso = last_week_start.strftime("%Y-%m-%d")
+        last_week_end_iso = last_week_end.strftime("%Y-%m-%d")
         channels_path_line = await self._discover_system_paths()
 
         # Determine which DVR systems are active
@@ -981,11 +991,13 @@ class AgentLoop:
             f"DATE REFERENCE (use these exact dates — do NOT calculate your own):\n"
             f"- Today: {today} = {today_iso}\n"
             f"- Yesterday: {yesterday_str} = {yesterday_iso}\n"
-            f"- This week / last 7 days: {week_ago_iso} to {today_iso}\n"
-            f"- Last week: {week_ago_iso} to {today_iso}\n"
+            f"- This week (Sunday-Saturday): {this_week_start_iso} to {this_week_end_iso}\n"
+            f"- Last week (Sunday-Saturday): {last_week_start_iso} to {last_week_end_iso}\n"
+            f"- Last 7 days (rolling): {week_ago_iso} to {today_iso}\n"
             f"{day_ref}\n"
-            f"WHEN THE USER SAYS 'this week', 'last week', 'past week', 'recent', or 'lately' — "
-            f"set date_from={week_ago_iso} and date_to={today_iso}. "
+            f"WHEN THE USER SAYS 'this week' — set date_from={this_week_start_iso} and date_to={this_week_end_iso}. "
+            f"WHEN THE USER SAYS 'last week' — set date_from={last_week_start_iso} and date_to={last_week_end_iso}. "
+            f"WHEN THE USER SAYS 'past week', 'recent', or 'lately' — set date_from={week_ago_iso} and date_to={today_iso}. "
             f"NEVER use any other date. NEVER use a year other than {today_iso[:4]}.\n"
         )
 
