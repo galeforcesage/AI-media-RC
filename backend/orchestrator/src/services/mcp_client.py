@@ -22,7 +22,7 @@ _WATCHDOG_SERVICE_MAP = {
     "channels": "mcp-channels",
     "linux": "mcp-linux",
 }
-_WATCHDOG_SCRIPT = "/home/sagetv/AI-media-RC/scripts/watchdog.sh"
+_WATCHDOG_SCRIPT = "/home/{username}/AI-media-RC/scripts/watchdog.sh"
 # Minimum seconds between auto-restart attempts per service
 _RESTART_COOLDOWN = 120
 

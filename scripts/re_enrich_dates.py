@@ -81,7 +81,7 @@ async def fetch_metadata(system: str, recording_id: str,
 
 async def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--db", default="/home/sagetv/AI-media-RC/backend/transcription/transcript_index.db")
+    p.add_argument("--db", default="/home/{username}/AI-media-RC/backend/transcription/transcript_index.db")
     p.add_argument("--channels-url", default="127.0.0.1:8767")
     p.add_argument("--sagetv-url", default="127.0.0.1:8766")
     p.add_argument("--limit", type=int, default=0, help="0 = no limit")

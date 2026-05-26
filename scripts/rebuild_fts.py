@@ -3,11 +3,11 @@ import sqlite3
 import time
 import sys
 
-db_path = "/home/sagetv/AI-media-RC/backend/transcription/transcription.db"
+db_path = "/home/{username}/AI-media-RC/backend/transcription/transcription.db"
 
 # First stop the service so we don't fight over the WAL
 import subprocess
-subprocess.run(["bash", "/home/sagetv/AI-media-RC/scripts/watchdog.sh", "stop", "transcription"],
+subprocess.run(["bash", "/home/{username}/AI-media-RC/scripts/watchdog.sh", "stop", "transcription"],
                capture_output=True, timeout=10)
 time.sleep(2)
 
@@ -64,6 +64,6 @@ conn.close()
 
 # Restart service
 print("Restarting transcription service...")
-subprocess.run(["bash", "/home/sagetv/AI-media-RC/scripts/watchdog.sh", "restart", "transcription"],
+subprocess.run(["bash", "/home/{username}/AI-media-RC/scripts/watchdog.sh", "restart", "transcription"],
                capture_output=True, timeout=10)
 print("Done!")

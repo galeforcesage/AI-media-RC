@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-ROOT="/home/sagetv/AI-media-RC"
+ROOT="/home/{username}/AI-media-RC"
 ORCH_VENV="$ROOT/backend/orchestrator/.venv/bin/python"
 TRANS_VENV="$ROOT/backend/transcription/.venv/bin/python"
 

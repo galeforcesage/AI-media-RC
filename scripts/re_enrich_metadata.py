@@ -210,7 +210,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--db",
-        default="/home/sagetv/AI-media-RC/backend/transcription/transcript_index.db",
+        default="/home/{username}/AI-media-RC/backend/transcription/transcript_index.db",
     )
     parser.add_argument("--channels-url", default="127.0.0.1:8767")
     parser.add_argument("--sagetv-url", default="127.0.0.1:8766")

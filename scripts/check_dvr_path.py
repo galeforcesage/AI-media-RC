@@ -21,8 +21,8 @@ print(f"\n=== Searching for file on disk ===")
 print(f"  DVR Path field: {path}")
 
 # Try common base paths
-bases = ["/shares/DVR", "/mnt/dvr", "/dvr", "/home/sagetv/dvr", 
-         "/shares", "/mnt/media", "/mnt", "/home/sagetv"]
+bases = ["/shares/DVR", "/mnt/dvr", "/dvr", "/home/{username}/dvr", 
+         "/shares", "/mnt/media", "/mnt", "/home/{username}"]
 for base in bases:
     full = os.path.join(base, path)
     if os.path.exists(full):

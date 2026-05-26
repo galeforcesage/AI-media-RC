@@ -19,7 +19,7 @@ for rec in recs:
 # Check transcription sidecar files
 print("\n=== Transcription sidecar files matching 'Neighborhood' ===")
 for pattern in ["/mnt/dvr/**/*eighbor*/*.json", "/mnt/dvr/**/*eighbor*.json",
-                "/home/sagetv/**/*eighbor*.json", "/mnt/media/**/*eighbor*.json"]:
+                "/home/{username}/**/*eighbor*.json", "/mnt/media/**/*eighbor*.json"]:
     for f in glob.glob(pattern, recursive=True):
         print(f"  {f}")
 

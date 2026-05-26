@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
-export JAVA_HOME=/home/sagetv/jdk-21.0.10+7
+export JAVA_HOME=/home/{username}/jdk-21.0.10+7
 export PATH=$JAVA_HOME/bin:$PATH
-export ANDROID_HOME=/home/sagetv/android-sdk
-cd /home/sagetv/channels-bridge-build
+export ANDROID_HOME=/home/{username}/android-sdk
+cd /home/{username}/channels-bridge-build
 echo "Java: $(java -version 2>&1 | head -1)"
 echo "Building Release APK..."
 ./gradlew assembleRelease --no-daemon 2>&1
