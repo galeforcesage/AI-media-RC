@@ -4,8 +4,8 @@ import sqlite3, os, subprocess
 
 # Check DB
 db_paths = [
-    "/home/{username}/AI-media-RC/backend/transcription/transcription.db",
-    "/home/{username}/AI-media-RC/transcription.db",
+    "/home/USER_HOME/AI-media-RC/backend/transcription/transcription.db",
+    "/home/USER_HOME/AI-media-RC/transcription.db",
     "/tmp/transcription.db",
 ]
 for p in db_paths:
@@ -37,7 +37,7 @@ for p in db_paths:
 else:
     print("No DB found!")
     # Find it
-    result = subprocess.run(["find", "/home/{username}", "-name", "*.db", "-type", "f"], 
+    result = subprocess.run(["find", "/home/USER_HOME", "-name", "*.db", "-type", "f"], 
                           capture_output=True, text=True, timeout=10)
     print("DBs found:")
     for line in result.stdout.strip().split("\n"):

@@ -61,16 +61,22 @@ if [[ -z "$PYTHON" ]]; then
 fi
 
 # Prompt for passwords
-read -rsp "App password (shared access, default: ai-media-rc): " APP_PASS
+read -rsp "App password (shared access): " APP_PASS
 echo
-APP_PASS="${APP_PASS:-ai-media-rc}"
+if [[ -z "$APP_PASS" ]]; then
+    echo "App password cannot be empty"
+    exit 1
+fi
 
-read -rp  "Admin username (default: admin): " ADMIN_USER
-ADMIN_USER="${ADMIN_USER:-admin}"
+read -rp  "Admin username (default: user): " ADMIN_USER
+ADMIN_USER="${ADMIN_USER:-user}"
 
-read -rsp "Admin password (default: admin): " ADMIN_PASS
+read -rsp "Admin password: " ADMIN_PASS
 echo
-ADMIN_PASS="${ADMIN_PASS:-admin}"
+if [[ -z "$ADMIN_PASS" ]]; then
+    echo "Admin password cannot be empty"
+    exit 1
+fi
 
 # Generate auth.json via Python (reuses the auth module's hashing)
 $PYTHON -c "

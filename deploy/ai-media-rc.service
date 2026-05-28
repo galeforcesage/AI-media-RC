@@ -8,9 +8,9 @@ Type=oneshot
 RemainAfterExit=yes
 User=sagetv
 Group=sagetv
-WorkingDirectory=/home/{username}/AI-media-RC
-ExecStart=/bin/bash /home/{username}/AI-media-RC/scripts/watchdog.sh all
-ExecStop=/bin/bash /home/{username}/AI-media-RC/scripts/watchdog.sh stop
+WorkingDirectory=/home/USER_HOME/AI-media-RC
+ExecStart=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh all
+ExecStop=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh stop
 # Give Ollama a moment to be fully ready before starting services
 ExecStartPre=/bin/sleep 5
 

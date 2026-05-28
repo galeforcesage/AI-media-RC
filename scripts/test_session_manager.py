@@ -47,7 +47,7 @@ def main():
     r = post("/devices", {
         "system": "sagetv",
         "friendly_name": "Living Room Shield",
-        "ip_address": "192.168.1.100",
+        "ip_address": "device-a.local",
         "platform": "shield",
     })
     sagetv_id = r.get("device", {}).get("device_id", "")
@@ -59,7 +59,7 @@ def main():
     r = post("/devices", {
         "system": "channelsdvr",
         "friendly_name": "Bedroom Chromecast",
-        "ip_address": "192.168.1.101",
+        "ip_address": "device-b.local",
         "platform": "chromecast",
     })
     channels_id = r.get("device", {}).get("device_id", "")

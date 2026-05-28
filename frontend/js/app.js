@@ -65,7 +65,7 @@
       async function handler() {
         dlg.removeEventListener('close', handler);
         if (dlg.returnValue === 'ok') {
-          const username = userInput ? userInput.value.trim() : 'admin';
+          const username = userInput ? userInput.value.trim() : 'user';
           const password = pwdInput.value;
           pwdInput.value = '';
           try {

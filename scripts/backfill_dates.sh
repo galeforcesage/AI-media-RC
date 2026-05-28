@@ -4,7 +4,7 @@ python3 << 'EOF'
 import sqlite3, os, re
 from datetime import datetime
 
-db = "/home/{username}/AI-media-RC/backend/transcription/transcript_index.db"
+db = "/home/USER_HOME/AI-media-RC/backend/transcription/transcript_index.db"
 conn = sqlite3.connect(db)
 
 # Get all recordings with NULL record_date

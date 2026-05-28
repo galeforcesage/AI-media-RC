@@ -13,7 +13,7 @@ for root, dirs, files in os.walk(base):
 
 # Also try common DVR paths
 for base2 in ["/mnt/dvr/TV/The Neighborhood", "/mnt/media/TV/The Neighborhood",
-              "/home/{username}/dvr/TV/The Neighborhood"]:
+              "/home/USER_HOME/dvr/TV/The Neighborhood"]:
     if os.path.isdir(base2):
         for root, dirs, files in os.walk(base2):
             for f in files:

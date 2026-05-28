@@ -104,10 +104,10 @@ class AuthManager:
         else:
             logger.warning("No auth config at %s — generating defaults", self._config_path)
             self._secret = secrets.token_hex(32)
-            self._app_hash = hash_password("ai-media-rc")
-            self._admin_users = {"admin": hash_password("admin")}
+            self._app_hash = hash_password(secrets.token_hex(16))
+            self._admin_users = {"user": hash_password(secrets.token_hex(16))}
             self._save_config()
-            logger.info("Auth config created with default passwords — CHANGE THEM via setup-auth.sh")
+            logger.info("Auth config created with placeholder credentials — run setup-auth.sh to set real values")
 
     def _save_config(self) -> None:
         """Persist auth config to disk."""

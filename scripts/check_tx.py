@@ -4,8 +4,8 @@ import sqlite3, os, glob
 
 # Check databases
 for db in [
-    "/home/{username}/AI-media-RC/backend/transcription/transcription.db",
-    "/home/{username}/AI-media-RC/backend/transcription/transcript_index.db",
+    "/home/USER_HOME/AI-media-RC/backend/transcription/transcription.db",
+    "/home/USER_HOME/AI-media-RC/backend/transcription/transcript_index.db",
 ]:
     print(f"\n=== {os.path.basename(db)} ===")
     if not os.path.exists(db):
@@ -33,7 +33,7 @@ for db in [
 
 # Check for Channels DVR recording paths
 print("\n=== Channels DVR recordings ===")
-channels_paths = ["/home/{username}/DVR", "/mnt/dvr", "/home/{username}/channels-dvr", "/var/channels"]
+channels_paths = ["/home/USER_HOME/DVR", "/mnt/dvr", "/home/USER_HOME/channels-dvr", "/var/channels"]
 for p in channels_paths:
     if os.path.exists(p):
         print(f"Found: {p}")
@@ -43,7 +43,7 @@ for p in channels_paths:
     
 # Check watcher config / sidecar files
 print("\n=== JSON sidecars ===")
-sidecar_dirs = ["/home/{username}/AI-media-RC/backend/transcription"]
+sidecar_dirs = ["/home/USER_HOME/AI-media-RC/backend/transcription"]
 for d in sidecar_dirs:
     jsons = glob.glob(os.path.join(d, "**/*.json"), recursive=True)[:5]
     for j in jsons:
