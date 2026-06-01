@@ -1938,7 +1938,8 @@ class AgentLoop(PlannerBase):
             re.I,
         ))
         quoted_titles = re.findall(r'"([^"]{3,50})"', answer)
-        if quoted_titles and cache and not _is_transcript_summary_query:
+        _has_transcript_tool_results = any(str(k).startswith("transcript_") for k in cache.keys())
+        if quoted_titles and cache and not _is_transcript_summary_query and not _has_transcript_tool_results:
             all_results_str = " ".join(
                 json.dumps(r, default=str) for r in cache.values()
             ).lower()
@@ -2368,15 +2369,21 @@ class AgentLoop(PlannerBase):
                 try:
                     parsed = json.loads(text)
 
-                    # transcript_cross_search is transcript-text FTS, so title-like
-                    # queries can return empty results even when transcripts exist.
-                    # If that happens, try a fuzzy title fallback against recent
-                    # transcript metadata.
-                    if tool_name == "transcript_cross_search":
+                    # transcript_cross_search is transcript-text FTS and
+                    # transcript_search can miss punctuation-heavy title queries
+                    # like "Show --- Episode". If empty, use a fuzzy title
+                    # fallback against recent transcript metadata.
+                    if tool_name in {"transcript_cross_search", "transcript_search"}:
                         query = str((args or {}).get("query") or "").strip()
                         if query:
                             data = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
-                            rows = data.get("results", []) if isinstance(data, dict) else []
+                            rows = []
+                            if isinstance(data, dict):
+                                for key in ("results", "recent", "recordings", "items"):
+                                    maybe_rows = data.get(key)
+                                    if isinstance(maybe_rows, list):
+                                        rows = maybe_rows
+                                        break
                             if not rows:
                                 fallback = await self._call_transcription(
                                     "transcript_list_recent", {"limit": 200}
@@ -2393,8 +2400,7 @@ class AgentLoop(PlannerBase):
                                         _s = re.sub(r"[^a-z0-9]+", " ", _s)
                                         return re.sub(r"\s+", " ", _s).strip()
 
-                                    qn = _norm(query)
-                                    qtokens = set(qn.split()) if qn else set()
+                                    seeds = [query] + self._query_variants(query)
                                     best = None
                                     best_score = 0.0
                                     for row in recent:
@@ -2405,12 +2411,19 @@ class AgentLoop(PlannerBase):
                                         cn = _norm(cand)
                                         if not cn:
                                             continue
-                                        ratio = _difflib.SequenceMatcher(None, qn, cn).ratio()
-                                        ctokens = set(cn.split())
-                                        overlap = len(qtokens & ctokens) / max(1, len(qtokens)) if qtokens else 0.0
-                                        score = max(ratio, overlap)
-                                        if qn and qn in cn:
-                                            score = max(score, 0.95)
+                                        score = 0.0
+                                        for seed in seeds:
+                                            qn = _norm(seed)
+                                            if not qn:
+                                                continue
+                                            qtokens = set(qn.split())
+                                            ratio = _difflib.SequenceMatcher(None, qn, cn).ratio()
+                                            ctokens = set(cn.split())
+                                            overlap = len(qtokens & ctokens) / max(1, len(qtokens)) if qtokens else 0.0
+                                            local_score = max(ratio, overlap)
+                                            if qn in cn:
+                                                local_score = max(local_score, 0.95)
+                                            score = max(score, local_score)
                                         if score > best_score:
                                             best_score = score
                                             best = row
@@ -2422,7 +2435,7 @@ class AgentLoop(PlannerBase):
                                                 "results": [best],
                                                 "total": 1,
                                                 "query": query,
-                                                "mode": "title_fuzzy_fallback",
+                                                "mode": f"{tool_name}_title_fuzzy_fallback",
                                             },
                                         }
 
