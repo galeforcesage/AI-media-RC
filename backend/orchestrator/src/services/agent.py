@@ -223,8 +223,31 @@ def _format_recording_line(idx: int, rec: dict) -> str:
             se = f"S{s:02d}E{e:02d}"
 
     air_date = rec.get("air_date", "")
-    watched = rec.get("watched", rec.get("is_watched", False))
-    watched_str = "Watched" if watched else "Unwatched"
+    watched_raw = rec.get("watched")
+    if watched_raw is None:
+        watched_raw = rec.get("is_watched")
+    if watched_raw is None:
+        watched_raw = rec.get("Watched")
+    if watched_raw is None:
+        watched_raw = rec.get("PlayedAt")
+
+    watched_state: bool | None = None
+    if isinstance(watched_raw, bool):
+        watched_state = watched_raw
+    elif isinstance(watched_raw, (int, float)):
+        watched_state = bool(watched_raw)
+    elif isinstance(watched_raw, str):
+        wl = watched_raw.strip().lower()
+        if wl in {"true", "1", "yes", "y", "watched"}:
+            watched_state = True
+        elif wl in {"false", "0", "no", "n", "unwatched", ""}:
+            watched_state = False
+
+    watched_str = "Unknown"
+    if watched_state is True:
+        watched_str = "Watched"
+    elif watched_state is False:
+        watched_str = "Unwatched"
     status = rec.get("status", "available")
 
     parts = [f'{idx}. "{title}"']
@@ -1009,7 +1032,8 @@ class AgentLoop(PlannerBase):
             "- List recordings as a numbered list, ONE line each. No bullet sub-items.\n"
             "- Each line MUST include the show name AND the episode title, both in quotes.\n"
             "- The show name comes from the 'title' field, the episode title from 'episode_title'.\n"
-            "- Each line MUST end with the word Watched or Unwatched.\n"
+            "- If watched status exists, each line MUST end with Watched or Unwatched.\n"
+            "- If watched status is missing/unknown, end the line with Unknown (do NOT assume Unwatched).\n"
             "- For multi-day queries, include the date on each line.\n"
             "- CORRECT single-day examples:\n"
             "  1. \"NCIS\" \"Toil and Trouble\" S23E19 Watched\n"
@@ -1765,7 +1789,8 @@ class AgentLoop(PlannerBase):
                 "episode title is in the 'episode_title' field. Never omit either.\n"
                 "You MUST include the 'air_date' value from each tool result on every line. "
                 "Example: 1. \"FBI\" \"Roleplay\" S08E20 — Mon May 4 Unwatched\n"
-                "End each line with the word Watched or Unwatched. "
+                "If watched status exists, end each line with Watched or Unwatched. "
+                "If watched status is missing, use Unknown (do NOT assume Unwatched). "
                 "Do NOT use sub-bullets or extra lines per entry."
             )
             _SUMMARY_REMINDER = (
