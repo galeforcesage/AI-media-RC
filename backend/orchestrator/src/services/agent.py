@@ -1575,6 +1575,49 @@ class AgentLoop(PlannerBase):
                                 f"Result: {summary_str}"
                             )
 
+                        # If index summary is missing or lookup failed, pull full transcript
+                        # text from the metadata store and let the model summarize that.
+                        _sum_data = summary_result.get("data", summary_result) if isinstance(summary_result, dict) else {}
+                        _sum_obj = _sum_data.get("summary") if isinstance(_sum_data, dict) else None
+                        _needs_transcript_get = False
+                        if isinstance(summary_result, dict) and summary_result.get("error"):
+                            _needs_transcript_get = True
+                        elif _sum_obj in (None, "", {}):
+                            _needs_transcript_get = True
+
+                        if _needs_transcript_get:
+                            get_args = {"recording_id": rid}
+                            get_key = f"transcript_get:{json.dumps(get_args, sort_keys=True, default=str)}"
+                            get_result = self._tool_results_cache.get(get_key)
+                            if not get_result:
+                                get_result = await self._execute_tool("transcript_get", get_args)
+                                self._tool_results_cache[get_key] = get_result
+
+                            # Keep enough transcript text for summarization, but cap payload.
+                            get_data = get_result.get("data", get_result) if isinstance(get_result, dict) else {}
+                            if isinstance(get_data, dict) and isinstance(get_data.get("transcript"), str):
+                                txt = get_data.get("transcript", "")
+                                if len(txt) > 12000:
+                                    get_data = dict(get_data)
+                                    get_data["transcript"] = txt[:12000] + "\n... (truncated)"
+                                    get_result = {"success": True, "data": get_data}
+
+                            get_slim = _slim_for_llm(get_result)
+                            get_str = json.dumps(get_slim, default=str)
+                            if len(get_str) > 4000:
+                                get_str = _truncate_result(get_slim, 4000)
+
+                            if native_tool_calls:
+                                tool_messages.append({
+                                    "role": "tool",
+                                    "content": f"[transcript_get] {get_str}",
+                                })
+                            else:
+                                tool_results.append(
+                                    "Tool: transcript_get\n"
+                                    f"Result: {get_str}"
+                                )
+
             # ── Direct-format bypass: skip LLM iteration 2 for pure listings ──
             if not has_service_error and not _is_transcript_summary_query and iteration == 0 and _iter_calls:
                 direct = _try_direct_format(_iter_calls, self._tool_results_cache)
@@ -1877,8 +1920,15 @@ class AgentLoop(PlannerBase):
                     break
 
         # 3) Existence check: quoted show titles should appear in tool results
+        # Skip this warning for transcript-summary queries; title variants
+        # like "Show --- Episode" are common and can create false negatives.
+        _is_transcript_summary_query = bool(re.search(
+            r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b.*\btranscript\b",
+            user_query,
+            re.I,
+        ))
         quoted_titles = re.findall(r'"([^"]{3,50})"', answer)
-        if quoted_titles and cache:
+        if quoted_titles and cache and not _is_transcript_summary_query:
             all_results_str = " ".join(
                 json.dumps(r, default=str) for r in cache.values()
             ).lower()
