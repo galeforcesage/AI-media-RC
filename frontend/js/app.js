@@ -881,14 +881,14 @@
         if (desc) html += `<div class="si-desc">${esc(desc)}</div>`;
         if (genreList.length) html += `<div class="si-genres">${genreList.map(esc).join(', ')}</div>`;
         if (castList.length) html += `<div class="si-cast">Cast: ${castList.slice(0, 6).map(esc).join(', ')}</div>`;
+        html += '<div class="si-actions">';
         if (txMatch) {
-          html += '<div class="si-actions">';
           html += `<button class="btn-view-transcript" data-recording-id="${esc(txMatch.recording_id)}" data-title="${esc(showTitle + (ep ? ' — ' + ep : ''))}">📝 View Transcript</button>`;
-          html += `<button class="btn-view-show-details" data-show-title="${esc(showTitle)}" data-episode-title="${esc(ep)}">📚 View Show Details</button>`;
-          html += '</div>';
         } else {
-          html += `<div class="si-no-transcript">No transcript available</div>`;
+          html += `<span class="si-no-transcript">No transcript available</span>`;
         }
+        html += `<button class="btn-view-show-details" data-show-title="${esc(showTitle)}" data-episode-title="${esc(ep)}">📚 View Show Details</button>`;
+        html += '</div>';
         html += '</div></div>';
       });
 
