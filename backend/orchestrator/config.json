@@ -29,7 +29,9 @@
         "openclaw": {
             "enabled": false,
             "timeout_ms": 30000,
-            "max_plan_depth": 5
+            "max_plan_depth": 5,
+            "strict": false,
+            "runtime_callable": ""
         }
     },
     "semantic": {

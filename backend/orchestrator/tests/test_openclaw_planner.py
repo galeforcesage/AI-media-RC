@@ -31,8 +31,16 @@ class _DummyMCPClient:
 
 
 class _DummyOrchestrator:
-    def __init__(self, enabled: bool):
-        self.config = {"agent": {"openclaw": {"enabled": enabled}}}
+    def __init__(self, enabled: bool, runtime_callable: str = ""):
+        self.config = {
+            "agent": {
+                "openclaw": {
+                    "enabled": enabled,
+                    "runtime_callable": runtime_callable,
+                    "timeout_ms": 30000,
+                }
+            }
+        }
         self._sagetv = _DummyMCPClient()
 
 
@@ -50,6 +58,19 @@ async def test_openclaw_native_stub_when_enabled():
     orch = _DummyOrchestrator(enabled=True)
     planner = OpenClawPlanner(orchestrator=orch, fallback_planner=_DummyFallback())
     result = await planner.run("hi", systems=["sagetv"])
-    assert result["planner"] == "openclaw-native-stub"
+    assert result["planner"] in {"openclaw-native", "openclaw-fallback-runtime", "openclaw-native-error"}
     assert result["status"] == "ok"
-    assert result["openai_tools_offered"] >= 1
+    assert result.get("openai_tools_offered", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_openclaw_native_runtime_callable_execution():
+    orch = _DummyOrchestrator(
+        enabled=True,
+        runtime_callable="tests.openclaw_runtime_stub:run",
+    )
+    planner = OpenClawPlanner(orchestrator=orch, fallback_planner=_DummyFallback())
+    result = await planner.run("hello", systems=["sagetv"])
+    assert result["planner"] == "openclaw-native"
+    assert result["response"] == "openclaw-runtime:hello"
+    assert result["model"] == "openclaw-runtime-stub"

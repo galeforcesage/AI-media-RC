@@ -86,4 +86,20 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(
             f"Invalid agent.planner '{planner}'. Allowed values: {sorted(allowed_planners)}"
         )
+
+    openclaw_cfg = agent_cfg.get("openclaw", {}) or {}
+    runtime_callable = openclaw_cfg.get("runtime_callable", "")
+    if runtime_callable and (not isinstance(runtime_callable, str) or ":" not in runtime_callable):
+        raise ValueError(
+            "Invalid agent.openclaw.runtime_callable. Expected 'module.submodule:function'"
+        )
+
+    timeout_ms = openclaw_cfg.get("timeout_ms", 30000)
+    try:
+        timeout_val = int(timeout_ms)
+    except Exception as exc:
+        raise ValueError("Invalid agent.openclaw.timeout_ms; must be an integer") from exc
+    if timeout_val <= 0:
+        raise ValueError("Invalid agent.openclaw.timeout_ms; must be > 0")
+
     return config
