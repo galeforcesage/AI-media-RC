@@ -1558,6 +1558,78 @@ class AgentLoop(PlannerBase):
                         if _name in {"transcript_cross_search", "transcript_search", "transcript_list_recent"}:
                             candidate_ids.extend(_collect_ids(_res))
 
+                    # Deterministic fallback: when transcript summary was requested
+                    # but tool results had no ids, fuzzy-match against recent
+                    # transcript metadata using the user's title hint.
+                    if not candidate_ids:
+                        def _extract_summary_title(_q: str) -> str | None:
+                            _m = re.search(
+                                r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b[^?]*\btranscript\b[^?]*"
+                                r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)",
+                                _q or "",
+                                re.I,
+                            )
+                            if _m:
+                                return _m.group(1).strip().strip('"\' .') or None
+                            _m2 = re.search(r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)", _q or "", re.I)
+                            return (_m2.group(1).strip().strip('"\' .') if _m2 else None) or None
+
+                        _hint = _extract_summary_title(user_query)
+                        if _hint:
+                            recent_args = {"limit": 200}
+                            recent_key = f"transcript_list_recent:{json.dumps(recent_args, sort_keys=True, default=str)}"
+                            recent_result = self._tool_results_cache.get(recent_key)
+                            if not recent_result:
+                                recent_result = await self._execute_tool("transcript_list_recent", recent_args)
+                                self._tool_results_cache[recent_key] = recent_result
+
+                            rdata = recent_result.get("data", recent_result) if isinstance(recent_result, dict) else {}
+                            rows = rdata.get("recent", []) if isinstance(rdata, dict) else []
+                            if isinstance(rows, list) and rows:
+                                import difflib as _difflib
+
+                                def _norm(_s: str) -> str:
+                                    _s = (_s or "").lower()
+                                    _s = _s.replace("---", " ").replace("--", " ")
+                                    _s = _s.replace("—", " ").replace("–", " ")
+                                    _s = re.sub(r"[^a-z0-9\s]", " ", _s)
+                                    return re.sub(r"\s+", " ", _s).strip()
+
+                                seeds = [_hint] + self._query_variants(_hint)
+                                best_row = None
+                                best_score = 0.0
+                                for row in rows:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    cand = " ".join([
+                                        str(row.get("title") or ""),
+                                        str(row.get("episode_title") or row.get("episode") or ""),
+                                    ]).strip()
+                                    cn = _norm(cand)
+                                    if not cn:
+                                        continue
+                                    score = 0.0
+                                    for seed in seeds:
+                                        qn = _norm(seed)
+                                        if not qn:
+                                            continue
+                                        qtokens = set(qn.split())
+                                        ctokens = set(cn.split())
+                                        ratio = _difflib.SequenceMatcher(None, qn, cn).ratio()
+                                        overlap = len(qtokens & ctokens) / max(1, len(qtokens)) if qtokens else 0.0
+                                        local_score = max(ratio, overlap)
+                                        if qn in cn:
+                                            local_score = max(local_score, 0.95)
+                                        score = max(score, local_score)
+                                    if score > best_score:
+                                        best_score = score
+                                        best_row = row
+
+                                if best_row is not None and best_score >= 0.45:
+                                    rid = best_row.get("recording_id")
+                                    if isinstance(rid, str) and rid:
+                                        candidate_ids.append(rid)
+
                     if candidate_ids:
                         rid = candidate_ids[0]
                         if status_callback:
@@ -1660,6 +1732,7 @@ class AgentLoop(PlannerBase):
                 "REMINDER: The user asked for a transcript summary. "
                 "Use transcript_recording_summary for metadata context and transcript_get for primary episode facts. "
                 "If there is any conflict, trust transcript_get transcript text. "
+                "The user already provided the title hint; do NOT ask for show name/episode title again. "
                 "Return ONLY these sections with clear headings and bullets: "
                 "1) Episode Overview (2-3 sentences), "
                 "2) Plot Breakdown (chronological major events only), "
