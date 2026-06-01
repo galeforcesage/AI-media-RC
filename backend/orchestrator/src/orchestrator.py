@@ -768,13 +768,37 @@ class Orchestrator:
             _is_meta_transcript = bool(_meta_transcript_re.search(prompt))
 
             # Detect transcript summary/recap requests and resolve by title
-            # with fuzzy matching to handle minor misspellings.
-            _summary_re = re.compile(
-                r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b[^?]*\btranscript\b[^?]*"
-                r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)",
-                re.I,
-            )
-            _summary_match = _summary_re.search(prompt)
+            # with fuzzy matching to handle minor misspellings and phrasing.
+            def _extract_summary_title(_prompt: str) -> str | None:
+                _p = (_prompt or "").strip()
+                _pl = _p.lower()
+
+                # Must look like a transcript-summary style ask.
+                if "transcript" not in _pl:
+                    return None
+                if not re.search(r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b", _pl):
+                    return None
+
+                # Primary strict pattern
+                _m = re.search(
+                    r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b[^?]*\btranscript\b[^?]*"
+                    r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)",
+                    _p,
+                    re.I,
+                )
+                if _m:
+                    _t = _m.group(1).strip().strip('"\' .')
+                    return _t or None
+
+                # Fallback: extract text after the last from/for/of token.
+                _m2 = re.search(r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)", _p, re.I)
+                if _m2:
+                    _t = _m2.group(1).strip().strip('"\' .')
+                    return _t or None
+
+                return None
+
+            _summary_title = _extract_summary_title(prompt)
 
             async def _call_transcript_tool(_tool: str, _args: Dict[str, Any]) -> Dict[str, Any]:
                 import asyncio as _aio
@@ -800,11 +824,11 @@ class Orchestrator:
                     return _payload.get("data", _payload)
                 return {}
 
-            if _summary_match:
+            if _summary_title:
                 if status_callback:
                     await status_callback("Searching transcripts")
 
-                _title_hint = _summary_match.group(1).strip().strip('"\' .')
+                _title_hint = _summary_title
 
                 def _norm_title(_s: str) -> str:
                     return re.sub(r"[^a-z0-9]+", " ", (_s or "").lower()).strip()
