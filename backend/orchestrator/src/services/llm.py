@@ -218,6 +218,7 @@ class LLMService:
         messages: list[Dict[str, Any]],
         token_callback=None,
         tools: list[Dict[str, Any]] | None = None,
+        params: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Streaming multi-turn chat via Ollama /api/chat.
@@ -243,6 +244,8 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            if params:
+                payload["options"].update(params)
             if tools:
                 payload["tools"] = tools
             # Disable qwen3 thinking mode — it wastes the token budget

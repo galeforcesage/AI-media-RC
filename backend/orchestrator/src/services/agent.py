@@ -1112,6 +1112,15 @@ class AgentLoop(PlannerBase):
             re.I,
         ))
 
+        llm_cfg = self._orch.config.get("llm", {})
+        summary_params: Dict[str, Any] | None = None
+        if _is_transcript_summary_query:
+            # Keep summary generations fast and bounded for local models.
+            summary_params = {
+                "num_predict": int(llm_cfg.get("summary_num_predict", 640)),
+                "temperature": float(llm_cfg.get("summary_temperature", 0.2)),
+            }
+
         # Extract resolved dates from the rewritten query so we can
         # override wrong dates hallucinated by the LLM in tool args.
         # Patterns: "(2026-05-03)" or "(2026-05-03 to 2026-05-09)"
@@ -1215,7 +1224,7 @@ class AgentLoop(PlannerBase):
             _tool_detected = False
             _buffer: List[str] = []
             _buffer_len = 0
-            _BUFFER_THRESHOLD = 20
+            _BUFFER_THRESHOLD = 1 if _is_transcript_summary_query else 20
 
             _think_active = False
 
@@ -1259,6 +1268,7 @@ class AgentLoop(PlannerBase):
                 messages,
                 token_callback=_on_token,
                 tools=openai_tools,
+                params=summary_params,
             )
 
             # Flush remaining buffered tokens (for non-tool-call responses)
@@ -1648,9 +1658,18 @@ class AgentLoop(PlannerBase):
             )
             _SUMMARY_REMINDER = (
                 "REMINDER: The user asked for a transcript summary. "
-                "Assemble your answer using transcript_recording_summary (metadata/actors/summary) "
-                "PLUS transcript_get (raw transcript text) and produce a concise episode summary. "
-                "Do NOT output a numbered recording list. If there is any conflict, trust transcript_get text."
+                "Use transcript_recording_summary for metadata context and transcript_get for primary episode facts. "
+                "If there is any conflict, trust transcript_get transcript text. "
+                "Return ONLY these sections with clear headings and bullets: "
+                "1) Episode Overview (2-3 sentences), "
+                "2) Plot Breakdown (chronological major events only), "
+                "3) Key Characters (name + role + what they do in this episode), "
+                "4) Important Dialogue and Turning Points (brief quotes only if meaningful), "
+                "5) Themes and Story Arcs (themes + how arcs advance), "
+                "6) Key Takeaways (5-8 bullets, Previously On style). "
+                "Constraints: concise but complete; no filler/minor details; preserve relationships and causality; "
+                "do NOT invent facts, names, motives, or events; if detail is missing, say 'Not shown in transcript.' "
+                "Do NOT output a numbered recording list."
             )
             _FOLLOWUP_REMINDER = _SUMMARY_REMINDER if _is_transcript_summary_query else _FORMAT_REMINDER
             if tool_messages:
