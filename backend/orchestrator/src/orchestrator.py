@@ -767,6 +767,135 @@ class Orchestrator:
             )
             _is_meta_transcript = bool(_meta_transcript_re.search(prompt))
 
+            # Detect transcript summary/recap requests and resolve by title
+            # with fuzzy matching to handle minor misspellings.
+            _summary_re = re.compile(
+                r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b[^?]*\btranscript\b[^?]*"
+                r"\b(?:from|for|of)\b\s+(.+?)(?:\?|$)",
+                re.I,
+            )
+            _summary_match = _summary_re.search(prompt)
+
+            async def _call_transcript_tool(_tool: str, _args: Dict[str, Any]) -> Dict[str, Any]:
+                import asyncio as _aio
+                import json as _json
+
+                _r, _w = await _aio.open_connection("127.0.0.1", 8770, limit=1024 * 1024)
+                _w.write((_json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": _tool, "arguments": _args},
+                }) + "\n").encode())
+                await _w.drain()
+                _line = await _aio.wait_for(_r.readline(), timeout=6.0)
+                _w.close()
+                await _w.wait_closed()
+                if not _line:
+                    return {}
+                _resp = _json.loads(_line.decode())
+                _content = _resp.get("result", {}).get("content", [])
+                if _content and _content[0].get("type") == "text":
+                    _payload = _json.loads(_content[0]["text"])
+                    return _payload.get("data", _payload)
+                return {}
+
+            if _summary_match:
+                if status_callback:
+                    await status_callback("Searching transcripts")
+
+                _title_hint = _summary_match.group(1).strip().strip('"\' .')
+
+                def _norm_title(_s: str) -> str:
+                    return re.sub(r"[^a-z0-9]+", " ", (_s or "").lower()).strip()
+
+                def _pick_best_row(_hint: str, _rows: list[dict]) -> dict | None:
+                    import difflib as _difflib
+
+                    _hint_n = _norm_title(_hint)
+                    if not _hint_n or not _rows:
+                        return None
+
+                    _hint_tokens = set(_hint_n.split())
+                    _best = None
+                    _best_score = 0.0
+                    for _row in _rows:
+                        _cand = " ".join([
+                            str(_row.get("title") or ""),
+                            str(_row.get("episode_title") or _row.get("episode") or ""),
+                        ]).strip()
+                        _cand_n = _norm_title(_cand)
+                        if not _cand_n:
+                            continue
+
+                        _cand_tokens = set(_cand_n.split())
+                        _token_overlap = len(_hint_tokens & _cand_tokens) / max(1, len(_hint_tokens))
+                        _ratio = _difflib.SequenceMatcher(None, _hint_n, _cand_n).ratio()
+                        _score = max(_ratio, _token_overlap)
+                        if _hint_n in _cand_n:
+                            _score = max(_score, 0.95)
+                        if _score > _best_score:
+                            _best_score = _score
+                            _best = _row
+
+                    return _best if _best_score >= 0.45 else None
+
+                try:
+                    _rows_data = await _call_transcript_tool(
+                        "transcript_cross_search",
+                        {"query": _title_hint, "limit": 25},
+                    )
+                    _rows = _rows_data.get("results") or []
+                    if not _rows:
+                        _recent_data = await _call_transcript_tool("transcript_list_recent", {"limit": 100})
+                        _rows = _recent_data.get("recent") or []
+
+                    _best = _pick_best_row(_title_hint, _rows)
+                    if not _best:
+                        return {
+                            "status": "ok",
+                            "llm_response": (
+                                f"I couldn't find a close transcript match for '{_title_hint}'. "
+                                "Try the exact show title or ask me to list recent transcripts first."
+                            ),
+                            "transcript_results": _rows[:10],
+                            "fast_path": True,
+                        }
+
+                    _rid = _best.get("recording_id", "")
+                    _summary_data = await _call_transcript_tool(
+                        "transcript_recording_summary", {"recording_id": _rid}
+                    ) if _rid else {}
+
+                    _summary_obj = _summary_data.get("summary")
+                    if isinstance(_summary_obj, dict):
+                        _summary_text = _summary_obj.get("summary") or _summary_obj.get("text") or ""
+                    elif isinstance(_summary_obj, str):
+                        _summary_text = _summary_obj
+                    else:
+                        _summary_text = ""
+
+                    _title = _best.get("title") or "Unknown"
+                    _episode = _best.get("episode_title") or _best.get("episode") or ""
+                    _hdr = f'Summary for "{_title}"' + (f' - "{_episode}"' if _episode else "") + ":"
+
+                    if _summary_text:
+                        _answer = _hdr + "\n" + _summary_text
+                    else:
+                        _answer = (
+                            _hdr + "\nI found the transcript, but a pre-generated summary is not available yet. "
+                            "I can still summarize from transcript excerpts if you want."
+                        )
+
+                    return {
+                        "status": "ok",
+                        "llm_response": _answer,
+                        "transcript_results": [_best],
+                        "fast_path": True,
+                    }
+                except Exception:
+                    logger.exception("Transcript summary fast-path failed")
+
             if _is_meta_transcript:
                 logger.info("Meta-transcript query — using Python fast-path")
                 # Pull a wide list of recent transcripts directly from the
