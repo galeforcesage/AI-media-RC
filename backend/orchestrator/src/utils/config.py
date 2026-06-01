@@ -42,7 +42,8 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     else:
         raise ValueError(f"Unsupported config format: {path.suffix}")
 
-    return apply_env_overrides(config)
+    config = apply_env_overrides(config)
+    return validate_config(config)
 
 
 def apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,4 +70,20 @@ def apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             # Ignore env vars that don't map cleanly
             pass
 
+    return config
+
+
+def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate key orchestrator config values.
+
+    Raises:
+        ValueError: for invalid configuration values.
+    """
+    agent_cfg = config.get("agent", {}) or {}
+    planner = str(agent_cfg.get("planner", "agentloop")).strip().lower()
+    allowed_planners = {"agentloop", "openclaw"}
+    if planner not in allowed_planners:
+        raise ValueError(
+            f"Invalid agent.planner '{planner}'. Allowed values: {sorted(allowed_planners)}"
+        )
     return config

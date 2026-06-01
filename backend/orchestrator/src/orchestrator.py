@@ -32,6 +32,8 @@ from services.system import SystemService
 from services.voice_session import VoiceSessionManager
 from services.tool_router import ToolRouter
 from services.agent import AgentLoop
+from services.openclaw_planner import OpenClawPlanner
+from services.planner_registry import PlannerRegistry
 from services.semantic_index import SemanticIndex
 from services.entity_context import EntityContextStore
 from services.ssd_extractor import SSDExtractor
@@ -113,6 +115,12 @@ class Orchestrator:
 
         # Agentic tool-calling loop
         self.agent = AgentLoop(orchestrator=self)
+        self._planner_registry = PlannerRegistry(self)
+        self._planner_registry.register("agentloop", lambda: self.agent)
+        self._planner_registry.register(
+            "openclaw",
+            lambda: OpenClawPlanner(orchestrator=self, fallback_planner=self.agent),
+        )
 
         # Conversation-scoped entity memory for multi-turn context
         self.entity_store = EntityContextStore(
@@ -145,6 +153,27 @@ class Orchestrator:
 
         # Session manager URL for device → session_id resolution
         self._session_url = config.get("session_manager_url", "http://127.0.0.1:8769")
+
+    def _resolve_planner_name(self, metadata: Dict[str, Any] | None = None) -> str:
+        """Resolve planner name from request metadata, then config defaults."""
+        requested = None
+        if isinstance(metadata, dict):
+            requested = metadata.get("planner")
+        if isinstance(requested, str) and requested.strip():
+            return requested.strip().lower()
+        return str(self.config.get("agent", {}).get("planner", "agentloop")).strip().lower()
+
+    def _get_planner(self, metadata: Dict[str, Any] | None = None):
+        """Get planner instance with fallback to agentloop if unknown."""
+        planner_name = self._resolve_planner_name(metadata)
+        try:
+            planner = self._planner_registry.get(planner_name)
+            if planner_name != "agentloop":
+                logger.info("Using planner '%s'", planner_name)
+            return planner
+        except ValueError:
+            logger.warning("Unknown planner '%s', falling back to 'agentloop'", planner_name)
+            return self._planner_registry.get("agentloop")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -965,8 +994,9 @@ class Orchestrator:
                 except Exception:
                     logger.warning("Semantic pre-fetch failed, continuing without")
 
-            # Run the agentic tool-calling loop
-            agent_result = await self.agent.run(
+            # Run the selected planner (AgentLoop by default).
+            planner = self._get_planner(metadata)
+            agent_result = await planner.run(
                 prompt,
                 transcript_context=transcript_context,
                 semantic_context=semantic_context,

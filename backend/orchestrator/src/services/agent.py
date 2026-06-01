@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
+from services.planner_base import PlannerBase
 
 logger = get_logger(__name__)
 
@@ -514,7 +515,7 @@ def _tool_status_message(tool_name: str, tool_args: dict = None) -> str:
     return base
 
 
-class AgentLoop:
+class AgentLoop(PlannerBase):
     """Manages the tool-calling loop between the LLM and MCP servers."""
 
     def __init__(self, orchestrator: Any) -> None:
