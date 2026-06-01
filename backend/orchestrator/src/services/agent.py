@@ -2123,7 +2123,67 @@ class AgentLoop(PlannerBase):
             if content and isinstance(content, list):
                 text = content[0].get("text", "{}")
                 try:
-                    return json.loads(text)
+                    parsed = json.loads(text)
+
+                    # transcript_cross_search is transcript-text FTS, so title-like
+                    # queries can return empty results even when transcripts exist.
+                    # If that happens, try a fuzzy title fallback against recent
+                    # transcript metadata.
+                    if tool_name == "transcript_cross_search":
+                        query = str((args or {}).get("query") or "").strip()
+                        if query:
+                            data = parsed.get("data", parsed) if isinstance(parsed, dict) else {}
+                            rows = data.get("results", []) if isinstance(data, dict) else []
+                            if not rows:
+                                fallback = await self._call_transcription(
+                                    "transcript_list_recent", {"limit": 200}
+                                )
+                                fdata = fallback.get("data", fallback) if isinstance(fallback, dict) else {}
+                                recent = fdata.get("recent", []) if isinstance(fdata, dict) else []
+
+                                if recent:
+                                    import difflib as _difflib
+
+                                    def _norm(_s: str) -> str:
+                                        _s = (_s or "").lower()
+                                        _s = _s.replace("---", " ").replace("--", " ")
+                                        _s = re.sub(r"[^a-z0-9]+", " ", _s)
+                                        return re.sub(r"\s+", " ", _s).strip()
+
+                                    qn = _norm(query)
+                                    qtokens = set(qn.split()) if qn else set()
+                                    best = None
+                                    best_score = 0.0
+                                    for row in recent:
+                                        cand = " ".join([
+                                            str(row.get("title") or ""),
+                                            str(row.get("episode_title") or row.get("episode") or ""),
+                                        ]).strip()
+                                        cn = _norm(cand)
+                                        if not cn:
+                                            continue
+                                        ratio = _difflib.SequenceMatcher(None, qn, cn).ratio()
+                                        ctokens = set(cn.split())
+                                        overlap = len(qtokens & ctokens) / max(1, len(qtokens)) if qtokens else 0.0
+                                        score = max(ratio, overlap)
+                                        if qn and qn in cn:
+                                            score = max(score, 0.95)
+                                        if score > best_score:
+                                            best_score = score
+                                            best = row
+
+                                    if best is not None and best_score >= 0.45:
+                                        return {
+                                            "success": True,
+                                            "data": {
+                                                "results": [best],
+                                                "total": 1,
+                                                "query": query,
+                                                "mode": "title_fuzzy_fallback",
+                                            },
+                                        }
+
+                    return parsed
                 except json.JSONDecodeError:
                     return {"raw": text}
             return result
