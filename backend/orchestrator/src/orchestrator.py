@@ -175,6 +175,15 @@ class Orchestrator:
             logger.warning("Unknown planner '%s', falling back to 'agentloop'", planner_name)
             return self._planner_registry.get("agentloop")
 
+    def _resolve_shadow_planner_name(self, metadata: Dict[str, Any] | None = None) -> str | None:
+        """Resolve optional shadow planner from request metadata."""
+        if not isinstance(metadata, dict):
+            return None
+        raw = metadata.get("shadow_planner")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower()
+        return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -995,6 +1004,7 @@ class Orchestrator:
                     logger.warning("Semantic pre-fetch failed, continuing without")
 
             # Run the selected planner (AgentLoop by default).
+            primary_name = self._resolve_planner_name(metadata)
             planner = self._get_planner(metadata)
             agent_result = await planner.run(
                 prompt,
@@ -1007,6 +1017,36 @@ class Orchestrator:
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
+
+            # Optional shadow planner execution for evaluation.
+            shadow_info: Dict[str, Any] | None = None
+            shadow_name = self._resolve_shadow_planner_name(metadata)
+            if shadow_name and shadow_name != primary_name:
+                try:
+                    shadow_planner = self._planner_registry.get(shadow_name)
+                    shadow_result = await shadow_planner.run(
+                        prompt,
+                        transcript_context=transcript_context,
+                        semantic_context=semantic_context,
+                        systems=systems,
+                        temporal=temporal,
+                        domains=domains,
+                        entity_store=self.entity_store,
+                        status_callback=None,
+                        token_callback=None,
+                    )
+                    shadow_info = {
+                        "planner": shadow_name,
+                        "status": shadow_result.get("status", "unknown"),
+                        "iterations": shadow_result.get("iterations", 0),
+                    }
+                except Exception as exc:
+                    logger.warning("Shadow planner '%s' failed: %s", shadow_name, exc)
+                    shadow_info = {
+                        "planner": shadow_name,
+                        "status": "error",
+                        "error": str(exc),
+                    }
 
             # Build response in pipeline-compatible format
             llm_result: Dict[str, Any] = {
@@ -1025,6 +1065,8 @@ class Orchestrator:
 
             # Attach transcript hits for the frontend
             llm_result["transcript_results"] = transcript_hits
+            if shadow_info is not None:
+                llm_result["shadow"] = shadow_info
 
             return llm_result
         except Exception as exc:

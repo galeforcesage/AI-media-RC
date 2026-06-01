@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
 from services.planner_base import PlannerBase
+from services.mcp_tool_registry import MCPToolRegistry
 
 logger = get_logger(__name__)
 
@@ -526,6 +527,7 @@ class AgentLoop(PlannerBase):
         self._dynamic_tools: Dict[str, str] | None = None  # cached dynamic tool text
         self._openai_tools: List[Dict[str, Any]] | None = None  # cached OpenAI-format tools
         self._tool_schemas: Dict[str, Dict[str, Any]] = {}  # cached schemas for validation
+        self._tool_registry = MCPToolRegistry(orchestrator)
 
     # ------------------------------------------------------------------
     # OpenAI-format tool schema discovery
@@ -766,64 +768,13 @@ class AgentLoop(PlannerBase):
         return False
 
     async def _discover_openai_tools(self, systems: list[str] | None = None) -> List[Dict[str, Any]]:
-        """Query each MCP server and build OpenAI-format tool schemas.
-
-        Returns a list of {"type": "function", "function": {...}} dicts
-        ready to pass as the ``tools`` parameter to Ollama /api/chat.
-        Only includes essential query/info tools to fit in context window.
-        Filters by temporal intent to reduce confusion for smaller models.
-        """
-        all_systems = {"sagetv", "channelsdvr"}
-        active = set(systems) if systems else all_systems
-
-        # Temporal-based tool filtering — hide wrong-direction tools
-        temporal = getattr(self, "_temporal", "")
-        _HIDE_FOR_FUTURE = {"search_recordings", "get_recordings", "get_recent_recordings"}
-        _HIDE_FOR_PAST = {"get_upcoming_recordings", "get_scheduled_recordings", "search_epg"}
-
-        tools: List[Dict[str, Any]] = []
-
-        server_map = []
-        if "channelsdvr" in active and hasattr(self._orch, "_channels"):
-            server_map.append(("channelsdvr", self._orch._channels, "Channels DVR"))
-        if "sagetv" in active and hasattr(self._orch, "_sagetv"):
-            server_map.append(("sagetv", self._orch._sagetv, "SageTV"))
-        if hasattr(self._orch, "_linux"):
-            server_map.append(("linux", self._orch._linux, "Linux"))
-
-        for sys_key, client, label in server_map:
-            try:
-                mcp_tools = await client.list_tools()
-                for t in mcp_tools:
-                    # Cache ALL tool schemas for validation (even non-essential)
-                    schema = t.get("inputSchema") or t.get("input_schema") or {"type": "object", "properties": {}}
-                    self._tool_schemas[t["name"]] = schema
-                    if t["name"] not in self._ESSENTIAL_TOOLS:
-                        continue
-                    # Domain-based tool subsetting
-                    if not self._tool_matches_domain(t["name"]):
-                        continue
-                    # Filter out wrong-direction tools based on temporal intent
-                    suffix = t["name"].split("_", 1)[1] if "_" in t["name"] else ""
-                    if temporal == "future" and suffix in _HIDE_FOR_FUTURE:
-                        continue
-                    if temporal == "past" and suffix in _HIDE_FOR_PAST:
-                        continue
-                    tools.append(self._mcp_to_openai_tool(t))
-                logger.info("Discovered %d OpenAI-format tools from %s (of %d total)",
-                            sum(1 for t in mcp_tools if t["name"] in self._ESSENTIAL_TOOLS),
-                            label, len(mcp_tools))
-            except Exception as exc:
-                logger.warning("Could not discover %s tools for OpenAI format: %s", label, exc)
-
-        # Add transcript tools — always include (they're small and critical for routing)
-        for t in self._TRANSCRIPT_TOOLS_OPENAI:
-            fn_name = t["function"]["name"]
-            if fn_name in self._ESSENTIAL_TOOLS:
-                tools.append(t)
-                # Cache transcript schemas for validation
-                fn = t["function"]
-                self._tool_schemas[fn["name"]] = fn.get("parameters", {})
+        """Build OpenAI-format tools using shared registry for all planners."""
+        tools, schemas = await self._tool_registry.discover_openai_tools(
+            systems=systems,
+            domains=getattr(self, "_domains", []) or [],
+            temporal=getattr(self, "_temporal", "") or "",
+        )
+        self._tool_schemas.update(schemas)
         logger.info("Total OpenAI-format tools: %d", len(tools))
         return tools
 
