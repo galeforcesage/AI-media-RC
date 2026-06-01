@@ -1106,6 +1106,12 @@ class AgentLoop(PlannerBase):
         self._domains = domains or []  # domain classification for tool subsetting
         self._entity_store = entity_store  # conversation-scoped entity memory
 
+        _is_transcript_summary_query = bool(re.search(
+            r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b.*\btranscript\b",
+            user_query,
+            re.I,
+        ))
+
         # Extract resolved dates from the rewritten query so we can
         # override wrong dates hallucinated by the LLM in tool args.
         # Patterns: "(2026-05-03)" or "(2026-05-03 to 2026-05-09)"
@@ -1426,6 +1432,7 @@ class AgentLoop(PlannerBase):
             tool_messages: List[Dict[str, Any]] = []
             has_service_error = False
             _iter_calls: list[tuple[str, dict]] = []  # track (tool_name, args) for direct-format
+            _iter_results: list[tuple[str, dict, dict]] = []  # track concrete tool results
 
             for idx, tc in enumerate(tool_calls):
                 tool_name = tc.get("tool", "")
@@ -1459,6 +1466,7 @@ class AgentLoop(PlannerBase):
                         error=result.get("error"),
                     )
                     _iter_calls.append((tool_name, tool_args))
+                    _iter_results.append((tool_name, tool_args, result))
 
                 # ── Confirmation gate: return to user if confirmation needed ──
                 if result.get("requires_confirmation"):
@@ -1508,8 +1516,67 @@ class AgentLoop(PlannerBase):
                 else:
                     tool_results.append(f"Tool: {tool_name}\nResult: {result_str}")
 
+            # Transcript-summary helper: if the model only searched/listed,
+            # auto-fetch transcript_recording_summary for the top hit.
+            if _is_transcript_summary_query:
+                already_has_summary = any(
+                    n == "transcript_recording_summary" for n, _a, _r in _iter_results
+                )
+                if not already_has_summary:
+                    candidate_ids: list[str] = []
+
+                    def _collect_ids(_res: dict) -> list[str]:
+                        out: list[str] = []
+                        if not isinstance(_res, dict):
+                            return out
+                        data = _res.get("data", _res)
+                        if isinstance(data, dict):
+                            rid = data.get("recording_id")
+                            if isinstance(rid, str) and rid:
+                                out.append(rid)
+                            for key in ("results", "recent", "recordings", "items"):
+                                rows = data.get(key)
+                                if isinstance(rows, list):
+                                    for row in rows:
+                                        if isinstance(row, dict):
+                                            rr = row.get("recording_id")
+                                            if isinstance(rr, str) and rr:
+                                                out.append(rr)
+                        return out
+
+                    for _name, _args, _res in _iter_results:
+                        if _name in {"transcript_cross_search", "transcript_search", "transcript_list_recent"}:
+                            candidate_ids.extend(_collect_ids(_res))
+
+                    if candidate_ids:
+                        rid = candidate_ids[0]
+                        if status_callback:
+                            await status_callback("Analyzing transcript")
+                        summary_args = {"recording_id": rid}
+                        summary_key = f"transcript_recording_summary:{json.dumps(summary_args, sort_keys=True, default=str)}"
+                        summary_result = self._tool_results_cache.get(summary_key)
+                        if not summary_result:
+                            summary_result = await self._execute_tool("transcript_recording_summary", summary_args)
+                            self._tool_results_cache[summary_key] = summary_result
+
+                        summary_slim = _slim_for_llm(summary_result)
+                        summary_str = json.dumps(summary_slim, default=str)
+                        if len(summary_str) > 4000:
+                            summary_str = _truncate_result(summary_slim, 4000)
+
+                        if native_tool_calls:
+                            tool_messages.append({
+                                "role": "tool",
+                                "content": f"[transcript_recording_summary] {summary_str}",
+                            })
+                        else:
+                            tool_results.append(
+                                "Tool: transcript_recording_summary\n"
+                                f"Result: {summary_str}"
+                            )
+
             # ── Direct-format bypass: skip LLM iteration 2 for pure listings ──
-            if not has_service_error and iteration == 0 and _iter_calls:
+            if not has_service_error and not _is_transcript_summary_query and iteration == 0 and _iter_calls:
                 direct = _try_direct_format(_iter_calls, self._tool_results_cache)
                 if direct is not None:
                     logger.info("Direct-format bypass: %d chars, skipping LLM iteration 2",
@@ -1545,6 +1612,13 @@ class AgentLoop(PlannerBase):
                 "End each line with the word Watched or Unwatched. "
                 "Do NOT use sub-bullets or extra lines per entry."
             )
+            _SUMMARY_REMINDER = (
+                "REMINDER: The user asked for a transcript summary. "
+                "Use transcript_recording_summary results when available and produce a concise summary "
+                "of what happened in the episode. Do NOT output a numbered recording list. "
+                "If summary text is missing, summarize from transcript excerpts and state that it is excerpt-based."
+            )
+            _FOLLOWUP_REMINDER = _SUMMARY_REMINDER if _is_transcript_summary_query else _FORMAT_REMINDER
             if tool_messages:
                 # Native path: add each tool result as a role:tool message
                 messages.extend(tool_messages)
@@ -1555,13 +1629,13 @@ class AgentLoop(PlannerBase):
                             "Some services are currently offline. "
                             "Do NOT retry the same tool. Tell the user which service "
                             "is unavailable and answer with whatever information you have. "
-                            + _FORMAT_REMINDER
+                            + _FOLLOWUP_REMINDER
                         ),
                     })
                 else:
                     messages.append({
                         "role": "user",
-                        "content": _FORMAT_REMINDER,
+                        "content": _FOLLOWUP_REMINDER,
                     })
             else:
                 # Text-parsed fallback path
@@ -1579,7 +1653,7 @@ class AgentLoop(PlannerBase):
                         "Use these results to answer the original question. "
                         "If a tool returned an error, do NOT retry it — tell the user. "
                         "Otherwise, provide your final answer. "
-                        + _FORMAT_REMINDER
+                        + _FOLLOWUP_REMINDER
                     ),
                 })
 
