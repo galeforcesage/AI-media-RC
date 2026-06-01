@@ -664,6 +664,32 @@
     handleSend();
   }
 
+  function ensureShowDetailsButtons(container) {
+    if (!container) return;
+    const transcriptButtons = container.querySelectorAll('.btn-view-transcript');
+    transcriptButtons.forEach((btn) => {
+      const actions = btn.closest('.si-actions') || btn.parentElement;
+      if (!actions) return;
+      if (actions.querySelector('.btn-view-show-details')) return;
+
+      const showTitle = btn.dataset.title || '';
+      let show = showTitle;
+      let episode = '';
+      if (showTitle.includes(' — ')) {
+        const parts = showTitle.split(' — ');
+        show = (parts[0] || '').trim();
+        episode = (parts.slice(1).join(' — ') || '').trim();
+      }
+
+      const detailsBtn = document.createElement('button');
+      detailsBtn.className = 'btn-view-show-details';
+      detailsBtn.dataset.showTitle = show;
+      detailsBtn.dataset.episodeTitle = episode;
+      detailsBtn.textContent = '📚 View Show Details';
+      actions.appendChild(detailsBtn);
+    });
+  }
+
   async function showMetadataPopup(title, showContext = '') {
     const dialog = document.getElementById('show-info-dialog');
     const titleEl = document.getElementById('show-info-title');
@@ -893,6 +919,7 @@
       });
 
       bodyEl.innerHTML = html;
+      ensureShowDetailsButtons(bodyEl);
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error: ${esc(err.message)}</p>`;
     }
