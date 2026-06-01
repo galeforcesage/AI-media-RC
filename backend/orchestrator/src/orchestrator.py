@@ -893,8 +893,18 @@ class Orchestrator:
                         "transcript_results": [_best],
                         "fast_path": True,
                     }
-                except Exception:
+                except Exception as exc:
                     logger.exception("Transcript summary fast-path failed")
+                    return {
+                        "status": "ok",
+                        "llm_response": (
+                            "I couldn't access the transcript summary service right now. "
+                            "Please try again in a moment. "
+                            f"(details: {exc})"
+                        ),
+                        "transcript_results": [],
+                        "fast_path": True,
+                    }
 
             if _is_meta_transcript:
                 logger.info("Meta-transcript query — using Python fast-path")
