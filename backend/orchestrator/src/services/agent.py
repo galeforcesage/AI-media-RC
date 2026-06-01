@@ -1106,11 +1106,7 @@ class AgentLoop(PlannerBase):
         self._domains = domains or []  # domain classification for tool subsetting
         self._entity_store = entity_store  # conversation-scoped entity memory
 
-        _is_transcript_summary_query = bool(re.search(
-            r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b.*\btranscript\b",
-            user_query,
-            re.I,
-        ))
+        _is_transcript_summary_query = self._is_transcript_summary_intent(user_query)
 
         llm_cfg = self._orch.config.get("llm", {})
         summary_params: Dict[str, Any] | None = None
@@ -1396,10 +1392,54 @@ class AgentLoop(PlannerBase):
                 else:
                     # Later iteration with no tool call = final answer
                     final = self._strip_markers(response_text)
+
+                    if _is_transcript_summary_query:
+                        _looks_wrong = bool(
+                            re.search(r"(?im)^\s*\d+\.\s+.*\b(watched|unwatched)\b", final)
+                            or re.search(r"\b(?:please\s+provide|unable\s+to\s+find|couldn't\s+find)\b", final, re.I)
+                        )
+                        if _looks_wrong:
+                            cache = getattr(self, "_tool_results_cache", {}) or {}
+                            summary_blob = None
+                            transcript_blob = None
+                            for _k, _v in cache.items():
+                                if isinstance(_k, str) and _k.startswith("transcript_recording_summary:") and isinstance(_v, dict):
+                                    summary_blob = _v
+                                elif isinstance(_k, str) and _k.startswith("transcript_get:") and isinstance(_v, dict):
+                                    transcript_blob = _v
+
+                            if summary_blob or transcript_blob:
+                                repair = await self._orch.llm.generate_chat(
+                                    [
+                                        {
+                                            "role": "system",
+                                            "content": (
+                                                "You are a TV episode analyst. Produce ONLY a structured summary with headings and bullets: "
+                                                "Episode Overview (2-3 sentences), Plot Breakdown (chronological major events), "
+                                                "Key Characters, Important Dialogue and Turning Points, Themes and Story Arcs, "
+                                                "Key Takeaways (5-8 bullets). Use transcript text as source of truth. "
+                                                "Do NOT output a recording list. If missing, say 'Not shown in transcript.'"
+                                            ),
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": (
+                                                f"Question: {user_query}\n\n"
+                                                f"transcript_recording_summary:\n{json.dumps(_slim_for_llm(summary_blob or {}), default=str)[:9000]}\n\n"
+                                                f"transcript_get:\n{json.dumps(_slim_for_llm(transcript_blob or {}), default=str)[:12000]}"
+                                            ),
+                                        },
+                                    ],
+                                    params={"num_predict": 640, "temperature": 0.2},
+                                )
+                                repaired = self._strip_markers((repair or {}).get("response", ""))
+                                if repaired and not re.search(r"(?im)^\s*\d+\.\s+.*\b(watched|unwatched)\b", repaired):
+                                    final = repaired
+
                     # Post-hoc answer validation (Layer 3 — Formal Validator)
                     vr = self._validate_answer(final, user_query)
                     trace.validation = vr.summary()
-                    if not vr.passed:
+                    if not vr.passed and not _is_transcript_summary_query:
                         final += f"\n\n_{vr.issues[0]}_"
                         trace.validation_issues = vr.issues
                     # Extract entities from tool results for conversation context
@@ -1945,6 +1985,23 @@ class AgentLoop(PlannerBase):
         text = re.sub(r"Tool:\s*\S+\s*Result:\s*\{.*?\}", "", text, flags=re.DOTALL)
         return text.strip()
 
+    @staticmethod
+    def _is_transcript_summary_intent(query: str) -> bool:
+        """Best-effort detector for transcript summary asks.
+
+        Handles strict phrasing ("summarize transcript ...") and looser
+        rewritten forms where "transcript" may be omitted.
+        """
+        q = (query or "").strip()
+        if not q:
+            return False
+        ql = q.lower()
+        if not re.search(r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b", ql):
+            return False
+        if "transcript" in ql:
+            return True
+        return bool(re.search(r"\b(?:from|for|of)\b", ql) and re.search(r"\b(?:show|episode)\b", ql))
+
     # ------------------------------------------------------------------
     # Post-hoc answer validation (Layer 3 — Formal Validator)
     # ------------------------------------------------------------------
@@ -2005,11 +2062,7 @@ class AgentLoop(PlannerBase):
         # 3) Existence check: quoted show titles should appear in tool results
         # Skip this warning for transcript-summary queries; title variants
         # like "Show --- Episode" are common and can create false negatives.
-        _is_transcript_summary_query = bool(re.search(
-            r"\b(?:summari[sz]e|summary|recap|what\s+happened)\b.*\btranscript\b",
-            user_query,
-            re.I,
-        ))
+        _is_transcript_summary_query = self._is_transcript_summary_intent(user_query)
         quoted_titles = re.findall(r'"([^"]{3,50})"', answer)
         _has_transcript_tool_results = any(str(k).startswith("transcript_") for k in cache.keys())
         if quoted_titles and cache and not _is_transcript_summary_query and not _has_transcript_tool_results:
