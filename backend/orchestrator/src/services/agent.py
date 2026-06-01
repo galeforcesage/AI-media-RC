@@ -1808,9 +1808,19 @@ class AgentLoop(PlannerBase):
             all_results_str = " ".join(
                 json.dumps(r, default=str) for r in cache.values()
             ).lower()
+
+            def _norm(_s: str) -> str:
+                _s = (_s or "").lower()
+                _s = _s.replace("---", " ").replace("--", " ")
+                _s = _s.replace("—", " ").replace("–", " ")
+                _s = re.sub(r"[^a-z0-9\s]", " ", _s)
+                return re.sub(r"\s+", " ", _s).strip()
+
+            all_results_norm = _norm(all_results_str)
             missing = []
             for title in quoted_titles[:5]:  # check first 5
-                if title.lower() not in all_results_str:
+                tnorm = _norm(title)
+                if tnorm and tnorm not in all_results_norm:
                     missing.append(title)
             if missing and len(missing) > len(quoted_titles) // 2:
                 issues.append(
@@ -2075,9 +2085,25 @@ class AgentLoop(PlannerBase):
                 return {"error": f"Wrong tool: '{tool_name}' is for past recordings. Use get_upcoming_recordings for future/scheduled content."}
 
             if tool_name.startswith("sagetv_"):
-                return await self._orch._sagetv.call_tool(tool_name, args)
+                result = await self._orch._sagetv.call_tool(tool_name, args)
+                if tool_name in {"sagetv_search_recordings", "sagetv_search_shows"}:
+                    result = await self._retry_search_with_variants(
+                        tool_name=tool_name,
+                        args=args,
+                        result=result,
+                        client=self._orch._sagetv,
+                    )
+                return result
             elif tool_name.startswith("channels_"):
-                return await self._orch._channels.call_tool(tool_name, args)
+                result = await self._orch._channels.call_tool(tool_name, args)
+                if tool_name in {"channels_search_recordings", "channels_search_epg"}:
+                    result = await self._retry_search_with_variants(
+                        tool_name=tool_name,
+                        args=args,
+                        result=result,
+                        client=self._orch._channels,
+                    )
+                return result
             elif tool_name.startswith("linux_"):
                 return await self._orch._linux.call_tool(tool_name, args)
             elif tool_name.startswith("transcript_"):
@@ -2090,6 +2116,89 @@ class AgentLoop(PlannerBase):
         except Exception as exc:
             logger.exception("Tool %s failed", tool_name)
             return {"error": str(exc)}
+
+    @staticmethod
+    def _query_variants(raw: str) -> list[str]:
+        """Generate tolerant search variants for title-like lookups."""
+        if not isinstance(raw, str):
+            return []
+        s = raw.strip()
+        if not s:
+            return []
+
+        variants: list[str] = []
+
+        # Normalize punctuation/dashes while preserving words.
+        norm = s.lower()
+        norm = norm.replace("---", " ").replace("--", " ")
+        norm = norm.replace("—", " ").replace("–", " ")
+        norm = re.sub(r"[^a-z0-9\s]", " ", norm)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if norm and norm != s.lower():
+            variants.append(norm)
+
+        # Many prompts pass "Show --- Episode"; try show-only and episode-only.
+        split_dash = re.split(r"\s*(?:---|--|—|–|-)\s*", s)
+        if len(split_dash) >= 2:
+            show_only = split_dash[0].strip()
+            tail_only = split_dash[-1].strip()
+            if show_only:
+                variants.append(show_only)
+            if tail_only:
+                variants.append(tail_only)
+
+        # De-duplicate while preserving order.
+        out: list[str] = []
+        seen: set[str] = set()
+        for v in variants:
+            k = v.lower().strip()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(v)
+        return out
+
+    async def _retry_search_with_variants(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Dict[str, Any],
+        client: Any,
+    ) -> Dict[str, Any]:
+        """Retry empty title/query search results with normalized query variants."""
+        if isinstance(result, dict) and result.get("error"):
+            return result
+
+        n_items = _count_items(result)
+        if n_items is None or n_items > 0:
+            return result
+
+        key = "title" if isinstance(args.get("title"), str) else "query" if isinstance(args.get("query"), str) else None
+        if not key:
+            return result
+
+        original = str(args.get(key) or "").strip()
+        for candidate in self._query_variants(original):
+            if candidate.lower() == original.lower():
+                continue
+            retry_args = dict(args)
+            retry_args[key] = candidate
+            try:
+                retry = await client.call_tool(tool_name, retry_args)
+            except Exception:
+                continue
+
+            retry_items = _count_items(retry)
+            if retry_items is not None and retry_items > 0:
+                logger.info(
+                    "Search fallback succeeded for %s: %s -> %s (%d items)",
+                    tool_name,
+                    original,
+                    candidate,
+                    retry_items,
+                )
+                return retry
+
+        return result
 
     async def _call_transcription(
         self, tool_name: str, args: Dict[str, Any],
