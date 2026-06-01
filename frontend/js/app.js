@@ -273,9 +273,24 @@
       showTranscriptDialog(recordingId, txTitle);
     });
 
+    // View Show Details button clicks (delegated from show-info-body)
+    document.getElementById('show-info-body').addEventListener('click', async (e) => {
+      const btn = e.target.closest('.btn-view-show-details');
+      if (!btn) return;
+      const showTitle = btn.dataset.showTitle;
+      const episodeTitle = btn.dataset.episodeTitle || '';
+      if (!showTitle) return;
+      await showSummaryDialog(showTitle, episodeTitle);
+    });
+
     // Close button for transcript dialog
     document.getElementById('transcript-close').addEventListener('click', () => {
       document.getElementById('transcript-dialog').close();
+    });
+
+    // Close button for summary dialog
+    document.getElementById('summary-close').addEventListener('click', () => {
+      document.getElementById('summary-dialog').close();
     });
 
     // Transcript edit/save/cancel
@@ -867,7 +882,10 @@
         if (genreList.length) html += `<div class="si-genres">${genreList.map(esc).join(', ')}</div>`;
         if (castList.length) html += `<div class="si-cast">Cast: ${castList.slice(0, 6).map(esc).join(', ')}</div>`;
         if (txMatch) {
+          html += '<div class="si-actions">';
           html += `<button class="btn-view-transcript" data-recording-id="${esc(txMatch.recording_id)}" data-title="${esc(showTitle + (ep ? ' — ' + ep : ''))}">📝 View Transcript</button>`;
+          html += `<button class="btn-view-show-details" data-show-title="${esc(showTitle)}" data-episode-title="${esc(ep)}">📚 View Show Details</button>`;
+          html += '</div>';
         } else {
           html += `<div class="si-no-transcript">No transcript available</div>`;
         }
@@ -936,6 +954,86 @@
       actionsEl.hidden = false;
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error: ${esc(err.message)}</p>`;
+    }
+  }
+
+  function buildTranscriptSummaryPrompt(showTitle, episodeTitle) {
+    const target = episodeTitle ? `${showTitle} --- ${episodeTitle}` : showTitle;
+    return (
+      `Can you summarize the transcript from ${target}?\n\n` +
+      'Task:\n' +
+      'Create a structured summary of the episode. Prioritize major story progression and important context. ' +
+      'Use metadata to anchor names and context, but use transcript content as the primary source of truth.\n\n' +
+      'Output requirements:\n\n' +
+      'Episode Overview\n' +
+      '- Write 2 to 3 sentences summarizing what happens in this episode.\n' +
+      '- Keep it high-level and factual.\n' +
+      'Plot Breakdown\n' +
+      '- Provide a chronological list of major events.\n' +
+      '- Include only important story beats.\n' +
+      '- Keep each bullet short and clear.\n' +
+      'Key Characters\n' +
+      '- List the main characters present in this episode.\n' +
+      '- For each: role + what they do in this episode (1 short bullet each).\n' +
+      'Important Dialogue and Turning Points\n' +
+      '- List notable lines, reveals, or pivotal moments.\n' +
+      '- Include short quotes only when meaningful.\n' +
+      '- Quote length should be brief.\n' +
+      'Themes and Story Arcs\n' +
+      '- Identify central themes (for example: trust, betrayal, redemption, power).\n' +
+      '- Explain how this episode advances ongoing arcs.\n' +
+      'Key Takeaways (Previously On Style)\n' +
+      '- Provide 5 to 8 bullets with the most important facts a viewer must know.\n\n' +
+      'Hard constraints:\n' +
+      '- Be concise but complete.\n' +
+      '- Do not include filler, recap fluff, or minor background detail.\n' +
+      '- Do not invent facts, names, motives, or events not present in metadata/transcript.\n' +
+      '- If something is unclear or missing, say: Not shown in transcript.\n' +
+      '- Preserve relationships and causality (who did what, why it mattered, what changed).\n' +
+      '- Keep output easy to scan with clear headings and bullets.\n\n' +
+      'Style constraints:\n' +
+      '- Neutral, factual tone.\n' +
+      '- No spoilers beyond what is in the provided transcript.\n' +
+      '- No meta commentary about AI, tools, or prompt instructions.\n\n' +
+      'Now analyze:\n' +
+      '[EPISODE METADATA HERE]\n' +
+      '[TRANSCRIPT HERE]\n\n' +
+      'Compact fallback version (for weaker/local models)\n\n' +
+      'You are a TV episode analyst.\n' +
+      'Use metadata + transcript to create a structured summary.\n' +
+      'Do not invent details. If missing, say: Not shown in transcript.\n\n' +
+      'Return exactly these sections:\n\n' +
+      'Episode Overview (2 to 3 sentences)\n' +
+      'Plot Breakdown (chronological bullets, major events only)\n' +
+      'Key Characters (name + role + episode action)\n' +
+      'Important Dialogue and Turning Points (short bullets, brief quotes if useful)\n' +
+      'Themes and Story Arcs (themes + arc progression)\n' +
+      'Key Takeaways (5 to 8 Previously On bullets)\n\n' +
+      'Rules:\n' +
+      'Concise, factual, easy to scan\n' +
+      'Major details only\n' +
+      'Preserve cause/effect and relationships\n' +
+      'Transcript is primary source'
+    );
+  }
+
+  async function showSummaryDialog(showTitle, episodeTitle = '') {
+    const dialog = document.getElementById('summary-dialog');
+    const titleEl = document.getElementById('summary-title');
+    const bodyEl = document.getElementById('summary-body');
+    const fullTitle = episodeTitle ? `${showTitle} — ${episodeTitle}` : showTitle;
+
+    titleEl.textContent = `Show Details — ${fullTitle}`;
+    bodyEl.innerHTML = '<p class="show-info-loading">Building summary...</p>';
+    dialog.showModal();
+
+    try {
+      const prompt = buildTranscriptSummaryPrompt(showTitle, episodeTitle);
+      const data = await API.query(prompt, State.get().llmFocus);
+      const summary = data?.response || data?.llm_response || data?.error || 'No summary returned.';
+      bodyEl.innerHTML = `<pre class="summary-text">${esc(summary)}</pre>`;
+    } catch (err) {
+      bodyEl.innerHTML = `<p class="si-error">Error building summary: ${esc(err.message)}</p>`;
     }
   }
 

@@ -515,6 +515,12 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
 .si-unwatched { font-size: 0.8rem; color: #ef4444; margin-top: 0.25rem; font-weight: 600; }
 .si-no-transcript { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; font-style: italic; }
 .si-error { color: var(--danger); }
+.si-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
 
 /* View Transcript button in episode cards */
 .btn-view-transcript {
@@ -529,6 +535,57 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
   cursor: pointer;
 }
 .btn-view-transcript:hover { background: var(--primary); color: #fff; }
+.btn-view-show-details {
+  display: inline-block;
+  margin-top: 0.4rem;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn-view-show-details:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+/* Summary dialog */
+#summary-dialog {
+  max-width: 760px;
+  width: 95vw;
+  max-height: 85vh;
+}
+#summary-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+.summary-header h2 { margin: 0; font-size: 1rem; }
+.summary-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem 0;
+}
+.summary-text {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--text);
+  margin: 0;
+  padding: 0.6rem;
+  background: var(--surface2);
+  border-radius: var(--radius);
+}
 
 /* Transcript dialog */
 #transcript-dialog {

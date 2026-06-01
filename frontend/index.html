@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css?v=3.4.0">
+<link rel="stylesheet" href="css/style.css?v=3.4.1">
 </head>
 <body>
   <!-- Region 1: Header -->
@@ -330,12 +330,23 @@
     </div>
   </dialog>
 
+  <!-- Show Summary Popup -->
+  <dialog id="summary-dialog">
+    <div class="summary-header">
+      <h2 id="summary-title">Show Details</h2>
+      <button type="button" id="summary-close" class="dialog-close" aria-label="Close">&times;</button>
+    </div>
+    <div id="summary-body" class="summary-body">
+      <p>Loading...</p>
+    </div>
+  </dialog>
+
   <script src="js/api.js?v=3.4.0"></script>
   <script src="js/state.js?v=3.4.0"></script>
   <script src="js/ui.js?v=3.4.0"></script>
   <script src="js/pcm16-streamer.js?v=3.4.0"></script>
   <script src="js/voice.js?v=3.4.0"></script>
-  <script src="js/app.js?v=3.4.0"></script>
+  <script src="js/app.js?v=3.4.1"></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function(err) {
