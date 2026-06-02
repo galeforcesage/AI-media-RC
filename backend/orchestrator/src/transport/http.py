@@ -329,8 +329,8 @@ async def services():
     cfg = _orchestrator.config if _orchestrator else {}
     channels_url = cfg.get("channels_dvr_url", "http://localhost:8089")
     sagetv_url = cfg.get("sagetv_url", "http://localhost:8080")
-    sagetv_user = cfg.get("sagetv_user", "")
-    sagetv_pass = cfg.get("sagetv_pass", "")
+    sagetv_user = cfg.get("sagetv_user", "sage")
+    sagetv_pass = cfg.get("sagetv_pass", "frey")
     dvr_checks = {
         "channels_dvr": {"name": "Channels DVR", "port": 8089, "url": f"{channels_url}/status",
                          "group": "dvr"},
@@ -627,4 +627,5 @@ async def alerts_clear():
         return {"success": False, "error": "unexpected response"}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
 

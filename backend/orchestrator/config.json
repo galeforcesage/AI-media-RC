@@ -52,8 +52,9 @@
     },
     "channels_dvr_url": "http://localhost:8089",
     "sagetv_url": "http://localhost:8080",
-    "sagetv_user": "",
-    "sagetv_pass": "",
+    "sagetv_user": "sage",
+    "sagetv_pass": "frey",
+    "sagetv_credentials_note": "Published defaults (username: sage, password: frey)",
     "session_manager_url": "http://127.0.0.1:8769",
     "paths": {
         "sagetv_media": "/var/media/tv",
