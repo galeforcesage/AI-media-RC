@@ -27,9 +27,9 @@
     },
     "agent": {
         "max_iterations": 5,
-        "planner": "agentloop",
+        "planner": "openclaw",
         "openclaw": {
-            "enabled": false,
+            "enabled": true,
             "timeout_ms": 30000,
             "max_plan_depth": 5,
             "strict": false,
@@ -52,8 +52,8 @@
     },
     "channels_dvr_url": "http://localhost:8089",
     "sagetv_url": "http://localhost:8080",
-    "sagetv_user": "sage",
-    "sagetv_pass": "frey",
+    "sagetv_user": "",
+    "sagetv_pass": "",
     "session_manager_url": "http://127.0.0.1:8769",
     "paths": {
         "sagetv_media": "/var/media/tv",

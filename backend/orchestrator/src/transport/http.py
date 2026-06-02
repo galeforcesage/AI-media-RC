@@ -1,4 +1,4 @@
-"""
+﻿"""
 http.py
 FastAPI HTTP transport layer for the orchestrator.
 Exposes REST endpoints for query, playback, metadata, system, and search.
@@ -160,7 +160,7 @@ async def query_stream(request: QueryRequest):
 @router.post("/query/voice")
 async def query_voice(audio: UploadFile = File(...)):
     """
-    Run a voice query: upload audio → transcription → LLM → TTS.
+    Run a voice query: upload audio â†’ transcription â†’ LLM â†’ TTS.
     """
     import tempfile, os
     orch = _require_orchestrator()
@@ -311,7 +311,7 @@ async def bridge_status(device: str = Query(..., description="Device name")):
 async def services():
     """
     Health-check all AI-media-RC services.
-    Returns a dict of service_id → { name, port, status, latency_ms }.
+    Returns a dict of service_id â†’ { name, port, status, latency_ms }.
     """
     import aiohttp
     import time
@@ -329,7 +329,7 @@ async def services():
     cfg = _orchestrator.config if _orchestrator else {}
     channels_url = cfg.get("channels_dvr_url", "http://localhost:8089")
     sagetv_url = cfg.get("sagetv_url", "http://localhost:8080")
-    sagetv_user = cfg.get("sagetv_user", "sage")
+    sagetv_user = cfg.get("sagetv_user", "")
     sagetv_pass = cfg.get("sagetv_pass", "")
     dvr_checks = {
         "channels_dvr": {"name": "Channels DVR", "port": 8089, "url": f"{channels_url}/status",
@@ -627,3 +627,4 @@ async def alerts_clear():
         return {"success": False, "error": "unexpected response"}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+

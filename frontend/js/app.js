@@ -279,8 +279,9 @@
       if (!btn) return;
       const showTitle = btn.dataset.showTitle;
       const episodeTitle = btn.dataset.episodeTitle || '';
+      const recordingId = btn.dataset.recordingId || '';
       if (!showTitle) return;
-      await showSummaryDialog(showTitle, episodeTitle);
+      await showSummaryDialog(showTitle, episodeTitle, recordingId);
     });
 
     // Close button for transcript dialog
@@ -685,6 +686,7 @@
       detailsBtn.className = 'btn-view-show-details';
       detailsBtn.dataset.showTitle = show;
       detailsBtn.dataset.episodeTitle = episode;
+      detailsBtn.dataset.recordingId = btn.dataset.recordingId || '';
       detailsBtn.textContent = '📚 View Show Details';
       actions.appendChild(detailsBtn);
     });
@@ -913,7 +915,7 @@
         } else {
           html += `<span class="si-no-transcript">No transcript available</span>`;
         }
-        html += `<button class="btn-view-show-details" data-show-title="${esc(showTitle)}" data-episode-title="${esc(ep)}">📚 View Show Details</button>`;
+        html += `<button class="btn-view-show-details" data-show-title="${esc(showTitle)}" data-episode-title="${esc(ep)}" data-recording-id="${esc(txMatch?.recording_id || '')}">📚 View Show Details</button>`;
         html += '</div>';
         html += '</div></div>';
       });
@@ -923,6 +925,13 @@
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error: ${esc(err.message)}</p>`;
     }
+  }
+
+  async function loadTranscriptData(recordingId) {
+    if (!recordingId) return null;
+    const data = await API.getTranscript(recordingId);
+    if (!data || data.error) return null;
+    return data;
   }
 
   async function showTranscriptDialog(recordingId, txTitle) {
@@ -942,8 +951,8 @@
     dialog.showModal();
 
     try {
-      const data = await API.getTranscript(recordingId);
-      if (!data || data.error) {
+      const data = await loadTranscriptData(recordingId);
+      if (!data) {
         bodyEl.innerHTML = `<p>Transcript not found.</p>`;
         return;
       }
@@ -984,10 +993,18 @@
     }
   }
 
-  function buildTranscriptSummaryPrompt(showTitle, episodeTitle) {
+  function buildTranscriptSummaryPrompt(showTitle, episodeTitle, transcriptText = '', recordingId = '') {
     const target = episodeTitle ? `${showTitle} --- ${episodeTitle}` : showTitle;
+    const tx = (transcriptText || '').trim();
+    const txSnippet = tx ? tx.slice(0, 12000) : '';
+    const metadataLines = [
+      `Show title: ${showTitle}`,
+      `Episode title: ${episodeTitle || 'Unknown'}`,
+      `Recording ID: ${recordingId || 'Unknown'}`,
+    ];
     return (
-      `Can you summarize the transcript from ${target}?\n\n` +
+      `Create a structured episode summary for ${target}.\n` +
+      'Use the metadata and transcript content provided below as your only source.\n\n' +
       'Task:\n' +
       'Create a structured summary of the episode. Prioritize major story progression and important context. ' +
       'Use metadata to anchor names and context, but use transcript content as the primary source of truth.\n\n' +
@@ -1040,25 +1057,48 @@
       'Concise, factual, easy to scan\n' +
       'Major details only\n' +
       'Preserve cause/effect and relationships\n' +
-      'Transcript is primary source'
+      'Transcript is primary source\n\n' +
+      'Episode metadata:\n' +
+      `${metadataLines.join('\n')}\n\n` +
+      'Transcript:\n' +
+      `${txSnippet || 'Not provided. If unavailable, state: Not shown in transcript.'}`
     );
   }
 
-  async function showSummaryDialog(showTitle, episodeTitle = '') {
+  async function showSummaryDialog(showTitle, episodeTitle = '', recordingId = '') {
     const dialog = document.getElementById('summary-dialog');
     const titleEl = document.getElementById('summary-title');
     const bodyEl = document.getElementById('summary-body');
     const fullTitle = episodeTitle ? `${showTitle} — ${episodeTitle}` : showTitle;
 
     titleEl.textContent = `Show Details — ${fullTitle}`;
-    bodyEl.innerHTML = '<p class="show-info-loading">Building summary...</p>';
+    bodyEl.innerHTML = [
+      '<p class="show-info-loading">Processing summary...</p>',
+      '<div class="si-meta" id="summary-status-line">Preparing transcript...</div>'
+    ].join('');
     dialog.showModal();
 
     try {
-      const prompt = buildTranscriptSummaryPrompt(showTitle, episodeTitle);
-      const data = await API.query(prompt, State.get().llmFocus);
+      const transcriptData = await loadTranscriptData(recordingId);
+      if (!transcriptData || !transcriptData.transcript) {
+        bodyEl.innerHTML = '<p class="si-no-transcript">No transcript available for this episode yet.</p>';
+        return;
+      }
+
+      const statusLine = document.getElementById('summary-status-line');
+      if (statusLine) statusLine.textContent = 'Transcript loaded. Generating summary...';
+
+      const prompt = buildTranscriptSummaryPrompt(showTitle, episodeTitle, transcriptData.transcript, recordingId);
+      const data = await API.queryStream(
+        prompt,
+        State.get().llmFocus,
+        (status) => {
+          const statusEl = document.getElementById('summary-status-line');
+          if (statusEl) statusEl.textContent = status;
+        }
+      );
       const summary = data?.response || data?.llm_response || data?.error || 'No summary returned.';
-      bodyEl.innerHTML = `<pre class="summary-text">${esc(summary)}</pre>`;
+      bodyEl.innerHTML = `<div class="transcript-content"><pre class="transcript-text summary-text">${esc(summary)}</pre></div>`;
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error building summary: ${esc(err.message)}</p>`;
     }

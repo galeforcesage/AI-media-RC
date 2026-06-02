@@ -4,7 +4,7 @@
   Provides offline shell so the app installs on all platforms.
 */
 
-const CACHE_NAME = 'llm-remote-v3.6.2';
+const CACHE_NAME = 'llm-remote-v3.6.6';
 
 const SHELL_ASSETS = [
   '/',

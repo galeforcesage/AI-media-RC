@@ -799,6 +799,57 @@ class Orchestrator:
                 return None
 
             _summary_title = _extract_summary_title(prompt)
+            _has_inline_transcript = bool(
+                re.search(r"\btranscript:\s*\S", prompt, re.I)
+            )
+            if _has_inline_transcript:
+                _summary_title = None
+            # Summary/recap requests should always go through the dedicated
+            # summary path. The meta-transcript regex is intentionally broad
+            # for inventory-style questions and can accidentally match long
+            # structured prompts that contain words like "list".
+            if _summary_title:
+                _is_meta_transcript = False
+            if _has_inline_transcript:
+                _is_meta_transcript = False
+
+            if _has_inline_transcript:
+                if status_callback:
+                    await status_callback("Analyzing transcript")
+
+                llm_cfg = self.config.get("llm", {})
+                summary_params = {
+                    "num_predict": int(llm_cfg.get("summary_num_predict", 640)),
+                    "temperature": float(llm_cfg.get("summary_temperature", 0.2)),
+                }
+                summary_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a TV episode analyst. Use ONLY the metadata and transcript provided by the user. "
+                            "Do not call tools. Do not use prior knowledge. If detail is missing, say 'Not shown in transcript.' "
+                            "Return ONLY these sections with headings and bullets: Episode Overview, Plot Breakdown, "
+                            "Key Characters, Important Dialogue and Turning Points, Themes and Story Arcs, Key Takeaways."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+
+                llm_result = await self.llm.stream_chat(
+                    summary_messages,
+                    token_callback=token_callback,
+                    params=summary_params,
+                )
+                response_text = (llm_result or {}).get("response", "")
+                if not response_text and llm_result.get("error"):
+                    return {"error": llm_result["error"]}
+                return {
+                    "status": "ok",
+                    "llm_response": response_text or "No summary returned.",
+                    "transcript_results": [],
+                    "fast_path": True,
+                    "model": llm_result.get("model", ""),
+                }
 
             async def _call_transcript_tool(_tool: str, _args: Dict[str, Any]) -> Dict[str, Any]:
                 import asyncio as _aio
