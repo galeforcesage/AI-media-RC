@@ -45,6 +45,11 @@ class TranscriptionQueue:
                 duration REAL DEFAULT 0
             )
         """)
+        # Migration: add dead_letter_reason column if not present
+        try:
+            self._conn.execute("SELECT dead_letter_reason FROM jobs LIMIT 0")
+        except sqlite3.OperationalError:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN dead_letter_reason TEXT DEFAULT ''")
         self._conn.commit()
         logger.info("Transcription queue opened: %s", self.db_path)
 
@@ -173,6 +178,91 @@ class TranscriptionQueue:
             }
             for r in rows
         ]
+
+    def recover_stale_jobs(self, stale_seconds: int = 1800) -> int:
+        """Reset stale jobs back to 'pending' if under max_attempts,
+        or move to 'dead_letter' if exhausted. Returns count recovered."""
+        cutoff = time.time() - stale_seconds
+        now = time.time()
+        rows = self._conn.execute(
+            """SELECT job_id, attempts, max_attempts, error
+               FROM jobs
+               WHERE status IN ('extracting', 'processing')
+                 AND updated_at < ?""",
+            (cutoff,),
+        ).fetchall()
+        recovered = 0
+        for row in rows:
+            job_id = row["job_id"]
+            if row["attempts"] >= row["max_attempts"]:
+                # Move to dead letter
+                self._conn.execute(
+                    """UPDATE jobs SET status = 'dead_letter',
+                       dead_letter_reason = ?, updated_at = ?
+                       WHERE job_id = ?""",
+                    (f"Stale after {row['attempts']} attempts: {row['error']}", now, job_id),
+                )
+                logger.warning("Job %s moved to dead letter (exhausted retries)", job_id)
+            else:
+                # Reset to pending for retry
+                self._conn.execute(
+                    """UPDATE jobs SET status = 'pending', updated_at = ?
+                       WHERE job_id = ?""",
+                    (now, job_id),
+                )
+                recovered += 1
+                logger.info("Job %s recovered from stale state -> pending", job_id)
+        self._conn.commit()
+        return recovered
+
+    def list_dead_letter(self, limit: int = 50) -> List[Dict]:
+        """List jobs in dead_letter status."""
+        rows = self._conn.execute(
+            """SELECT job_id, system, recording_id, file_path, attempts,
+                      error, dead_letter_reason, created_at, updated_at
+               FROM jobs WHERE status = 'dead_letter'
+               ORDER BY updated_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "job_id": r["job_id"],
+                "system": r["system"],
+                "recording_id": r["recording_id"],
+                "file_path": r["file_path"],
+                "attempts": r["attempts"],
+                "error": r["error"],
+                "dead_letter_reason": r["dead_letter_reason"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def retry_dead_letter(self, job_id: str) -> bool:
+        """Reset a dead-lettered job back to pending for retry."""
+        row = self._conn.execute(
+            "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if not row or row["status"] != "dead_letter":
+            return False
+        now = time.time()
+        self._conn.execute(
+            """UPDATE jobs SET status = 'pending', attempts = 0,
+               error = '', dead_letter_reason = '', updated_at = ?
+               WHERE job_id = ?""",
+            (now, job_id),
+        )
+        self._conn.commit()
+        logger.info("Dead-lettered job %s retried -> pending", job_id)
+        return True
+
+    def dead_letter_count(self) -> int:
+        """Return count of dead-lettered jobs."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'dead_letter'"
+        ).fetchone()
+        return row["cnt"] if row else 0
 
     def _row_to_job(self, row) -> TranscriptionJob:
         return TranscriptionJob(

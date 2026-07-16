@@ -40,6 +40,8 @@ from utils.logger import get_logger
 from orchestrator import Orchestrator
 from transport.http import router as http_router, init_http_transport
 from transport.mcp import MCPServer
+from transport.ws import router as ws_router, init_ws_transport
+from api.routes.debug import router as debug_router
 from services.stt import STTService
 
 logger = get_logger(__name__)
@@ -141,7 +143,10 @@ def create_app(orchestrator: Orchestrator, config: Dict[str, Any] | None = None)
     )
 
     init_http_transport(orchestrator)
+    init_ws_transport(orchestrator)
     app.include_router(http_router, prefix="/api")
+    app.include_router(ws_router)
+    app.include_router(debug_router)
 
     # ── STT WebSocket ───────────────────────────────────────
     _config = config or {}

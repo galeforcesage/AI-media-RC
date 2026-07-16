@@ -56,9 +56,17 @@ class TranscriptionWorker:
         except (OSError, AttributeError):
             pass  # nice() not available on all platforms
 
+        # Crash recovery: reset any stale jobs from a prior unclean shutdown
+        recovered = self.queue.recover_stale_jobs(stale_seconds=300)
+        if recovered:
+            logger.info("Crash recovery: %d stale jobs reset to pending", recovered)
+
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
         logger.info("Transcription worker started (concurrency=%d)", self.concurrency)
+
+        # Start periodic health check in background
+        asyncio.create_task(self._periodic_health_check())
 
         while self._running:
             try:
@@ -74,6 +82,33 @@ class TranscriptionWorker:
 
     def stop(self) -> None:
         self._running = False
+
+    async def _periodic_health_check(self) -> None:
+        """Periodically check for stale jobs and recover them."""
+        while self._running:
+            await asyncio.sleep(300)  # Every 5 minutes
+            if not self._running:
+                break
+            try:
+                recovered = self.queue.recover_stale_jobs(stale_seconds=1800)
+                if recovered:
+                    logger.info("Health check: recovered %d stale jobs", recovered)
+            except Exception:
+                logger.exception("Health check error")
+
+    def health(self) -> dict:
+        """Return worker health status."""
+        stats = self.queue.stats()
+        stale = self.queue.find_stale_jobs()
+        dlq_count = self.queue.dead_letter_count()
+        return {
+            "running": self._running,
+            "concurrency": self.concurrency,
+            "active_jobs": self._active_jobs,
+            "queue_stats": stats,
+            "stale_jobs": len(stale),
+            "dead_letter_count": dlq_count,
+        }
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
