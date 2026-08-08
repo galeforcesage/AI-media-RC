@@ -13,9 +13,12 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .gpu import release_cuda_memory
+from .gpu import release_cuda_memory, cuda_is_usable
 
 logger = logging.getLogger(__name__)
+
+# pyannote needs a meaningful amount of audio; anything shorter is noise.
+MIN_DIARIZATION_SECONDS = 0.5
 
 # Lazy-loaded pyannote pipeline
 _pipeline = None
@@ -117,10 +120,31 @@ def _load_pipeline():
 
         logger.info("Loading pyannote speaker-diarization-3.1 pipeline...")
         start = time.time()
-        _pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=token,
-        )
+        # pyannote.audio 4.x renamed `use_auth_token` to `token`; 3.x only
+        # accepts the old name. Try the modern kwarg and fall back so this
+        # works against either major version.
+        try:
+            _pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=token,
+            )
+        except TypeError:
+            _pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=token,
+            )
+        # pyannote defaults to CPU. Move to GPU only when torch can genuinely
+        # run kernels here — see cuda_is_usable() for why is_available() alone
+        # is not enough.
+        if cuda_is_usable():
+            try:
+                import torch
+                _pipeline.to(torch.device("cuda"))
+                logger.info("Diarization pipeline moved to CUDA")
+            except Exception:
+                logger.exception("Could not move diarization pipeline to CUDA; staying on CPU")
+        else:
+            logger.info("Diarization pipeline running on CPU")
         logger.info("Diarization pipeline loaded in %.1fs", time.time() - start)
         return _pipeline
 
@@ -130,24 +154,52 @@ def _load_pipeline():
         return None
 
 
-def _load_audio_as_waveform(audio_path: str) -> dict:
+def _load_audio_as_waveform(audio_path: str) -> Optional[dict]:
     """Load audio file as a waveform dict that pyannote can consume directly.
 
     This bypasses pyannote's built-in audio loading which requires torchcodec.
-    Returns: {"waveform": Tensor(channel, time), "sample_rate": int}
+    Returns {"waveform": Tensor(channel, time), "sample_rate": int}, or None if
+    the file holds too little audio to diarize.
+
+    pyannote rejects any waveform where ``shape[0] > shape[1]``, so a zero-length
+    file (left behind by a failed ffmpeg extraction) arrives as (1, 0) and blows
+    up with a confusing "must be provided as a (channel, time) torch Tensor".
+    Screen those out here instead.
     """
     import torch
     import soundfile as sf
     import numpy as np
 
     data, sample_rate = sf.read(audio_path, dtype="float32")
+    if data.size == 0:
+        logger.warning("Diarization skipped: %s contains no audio samples", audio_path)
+        return None
+
     # soundfile returns (samples,) for mono or (samples, channels) for stereo
     if data.ndim == 1:
         data = data[np.newaxis, :]  # (1, samples)
     else:
         data = data.T  # (channels, samples)
-    waveform = torch.from_numpy(data)
-    return {"waveform": waveform, "sample_rate": sample_rate}
+
+    n_channels, n_samples = data.shape
+    duration = n_samples / float(sample_rate or 1)
+    if duration < MIN_DIARIZATION_SECONDS:
+        logger.warning(
+            "Diarization skipped: %s is only %.2fs (minimum %.2fs)",
+            audio_path, duration, MIN_DIARIZATION_SECONDS,
+        )
+        return None
+    if n_channels > n_samples:
+        logger.warning(
+            "Diarization skipped: %s has more channels (%d) than samples (%d)",
+            audio_path, n_channels, n_samples,
+        )
+        return None
+
+    # .T yields a non-contiguous view; make it contiguous so torch doesn't have
+    # to copy it again downstream.
+    waveform = torch.from_numpy(np.ascontiguousarray(data))
+    return {"waveform": waveform, "sample_rate": int(sample_rate)}
 
 
 def diarize(audio_path: str) -> List[Dict[str, Any]]:
@@ -166,6 +218,8 @@ def diarize(audio_path: str) -> List[Dict[str, Any]]:
     start = time.time()
     # Load audio ourselves to bypass torchcodec AudioDecoder issue
     audio_input = _load_audio_as_waveform(audio_path)
+    if audio_input is None:
+        return []
     result = pipeline(audio_input)
     elapsed = time.time() - start
     logger.info("Diarization complete in %.1fs", elapsed)
