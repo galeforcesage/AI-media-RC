@@ -20,11 +20,17 @@ import hashlib
 import aiohttp
 
 from utils.logger import get_logger
+from services.gpu import release_cuda_memory
 
 logger = get_logger(__name__)
 
 # Lightweight model — ~80MB, fast on CPU, good quality
 DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
+# Run embeddings on CPU by default. This model is small and CPU-fast, but
+# sentence-transformers auto-selects CUDA when available, which pins a ~500MB
+# CUDA context in the orchestrator process for the entire uptime of the
+# service. The GPU is far better spent on Whisper/Ollama.
+DEFAULT_EMBED_DEVICE = "cpu"
 COLLECTION_NAME = "media_index"
 CHROMA_DIR = os.path.join(os.path.expanduser("~"), ".llm-remote", "chroma_db")
 CHANNELS_DVR_URL = "http://localhost:8089"
@@ -59,6 +65,7 @@ class SemanticIndex:
         # Pull tunables from config
         sem_cfg = getattr(orchestrator, "config", {}).get("semantic", {})
         self._embed_model = sem_cfg.get("embed_model", DEFAULT_EMBED_MODEL)
+        self._embed_device = sem_cfg.get("embed_device", DEFAULT_EMBED_DEVICE)
         self._encode_batch_size = sem_cfg.get("encode_batch_size", DEFAULT_ENCODE_BATCH_SIZE)
 
         # Scale max_chars for format_context with LLM context window
@@ -89,8 +96,9 @@ class SemanticIndex:
         from sentence_transformers import SentenceTransformer
         import chromadb
 
-        logger.info("Loading embedding model: %s (max %d threads)", self._embed_model, _MAX_ENCODE_THREADS)
-        self._embedder = SentenceTransformer(self._embed_model)
+        logger.info("Loading embedding model: %s (device=%s, max %d threads)",
+                    self._embed_model, self._embed_device, _MAX_ENCODE_THREADS)
+        self._embedder = SentenceTransformer(self._embed_model, device=self._embed_device)
 
         os.makedirs(CHROMA_DIR, exist_ok=True)
         client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -101,13 +109,17 @@ class SemanticIndex:
         self._doc_count = self._collection.count()
 
     async def stop(self) -> None:
-        """Cancel background refresh."""
+        """Cancel background refresh and release the embedding model."""
         if self._refresh_task:
             self._refresh_task.cancel()
             try:
                 await self._refresh_task
             except asyncio.CancelledError:
                 pass
+        self._ready = False
+        if self._embedder is not None:
+            self._embedder = None
+            release_cuda_memory()
 
     @property
     def ready(self) -> bool:

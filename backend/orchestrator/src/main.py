@@ -145,7 +145,10 @@ def create_app(orchestrator: Orchestrator, config: Dict[str, Any] | None = None)
 
     # ── STT WebSocket ───────────────────────────────────────
     _config = config or {}
-    stt = STTService(model_name=_config.get("stt_model", "base"))
+    stt = STTService(
+        model_name=_config.get("stt_model", "base"),
+        idle_timeout=float(_config.get("stt_idle_timeout", 300)),
+    )
 
     @app.websocket("/ws/stt")
     async def ws_stt(ws: WebSocket):
@@ -231,6 +234,7 @@ def create_app(orchestrator: Orchestrator, config: Dict[str, Any] | None = None)
     @app.on_event("shutdown")
     async def on_shutdown() -> None:
         await orchestrator.shutdown()
+        await stt.aclose()
 
     return app
 

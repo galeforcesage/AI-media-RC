@@ -13,6 +13,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .gpu import release_cuda_memory
+
 logger = logging.getLogger(__name__)
 
 # Lazy-loaded pyannote pipeline
@@ -42,6 +44,24 @@ def is_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def is_loaded() -> bool:
+    """True if the diarization pipeline is currently resident in memory."""
+    return _pipeline is not None
+
+
+def unload() -> None:
+    """Release the cached pyannote pipeline and any VRAM it holds.
+
+    The next call to ``diarize()`` transparently reloads it.
+    """
+    global _pipeline
+    if _pipeline is None:
+        return
+    logger.info("Unloading pyannote diarization pipeline to free memory")
+    _pipeline = None
+    release_cuda_memory()
 
 
 def _load_pipeline():

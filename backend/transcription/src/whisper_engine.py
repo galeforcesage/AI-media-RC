@@ -12,6 +12,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .gpu import release_cuda_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +114,22 @@ class WhisperEngine:
             cpu_threads=self._cpu_threads,
         )
         logger.info("Whisper model loaded in %.1fs", time.time() - start)
+
+    def unload(self) -> None:
+        """Release the model and hand its VRAM back to the driver.
+
+        Safe to call at any time — ``transcribe()`` reloads on demand.
+        """
+        if self._model is None:
+            return
+        logger.info("Unloading Whisper model %s (device=%s) to free VRAM",
+                    self._model_name, self._device)
+        self._model = None
+        release_cuda_memory()
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
 
     def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.

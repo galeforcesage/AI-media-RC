@@ -36,6 +36,7 @@ class TranscriptionWorker:
         engine: WhisperEngine,
         concurrency: int = 1,
         poll_interval: float = 10.0,
+        gpu_idle_timeout: float = 600.0,
     ):
         self.queue = queue
         self.store = store
@@ -44,9 +45,12 @@ class TranscriptionWorker:
         self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
+        self.gpu_idle_timeout = gpu_idle_timeout
         self._running = False
         self._active_jobs = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._last_job_end = time.monotonic()
+        self._reaper_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
@@ -58,13 +62,18 @@ class TranscriptionWorker:
 
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
-        logger.info("Transcription worker started (concurrency=%d)", self.concurrency)
+        logger.info("Transcription worker started (concurrency=%d, gpu_idle_timeout=%ss)",
+                    self.concurrency, self.gpu_idle_timeout)
+
+        if self.gpu_idle_timeout > 0:
+            self._reaper_task = asyncio.create_task(self._idle_reaper())
 
         while self._running:
             try:
                 job = self.queue.dequeue()
                 if job:
                     await self._semaphore.acquire()
+                    self._active_jobs += 1
                     asyncio.create_task(self._process_with_semaphore(job))
                 else:
                     await asyncio.sleep(self.poll_interval)
@@ -72,13 +81,52 @@ class TranscriptionWorker:
                 logger.exception("Worker loop error")
                 await asyncio.sleep(self.poll_interval)
 
+    async def _idle_reaper(self) -> None:
+        """Release Whisper/diarization models when the queue has been idle.
+
+        Models are reloaded automatically on the next job. This trades a few
+        seconds of reload latency for several GB of VRAM that would otherwise
+        sit pinned 24/7 between recordings.
+        """
+        interval = max(15.0, min(self.gpu_idle_timeout / 4, 60.0))
+        while self._running:
+            await asyncio.sleep(interval)
+            if self._active_jobs > 0:
+                continue
+            if not (self.engine.loaded or diarization.is_loaded()):
+                continue
+            idle_for = time.monotonic() - self._last_job_end
+            if idle_for < self.gpu_idle_timeout:
+                continue
+            # Don't unload if work is waiting or in flight
+            try:
+                stats = self.queue.stats()
+                if stats.get("pending") or stats.get("processing") or stats.get("extracting"):
+                    continue
+            except Exception:
+                logger.debug("Queue stats unavailable during idle check", exc_info=True)
+            logger.info("Idle for %.0fs — releasing GPU models", idle_for)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, self.engine.unload)
+                await loop.run_in_executor(None, diarization.unload)
+            except Exception:
+                logger.exception("Failed to release GPU models")
+
     def stop(self) -> None:
         self._running = False
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            self._reaper_task = None
+        self.engine.unload()
+        diarization.unload()
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
             await self._process(job)
         finally:
+            self._active_jobs -= 1
+            self._last_job_end = time.monotonic()
             self._semaphore.release()
 
     async def _process(self, job: TranscriptionJob) -> None:

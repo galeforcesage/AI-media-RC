@@ -17,17 +17,32 @@ import time
 import wave
 from typing import Optional
 
+from services.gpu import release_cuda_memory
+
 logger = logging.getLogger(__name__)
+
+# Release the STT model after this many seconds without a transcription.
+# Voice commands are bursty and short, so holding a CUDA context between
+# utterances wastes VRAM that Whisper transcription / Ollama could use.
+DEFAULT_IDLE_TIMEOUT = 300.0
+_REAPER_INTERVAL = 30.0
 
 
 class STTService:
-    """Voice command transcription using faster-whisper."""
+    """Voice command transcription using faster-whisper.
 
-    def __init__(self, model_name: str = "base"):
+    The model is loaded lazily on first use and released again once the
+    service has been idle for ``idle_timeout`` seconds.
+    """
+
+    def __init__(self, model_name: str = "base", idle_timeout: float = DEFAULT_IDLE_TIMEOUT):
         self._model_name = model_name
         self._model = None
         self._lock = asyncio.Lock()
         self._device = "cpu"
+        self._idle_timeout = idle_timeout
+        self._last_used = 0.0
+        self._reaper: Optional[asyncio.Task] = None
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -58,14 +73,64 @@ class STTService:
         )
         logger.info("Whisper STT model loaded in %.1fs", time.time() - start)
 
+    def unload(self) -> None:
+        """Drop the model and hand its VRAM back to the driver."""
+        if self._model is None:
+            return
+        logger.info("Releasing idle Whisper STT model (device=%s)", self._device)
+        self._model = None
+        release_cuda_memory()
+
+    def _touch(self) -> None:
+        self._last_used = time.time()
+
+    def _ensure_reaper(self) -> None:
+        """Start the idle-unload task (lazily, once an event loop exists)."""
+        if self._idle_timeout <= 0:
+            return
+        if self._reaper is not None and not self._reaper.done():
+            return
+        try:
+            self._reaper = asyncio.get_running_loop().create_task(self._reap_loop())
+        except RuntimeError:
+            pass  # no running loop yet; will retry on next transcribe
+
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_REAPER_INTERVAL)
+            if self._model is None:
+                continue
+            if time.time() - self._last_used < self._idle_timeout:
+                continue
+            async with self._lock:
+                # Re-check under the lock so we never unload mid-transcription
+                if self._model is not None and time.time() - self._last_used >= self._idle_timeout:
+                    await asyncio.get_event_loop().run_in_executor(None, self.unload)
+
+    async def aclose(self) -> None:
+        """Cancel the reaper and release the model (call on shutdown)."""
+        if self._reaper:
+            self._reaper.cancel()
+            try:
+                await self._reaper
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reaper = None
+        self.unload()
+
     async def transcribe_pcm(
         self, pcm_bytes: bytes, sample_rate: int = 16000
     ) -> str:
         """Transcribe raw PCM16-LE mono audio bytes."""
+        self._ensure_reaper()
         async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(
-                None, self._transcribe_sync, pcm_bytes, sample_rate,
-            )
+            self._touch()
+            try:
+                return await asyncio.get_event_loop().run_in_executor(
+                    None, self._transcribe_sync, pcm_bytes, sample_rate,
+                )
+            finally:
+                self._touch()
 
     def _transcribe_sync(self, pcm_bytes: bytes, sample_rate: int) -> str:
         self._ensure_loaded()
