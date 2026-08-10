@@ -174,6 +174,39 @@ class TranscriptionQueue:
             for r in rows
         ]
 
+    def reset_stale_jobs(self, stale_seconds: int = 1800) -> int:
+        """Return abandoned 'extracting'/'processing' jobs to the queue.
+
+        Those two states only make sense while a worker is actively holding the
+        job. If the process dies mid-extraction the row is never updated again,
+        which strands it permanently: enqueue() refuses to re-add a recording
+        that already has a non-terminal job, so the recording can never be
+        transcribed again. Jobs past max_attempts go to 'error' instead of
+        looping forever. Returns the number of rows changed.
+        """
+        cutoff = time.time() - stale_seconds
+        rows = self._conn.execute(
+            """SELECT job_id, attempts, max_attempts FROM jobs
+               WHERE status IN ('extracting', 'processing') AND updated_at < ?""",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0
+        now = time.time()
+        for r in rows:
+            exhausted = (r["attempts"] or 0) >= (r["max_attempts"] or 3)
+            self._conn.execute(
+                "UPDATE jobs SET status = ?, updated_at = ?, error = ? WHERE job_id = ?",
+                (
+                    "error" if exhausted else "pending",
+                    now,
+                    "Abandoned in progress; worker exited before finishing",
+                    r["job_id"],
+                ),
+            )
+        self._conn.commit()
+        return len(rows)
+
     def _row_to_job(self, row) -> TranscriptionJob:
         return TranscriptionJob(
             job_id=row["job_id"],

@@ -62,6 +62,17 @@ class TranscriptionWorker:
 
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
+
+        # Jobs left in 'extracting'/'processing' by a previous run are never
+        # touched again, and enqueue() won't re-add their recording, so recover
+        # them before starting rather than stranding those recordings forever.
+        try:
+            recovered = self.queue.reset_stale_jobs()
+            if recovered:
+                logger.warning("Recovered %d job(s) abandoned by a previous run", recovered)
+        except Exception:
+            logger.exception("Stale job recovery failed")
+
         logger.info("Transcription worker started (concurrency=%d, gpu_idle_timeout=%ss)",
                     self.concurrency, self.gpu_idle_timeout)
 
@@ -98,10 +109,15 @@ class TranscriptionWorker:
             idle_for = time.monotonic() - self._last_job_end
             if idle_for < self.gpu_idle_timeout:
                 continue
-            # Don't unload if work is waiting or in flight
+            # Only *pending* work should hold the models: the worker loop will
+            # pick it up within poll_interval. Deliberately not checking the
+            # 'extracting'/'processing' counts here — those are rows some worker
+            # claimed, and a job this process is really running is already
+            # covered by _active_jobs above. Rows abandoned by an earlier run
+            # stay in those states forever, and treating them as live work
+            # pinned several GB of VRAM indefinitely.
             try:
-                stats = self.queue.stats()
-                if stats.get("pending") or stats.get("processing") or stats.get("extracting"):
+                if self.queue.stats().get("pending"):
                     continue
             except Exception:
                 logger.debug("Queue stats unavailable during idle check", exc_info=True)
