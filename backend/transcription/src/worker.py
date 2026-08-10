@@ -317,6 +317,14 @@ class TranscriptionWorker:
         # Skip diarization for non-final incremental jobs (will run on complete file)
         diarization_turns = []
         if diarization.is_available() and not (is_incremental and not is_final):
+            # All Whisper work for this job is done by now, and diarization is
+            # the memory-hungry step. Holding both resident peaks around 6.5 GB
+            # of VRAM; dropping Whisper first keeps the peak near 4 GB so a live
+            # TV transcoder sharing this GPU has headroom. Nothing here is
+            # latency-sensitive (every job is queued or batched) and transcribe()
+            # reloads on demand, so the reload cost lands on batch throughput
+            # rather than on anything a viewer sees.
+            await loop.run_in_executor(None, self.engine.unload)
             try:
                 diarization_turns = await loop.run_in_executor(
                     None, diarization.diarize, audio_path
