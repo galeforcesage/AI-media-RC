@@ -85,11 +85,32 @@ class TranscriptionQueue:
         return job
 
     def dequeue(self) -> Optional[TranscriptionJob]:
-        """Get the next pending job (oldest first)."""
+        """Claim the next pending job (oldest first).
+
+        The claim has to happen here, not in the worker. The worker hands each
+        job to a background task and immediately polls again, so a row that was
+        only read stays 'pending' and gets handed out a second time before the
+        task has started. With concurrency 1 the duplicate simply waits on the
+        semaphore and then transcribes the same recording all over again, which
+        doubled GPU time per recording and made the queue appear to stall.
+        Flipping the row to 'extracting' as part of the claim closes that
+        window; a claim lost to another worker returns None.
+
+        Attempts are counted by the worker's own 'extracting' update, so this
+        deliberately does not increment them.
+        """
         row = self._conn.execute(
             "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
+            return None
+        claimed = self._conn.execute(
+            "UPDATE jobs SET status = 'extracting', updated_at = ?"
+            " WHERE job_id = ? AND status = 'pending'",
+            (time.time(), row["job_id"]),
+        )
+        self._conn.commit()
+        if claimed.rowcount == 0:
             return None
         return self._row_to_job(row)
 
