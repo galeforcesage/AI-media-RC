@@ -14,7 +14,7 @@ import time
 from typing import Any, Dict, Optional
 
 from .enrichment import MetadataEnrichmentPipeline
-from .extractor import AudioExtractor
+from .extractor import AudioExtractor, PermanentExtractionError
 from .models import TranscriptMetadata, TranscriptionJob
 from .queue import TranscriptionQueue
 from .store import MetadataStore
@@ -183,6 +183,12 @@ class TranscriptionWorker:
                 job.file_path, job.recording_id, start_seconds=start_seconds,
             )
             self.queue.update_status(job.job_id, "processing", temp_audio_path=audio_path)
+        except PermanentExtractionError as e:
+            # Retrying re-reads the whole source file for a guaranteed failure,
+            # so fail straight to error and leave a readable reason behind.
+            logger.error("Extraction permanently failed for %s: %s", job.job_id, e)
+            self.queue.update_status(job.job_id, "error", error=f"Extraction: {e}")
+            return
         except Exception as e:
             logger.error("Extraction failed for %s: %s", job.job_id, e)
             self.queue.mark_for_retry(job.job_id, f"Extraction: {e}")

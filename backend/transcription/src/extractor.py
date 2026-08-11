@@ -11,10 +11,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ffmpeg messages that mean "retrying this will fail exactly the same way".
+# Everything else (I/O hiccups, a file still being written, transient disk
+# pressure) is worth another attempt.
+_PERMANENT_FFMPEG_ERRORS = (
+    "no decoder found for",
+    "decoder not found",
+)
+
+
+class PermanentExtractionError(RuntimeError):
+    """Extraction failed for a reason that retrying cannot fix.
+
+    Retrying costs a full re-read of the source file, so failures that are
+    deterministic (a missing file, audio in a codec this ffmpeg build cannot
+    decode) should burn one attempt, not the whole retry budget.
+    """
+
+
+_MISSING_DECODER_RE = re.compile(r"no decoder found for:?\s*([A-Za-z0-9_]+)", re.IGNORECASE)
+
+
+def _missing_decoder(err_text: str) -> str:
+    """Pull the codec name out of ffmpeg's 'no decoder found for: ac4' line."""
+    match = _MISSING_DECODER_RE.search(err_text)
+    return match.group(1) if match else ""
 
 
 # Limit ffmpeg threads to avoid starving SageTV/Channels DVR.
@@ -42,7 +69,7 @@ class AudioExtractor:
         """
         # Pre-check: bail early if the source file no longer exists
         if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Source file not found: {video_path}")
+            raise PermanentExtractionError(f"Source file not found: {video_path}")
 
         suffix = ""
         if start_seconds is not None and start_seconds > 0:
@@ -86,7 +113,17 @@ class AudioExtractor:
                          and "configuration:" not in l
                          and "built with" not in l]
             err = "\n".join(err_lines[-5:]) if err_lines else err_text[-300:]
-            raise RuntimeError(f"ffmpeg extraction failed (rc={proc.returncode}): {err}")
+            message = f"ffmpeg extraction failed (rc={proc.returncode}): {err}"
+            lowered = err_text.lower()
+            if any(marker in lowered for marker in _PERMANENT_FFMPEG_ERRORS):
+                codec = _missing_decoder(err_text)
+                if codec:
+                    message = (
+                        f"unsupported audio codec '{codec}' — this ffmpeg build has no "
+                        f"decoder for it, so the audio cannot be read: {video_path}"
+                    )
+                raise PermanentExtractionError(message)
+            raise RuntimeError(message)
 
         logger.info("Audio extracted: %s (%.1f MB)", output_path,
                      os.path.getsize(output_path) / (1024 * 1024))
