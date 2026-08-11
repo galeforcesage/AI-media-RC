@@ -174,7 +174,7 @@ class TranscriptionQueue:
             for r in rows
         ]
 
-    def reset_stale_jobs(self, stale_seconds: int = 1800) -> int:
+    def reset_stale_jobs(self, stale_seconds: int = 0) -> int:
         """Return abandoned 'extracting'/'processing' jobs to the queue.
 
         Those two states only make sense while a worker is actively holding the
@@ -183,6 +183,14 @@ class TranscriptionQueue:
         that already has a non-terminal job, so the recording can never be
         transcribed again. Jobs past max_attempts go to 'error' instead of
         looping forever. Returns the number of rows changed.
+
+        This is called at worker startup, where by definition no worker holds
+        any job, so the default age cutoff is 0: every non-terminal row is
+        abandoned. An earlier version defaulted to 1800s, which quietly stranded
+        any job abandoned within 30 minutes of a restart until some later
+        restart happened to fall outside that window. Pass a positive
+        stale_seconds only if several workers ever share one database, where a
+        row may belong to a live peer.
         """
         cutoff = time.time() - stale_seconds
         rows = self._conn.execute(
