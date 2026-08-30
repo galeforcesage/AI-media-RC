@@ -27,6 +27,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_IDLE_TIMEOUT = 300.0
 _REAPER_INTERVAL = 30.0
 
+# Which device to run voice-command STT on: "cpu" (default), "cuda", or "auto".
+#
+# Defaults to CPU deliberately. Unloading the model frees its weights but NOT
+# the CUDA primary context, which costs ~316 MiB and can only be reclaimed by
+# exiting the process -- so a single voice command pins that memory for the
+# lifetime of the orchestrator. This GPU is shared with a live TV transcoder,
+# batch transcription (Whisper large-v3) and Ollama, and measured usage here is
+# 2 utterances in 3 weeks, so that trade is a bad one. The "base" model at int8
+# on CPU handles short utterances comfortably.
+#
+# Set STT_DEVICE=auto (or cuda) if voice latency ever becomes the bottleneck.
+DEFAULT_DEVICE = os.environ.get("STT_DEVICE", "cpu").strip().lower()
+_CPU_THREADS = int(os.environ.get("STT_CPU_THREADS", "4"))
+
 
 class STTService:
     """Voice command transcription using faster-whisper.
@@ -35,11 +49,17 @@ class STTService:
     service has been idle for ``idle_timeout`` seconds.
     """
 
-    def __init__(self, model_name: str = "base", idle_timeout: float = DEFAULT_IDLE_TIMEOUT):
+    def __init__(
+        self,
+        model_name: str = "base",
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        device: str = DEFAULT_DEVICE,
+    ):
         self._model_name = model_name
         self._model = None
         self._lock = asyncio.Lock()
         self._device = "cpu"
+        self._requested_device = device
         self._idle_timeout = idle_timeout
         self._last_used = 0.0
         self._reaper: Optional[asyncio.Task] = None
@@ -49,16 +69,20 @@ class STTService:
             return
         from faster_whisper import WhisperModel
 
-        # Detect GPU
         self._device = "cpu"
         compute_type = "int8"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self._device = "cuda"
-                compute_type = "float16"
-        except ImportError:
-            pass
+        # Only touch torch.cuda when CUDA was actually asked for; probing it
+        # unconditionally would create the CUDA context we are trying to avoid.
+        if self._requested_device in ("cuda", "auto"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._device = "cuda"
+                    compute_type = "float16"
+                elif self._requested_device == "cuda":
+                    logger.warning("STT_DEVICE=cuda requested but CUDA is unavailable; using CPU")
+            except ImportError:
+                pass
 
         logger.info(
             "Loading Whisper STT model: %s (device=%s, compute=%s)",
@@ -69,7 +93,7 @@ class STTService:
             self._model_name,
             device=self._device,
             compute_type=compute_type,
-            cpu_threads=2,
+            cpu_threads=_CPU_THREADS if self._device == "cpu" else 2,
         )
         logger.info("Whisper STT model loaded in %.1fs", time.time() - start)
 
@@ -79,7 +103,8 @@ class STTService:
             return
         logger.info("Releasing idle Whisper STT model (device=%s)", self._device)
         self._model = None
-        release_cuda_memory()
+        if self._device == "cuda":
+            release_cuda_memory()
 
     def _touch(self) -> None:
         self._last_used = time.time()
