@@ -21,8 +21,23 @@ from .store import MetadataStore
 from .whisper_engine import WhisperEngine
 from . import diarization
 from . import cc_extractor
+from .gpu import gpu_free_mb, release_cuda_memory
 
 logger = logging.getLogger(__name__)
+
+# This GPU is shared with a live TV transcoder, Ollama and other tenants, so a
+# job that barges in when the card is nearly full will OOM (and, before the
+# claim-on-dequeue fix, could take a recording's only attempt with it). Wait for
+# real headroom instead.
+#
+# Measured on an RTX 5080: Whisper large-v3 needs ~4 GB and diarization peaks at
+# ~4.3 GB, and diarization's peak is flat with input duration. 4500 MiB covers
+# either step with a little slack.
+GPU_MIN_FREE_MB = float(os.environ.get("GPU_MIN_FREE_MB", "4500"))
+# Bounded so a permanently busy GPU degrades to "try anyway" rather than
+# stalling the queue forever; an OOM from that attempt is already retryable.
+GPU_WAIT_TIMEOUT = float(os.environ.get("GPU_WAIT_TIMEOUT", "900"))
+GPU_WAIT_POLL = float(os.environ.get("GPU_WAIT_POLL", "15"))
 
 
 class TranscriptionWorker:
@@ -129,6 +144,53 @@ class TranscriptionWorker:
             except Exception:
                 logger.exception("Failed to release GPU models")
 
+    async def _await_vram(self, label: str, need_mb: float = GPU_MIN_FREE_MB) -> None:
+        """Block until the GPU has ``need_mb`` free, or the wait times out.
+
+        Other tenants on this card (a live TV transcoder, Ollama, OCR
+        containers) come and go, so starting a memory-hungry step the moment a
+        job arrives can OOM even though the same job would succeed a minute
+        later. Nothing here is latency-sensitive — every job is queued or
+        batched — so waiting is nearly free, while an OOM costs the whole step.
+
+        On timeout this logs and returns rather than raising: a permanently busy
+        GPU must not stall the queue forever, and if the attempt does OOM the
+        existing handler already marks the job for retry.
+        """
+        if GPU_WAIT_TIMEOUT <= 0 or need_mb <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        # Hand back our own cached-but-unused blocks first, so we wait on a true
+        # shortage rather than on memory we are already holding.
+        await loop.run_in_executor(None, release_cuda_memory)
+
+        deadline = time.monotonic() + GPU_WAIT_TIMEOUT
+        waited_from: Optional[float] = None
+        while True:
+            free = await loop.run_in_executor(None, gpu_free_mb)
+            if free is None:
+                return  # No nvidia-smi / no GPU: nothing useful to gate on.
+            if free >= need_mb:
+                if waited_from is not None:
+                    logger.info(
+                        "GPU freed up after %.0fs — starting %s (%.0f MiB free)",
+                        time.monotonic() - waited_from, label, free,
+                    )
+                return
+            if waited_from is None:
+                waited_from = time.monotonic()
+                logger.info(
+                    "Waiting for VRAM before %s: %.0f MiB free, need %.0f MiB",
+                    label, free, need_mb,
+                )
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "GPU still busy after %.0fs (%.0f MiB free, need %.0f MiB) — "
+                    "attempting %s anyway", GPU_WAIT_TIMEOUT, free, need_mb, label,
+                )
+                return
+            await asyncio.sleep(GPU_WAIT_POLL)
+
     def stop(self) -> None:
         self._running = False
         if self._reaper_task:
@@ -230,6 +292,11 @@ class TranscriptionWorker:
                         transcription_mode = "mixed"
 
         # Step 2: Transcribe according to chosen mode
+        # Whisper is the first VRAM-hungry step. Skipped when the model is
+        # already resident, since that memory is ours already and we would be
+        # waiting for headroom we do not actually need.
+        if transcription_mode != "cc" and self.engine.uses_gpu and not self.engine.loaded:
+            await self._await_vram("transcription")
         if transcription_mode == "cc":
             # Use CC segments verbatim, strip any speaker prefixes for clean text.
             segments = []
@@ -331,6 +398,9 @@ class TranscriptionWorker:
             # reloads on demand, so the reload cost lands on batch throughput
             # rather than on anything a viewer sees.
             await loop.run_in_executor(None, self.engine.unload)
+            # Whisper's VRAM has just gone back to the driver, so this is the
+            # cleanest point to check we actually have room for diarization.
+            await self._await_vram("diarization")
             try:
                 diarization_turns = await loop.run_in_executor(
                     None, diarization.diarize, audio_path

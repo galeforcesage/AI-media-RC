@@ -15,6 +15,7 @@ import gc
 import glob
 import logging
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,34 @@ def cuda_is_usable() -> bool:
         )
         _cuda_usable = False
     return _cuda_usable
+
+
+def gpu_free_mb() -> "float | None":
+    """Device-wide free VRAM in MiB, or None if it cannot be determined.
+
+    Deliberately shells out to nvidia-smi rather than calling
+    ``torch.cuda.mem_get_info()``. The torch call requires an initialised CUDA
+    context, so merely *asking how much VRAM is free* would allocate ~316 MiB
+    that cannot be released again without exiting the process — the opposite of
+    what a headroom check is for. nvidia-smi answers without touching our
+    process's CUDA state.
+
+    Reports free memory for the whole device, so it accounts for other tenants
+    (a live TV transcoder, Ollama, OCR containers), not just this process.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode != 0:
+            return None
+        # Multi-GPU hosts return one line per device; we only ever use device 0.
+        first = out.stdout.strip().splitlines()[0]
+        return float(first.strip())
+    except Exception:
+        logger.debug("Could not query free VRAM", exc_info=True)
+        return None
 
 
 def cuda_memory_mb() -> float:

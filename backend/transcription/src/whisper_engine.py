@@ -131,6 +131,16 @@ class WhisperEngine:
     def loaded(self) -> bool:
         return self._model is not None
 
+    @property
+    def uses_gpu(self) -> bool:
+        """Whether this engine will run on the GPU.
+
+        Before the first load ``_device`` may still be "auto", so treat anything
+        that isn't an explicit "cpu" as GPU-bound; callers use this only to
+        decide whether a VRAM headroom check is worth doing.
+        """
+        return self._device != "cpu"
+
     def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.
 
