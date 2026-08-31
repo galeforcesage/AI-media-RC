@@ -67,6 +67,53 @@ class LLMService:
         self.loaded = False
         self._lock = asyncio.Lock()
         self._inference_semaphore = asyncio.Semaphore(max_concurrent)
+        # GPU arbiter (set by the orchestrator). When present, every generation
+        # pauses batch Whisper, picks the biggest model VSR left room for, and
+        # resumes Whisper afterwards. None => legacy fixed-model behaviour.
+        self.arbiter = None
+        self._turn_lock = asyncio.Lock()
+
+    def set_arbiter(self, arbiter) -> None:
+        self.arbiter = arbiter
+
+    async def _begin_turn(self):
+        """Open an arbitrated GPU turn. Returns (model, num_ctx, keep_alive).
+        Holds a turn lock across the whole call (released in _end_turn) so the
+        Whisper pause window stays aligned with a single in-flight query."""
+        if self.arbiter is None:
+            return self.model, None, None
+        await self._turn_lock.acquire()
+        try:
+            from services.gpu_arbiter import LLM_KEEP_ALIVE
+            self.arbiter.mark_interactive()
+            await self.arbiter.pause_transcription()
+            model, num_ctx = await self.arbiter.select(self.model)
+            return model, num_ctx, LLM_KEEP_ALIVE
+        except Exception:
+            if self._turn_lock.locked():
+                self._turn_lock.release()
+            logger.warning("GPU arbiter begin_turn failed; using default model", exc_info=True)
+            return self.model, None, None
+
+    async def _end_turn(self) -> None:
+        if self.arbiter is None:
+            return
+        try:
+            self.arbiter.clear_interactive()
+            await self.arbiter.resume_transcription()
+        except Exception:
+            logger.warning("GPU arbiter end_turn failed", exc_info=True)
+        finally:
+            if self._turn_lock.locked():
+                self._turn_lock.release()
+
+    @staticmethod
+    def _apply_turn(payload: Dict[str, Any], num_ctx, keep_alive) -> None:
+        """Fold arbiter-chosen context size + keep_alive into an Ollama payload."""
+        if num_ctx:
+            payload.setdefault("options", {})["num_ctx"] = num_ctx
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
     async def load(self) -> None:
         """Verify Ollama is reachable and the model is available."""
@@ -110,9 +157,10 @@ class LLMService:
             Dict with status, prompt, response, and model.
         """
         logger.info("LLM generating response (prompt length=%d)", len(prompt))
+        model, num_ctx, keep_alive = await self._begin_turn()
         try:
             payload = {
-                "model": self.model,
+                "model": model,
                 "system": SYSTEM_PROMPT,
                 "prompt": prompt,
                 "stream": False,
@@ -122,9 +170,10 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            self._apply_turn(payload, num_ctx, keep_alive)
             if params:
                 payload["options"].update(params)
-            if "qwen3" in self.model:
+            if "qwen3" in model:
                 payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
@@ -144,7 +193,7 @@ class LLMService:
                 "status": "ok",
                 "prompt": prompt,
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM generation timed out")
@@ -152,6 +201,8 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM generation error")
             return {"error": str(exc)}
+        finally:
+            await self._end_turn()
 
     async def generate_chat(
         self,
@@ -169,9 +220,10 @@ class LLMService:
             Dict with status, response, and model.
         """
         logger.info("LLM chat generation (%d messages)", len(messages))
+        model, num_ctx, keep_alive = await self._begin_turn()
         try:
             payload: Dict[str, Any] = {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "stream": False,
                 "options": {
@@ -181,7 +233,8 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
-            if "qwen3" in self.model:
+            self._apply_turn(payload, num_ctx, keep_alive)
+            if "qwen3" in model:
                 payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
@@ -204,7 +257,7 @@ class LLMService:
             return {
                 "status": "ok",
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM chat generation timed out")
@@ -212,6 +265,8 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM chat generation error")
             return {"error": str(exc)}
+        finally:
+            await self._end_turn()
 
     async def stream_chat(
         self,
@@ -219,6 +274,7 @@ class LLMService:
         token_callback=None,
         tools: list[Dict[str, Any]] | None = None,
         params: Dict[str, Any] | None = None,
+        metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Streaming multi-turn chat via Ollama /api/chat.
@@ -232,9 +288,10 @@ class LLMService:
         """
         logger.info("LLM streaming chat (%d messages, %d tools)",
                      len(messages), len(tools) if tools else 0)
+        model, num_ctx, keep_alive = await self._begin_turn()
         try:
             payload: Dict[str, Any] = {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "stream": True,
                 "options": {
@@ -244,13 +301,14 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
+            self._apply_turn(payload, num_ctx, keep_alive)
             if params:
                 payload["options"].update(params)
             if tools:
                 payload["tools"] = tools
             # Disable qwen3 thinking mode — it wastes the token budget
             # on <think> reasoning and produces empty responses with many tools
-            if "qwen3" in self.model:
+            if "qwen3" in model:
                 payload["think"] = False
             # Log payload size for debugging context overflow
             payload_json = json.dumps(payload)
@@ -327,7 +385,7 @@ class LLMService:
                     "status": "ok",
                     "response": response_text,
                     "tool_calls": accumulated_tool_calls,
-                    "model": self.model,
+                    "model": model,
                 }
 
             logger.info(
@@ -337,7 +395,7 @@ class LLMService:
             return {
                 "status": "ok",
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM stream_chat timed out")
@@ -345,6 +403,8 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM stream_chat error")
             return {"error": str(exc)}
+        finally:
+            await self._end_turn()
 
     async def stream(
         self,
@@ -353,8 +413,9 @@ class LLMService:
     ) -> AsyncIterator[str]:
         """Stream tokens from Ollama as an async generator."""
         logger.info("LLM streaming response (prompt length=%d)", len(prompt))
+        model, num_ctx, keep_alive = await self._begin_turn()
         payload = {
-            "model": self.model,
+            "model": model,
             "system": SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": True,
@@ -364,6 +425,7 @@ class LLMService:
                 "num_thread": self.num_threads,
             },
         }
+        self._apply_turn(payload, num_ctx, keep_alive)
         try:
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
@@ -386,3 +448,5 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM streaming error")
             yield f"[Error: {exc}]"
+        finally:
+            await self._end_turn()

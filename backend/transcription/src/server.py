@@ -32,6 +32,9 @@ class TranscriptionServer:
         self.queue = queue
         self.store = store
         self._server: Optional[asyncio.AbstractServer] = None
+        # Set by main.py after the worker is built, so the GPU arbiter can
+        # pause/resume batch Whisper over this same JSON-RPC socket.
+        self.worker: Any = None
 
         # Cross-metadata reasoning layer
         index_path = config.get("index_db", "transcript_index.db")
@@ -95,6 +98,10 @@ class TranscriptionServer:
             "tools/call": self._tools_call,
             "resources/list": self._resources_list,
             "resources/read": self._resources_read,
+            # GPU arbitration: the orchestrator asks batch Whisper to yield the
+            # card to an interactive LLM turn, then resume afterwards.
+            "gpu/pause": self._gpu_pause,
+            "gpu/resume": self._gpu_resume,
         }
 
         handler = handlers.get(method)
@@ -125,6 +132,21 @@ class TranscriptionServer:
 
     async def _ping(self, p):
         return {}
+
+    async def _gpu_pause(self, p):
+        """Checkpoint and unload batch Whisper/diarization so an interactive
+        LLM turn (or VSR) gets the VRAM. Idempotent; safe if no job is running."""
+        if self.worker is None:
+            return {"paused": False, "reason": "no-worker"}
+        await self.worker.pause_gpu()
+        return {"paused": True}
+
+    async def _gpu_resume(self, p):
+        """Release the pause so batch transcription may resume."""
+        if self.worker is None:
+            return {"resumed": False, "reason": "no-worker"}
+        await self.worker.resume_gpu()
+        return {"resumed": True}
 
     # ------------------------------------------------------------------
     # Tools

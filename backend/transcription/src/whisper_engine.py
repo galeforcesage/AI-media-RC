@@ -141,13 +141,21 @@ class WhisperEngine:
         """
         return self._device != "cpu"
 
-    def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
+    def transcribe(self, audio_path: str, language: str = "en",
+                   should_stop=None) -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.
+
+        Args:
+            should_stop: optional zero-arg callable. Checked at every segment
+                boundary; when it returns True the loop stops early so the GPU
+                can be handed to a higher-priority tenant. The returned info
+                then carries ``interrupted=True`` and ``resume_at`` (seconds of
+                audio already transcribed) so a caller can continue later.
 
         Returns:
             (full_text, segments, info)
             segments: list of {start, end, text}
-            info: {language, duration, language_probability}
+            info: {language, duration, language_probability, interrupted, resume_at}
         """
         if self._model is None:
             self.load()
@@ -165,13 +173,20 @@ class WhisperEngine:
 
         full_text_parts = []
         segments = []
+        interrupted = False
+        resume_at = 0.0
         for seg in segments_iter:
+            if should_stop is not None and should_stop():
+                interrupted = True
+                logger.info("Transcription interrupted at %.1fs (GPU yield)", resume_at)
+                break
             full_text_parts.append(seg.text.strip())
             segments.append({
                 "start": round(seg.start, 2),
                 "end": round(seg.end, 2),
                 "text": seg.text.strip(),
             })
+            resume_at = seg.end
 
         elapsed = time.time() - start
         full_text = " ".join(full_text_parts)
@@ -182,9 +197,12 @@ class WhisperEngine:
             "model": self._model_name,
             "elapsed_seconds": round(elapsed, 1),
             "realtime_factor": round(elapsed / max(info.duration, 1), 2),
+            "interrupted": interrupted,
+            "resume_at": round(resume_at, 2),
         }
 
-        logger.info("Transcription complete: %.0fs audio in %.0fs (%.2fx realtime), %d segments",
+        logger.info("Transcription %s: %.0fs audio in %.0fs (%.2fx realtime), %d segments",
+                     "interrupted" if interrupted else "complete",
                      info.duration, elapsed, elapsed / max(info.duration, 1), len(segments))
 
         return full_text, segments, transcription_info

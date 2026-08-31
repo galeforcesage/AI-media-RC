@@ -66,6 +66,12 @@ class Orchestrator:
             num_ctx=config.get("llm", {}).get("num_ctx", 4096),
             max_concurrent=config.get("llm", {}).get("max_concurrent", 1),
         )
+        # Shared-GPU arbiter: lets the LLM path pause batch Whisper, pick the
+        # biggest model VSR left room for, and gate lower-priority tenants
+        # (Paperless) via HTTP. Optional config under "gpu_arbiter".
+        from services.gpu_arbiter import GpuArbiter
+        self.gpu_arbiter = GpuArbiter(config.get("gpu_arbiter"))
+        self.llm.set_arbiter(self.gpu_arbiter)
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
             model_size=config.get("whisper", {}).get("model_size", "base"),

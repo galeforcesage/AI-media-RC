@@ -166,6 +166,9 @@ async def run(args: argparse.Namespace) -> None:
             sagetv_url=args.sagetv_mcp,
             channels_url=args.channels_mcp,
         )
+        # Give the MCP server a handle to the worker so the GPU arbiter's
+        # gpu/pause and gpu/resume RPCs can reach it.
+        server.worker = worker
         tasks.append(asyncio.create_task(worker.start()))
 
     # Wait for shutdown signal
