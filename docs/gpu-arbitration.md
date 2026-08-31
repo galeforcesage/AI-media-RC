@@ -43,6 +43,33 @@ Tunables (env): `GPU_VSR_RESERVE_MB` (6500), `GPU_SAFETY_MB` (700),
 `GPU_ENCODER_LIVE_PCT` (3), `GPU_INTERACTIVE_TTL` (20), `GPU_LLM_KEEP_ALIVE`
 (30s), `GPU_FLOOR_MODEL` (hermes3:8b).
 
+## Persistent config (survives restarts)
+
+The model ladder and floor are read from a `gpu_arbiter` block in
+`backend/orchestrator/config.json`; if the block is absent the arbiter uses the
+`DEFAULT_LADDER` baked into `gpu_arbiter.py`, so intent survives even a scrubbed
+config:
+
+```json
+"gpu_arbiter": {
+    "floor_model": "hermes3:8b",
+    "model_ladder": [
+        {"model": "qwen3:14b", "vram_mb": 12800, "num_ctx": 32768},
+        {"model": "mistral-nemo:latest", "vram_mb": 9400, "num_ctx": 16384},
+        {"model": "hermes3:8b", "vram_mb": 6800, "num_ctx": 16384}
+    ]
+}
+```
+
+`scripts/watchdog.sh` regenerates the `llm` and `gpu_arbiter` blocks on every
+orchestrator start (`ensure_orchestrator_config`), so a restart re-asserts this
+intent rather than clobbering it, and `ensure_ollama_models` always pre-pulls
+the floor model plus the top model so the arbiter's picks are guaranteed
+present. Both use `setdefault` for `gpu_arbiter`, so hand-tuned overrides in
+`config.json` are preserved. `qwen2.5:32b` is deliberately excluded from the
+ladder: it spills to CPU (~7 tok/s) on a 16 GB card.
+
+
 ## HTTP lease API (for lower-priority tenants)
 
 Served by the orchestrator on `:8000` under `/api`:

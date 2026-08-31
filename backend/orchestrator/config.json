@@ -5,13 +5,36 @@
     "llm": {
         "model_path": "models/llm",
         "base_url": "http://127.0.0.1:11434",
-        "model": "hermes3:8b",
+        "model": "auto",
+        "auto_select_model": true,
+        "fallback_model": "hermes3:8b",
         "temperature": 0.7,
         "num_predict": 2048,
         "summary_num_predict": 640,
         "summary_temperature": 0.2,
         "num_ctx": 8192,
-        "max_concurrent": 1
+        "max_concurrent": 1,
+        "gpu_memory_profiles_mb": [
+            {"min_mb": 12800, "model": "qwen3:14b"},
+            {"min_mb": 9400, "model": "mistral-nemo:latest"},
+            {"min_mb": 6144, "model": "hermes3:8b"}
+        ],
+        "routing": {
+            "default_model": "qwen3:14b",
+            "complex_model": "qwen3:14b",
+            "fast_model": "hermes3:8b",
+            "premium_model": "qwen3:14b",
+            "complex_min_gpu_mb": 12800,
+            "premium_min_gpu_mb": 12800
+        }
+    },
+    "gpu_arbiter": {
+        "floor_model": "hermes3:8b",
+        "model_ladder": [
+            {"model": "qwen3:14b", "vram_mb": 12800, "num_ctx": 32768},
+            {"model": "mistral-nemo:latest", "vram_mb": 9400, "num_ctx": 16384},
+            {"model": "hermes3:8b", "vram_mb": 6800, "num_ctx": 16384}
+        ]
     },
     "whisper": {
         "model_path": "models/whisper",
