@@ -338,7 +338,12 @@ class TranscriptIndex:
         _tokens = [t for t in _re.findall(r"[A-Za-z0-9]+", query or "") if t]
         if not _tokens:
             return []
-        _fts_query = " AND ".join(f'"{t}"' for t in _tokens)
+        # FTS5 ANDs quoted terms by default, so a full natural-language
+        # question matches nothing. Try strict AND first, then fall back to OR
+        # (bm25-ranked) so multi-word questions still surface relevant chunks.
+        _and_query = " AND ".join(f'"{t}"' for t in _tokens)
+        _or_query = " OR ".join(f'"{t}"' for t in _tokens)
+        _fts_query = _and_query
         conditions = ["transcript_fts MATCH ?"]
         params: list = [_fts_query]
 
@@ -384,6 +389,9 @@ class TranscriptIndex:
 
         try:
             rows = self._conn.execute(sql, params).fetchall()
+            if not rows and _or_query != _and_query:
+                params[0] = _or_query
+                rows = self._conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.OperationalError as e:
             logger.error("FTS search error: %s", e)

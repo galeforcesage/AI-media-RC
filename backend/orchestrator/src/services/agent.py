@@ -1131,6 +1131,7 @@ class AgentLoop(PlannerBase):
         self._entity_store = entity_store  # conversation-scoped entity memory
 
         _is_transcript_summary_query = self._is_transcript_summary_intent(user_query)
+        _is_content_query = self._is_transcript_content_intent(user_query)
 
         llm_cfg = self._orch.config.get("llm", {})
         summary_params: Dict[str, Any] | None = None
@@ -1463,7 +1464,7 @@ class AgentLoop(PlannerBase):
                     # Post-hoc answer validation (Layer 3 — Formal Validator)
                     vr = self._validate_answer(final, user_query)
                     trace.validation = vr.summary()
-                    if not vr.passed and not _is_transcript_summary_query:
+                    if not vr.passed and not _is_transcript_summary_query and not _is_content_query:
                         final += f"\n\n_{vr.issues[0]}_"
                         trace.validation_issues = vr.issues
                     # Extract entities from tool results for conversation context
@@ -1756,7 +1757,7 @@ class AgentLoop(PlannerBase):
                             )
 
             # ── Direct-format bypass: skip LLM iteration 2 for pure listings ──
-            if not has_service_error and not _is_transcript_summary_query and iteration == 0 and _iter_calls:
+            if not has_service_error and not _is_transcript_summary_query and not _is_content_query and iteration == 0 and _iter_calls:
                 direct = _try_direct_format(_iter_calls, self._tool_results_cache)
                 if direct is not None:
                     logger.info("Direct-format bypass: %d chars, skipping LLM iteration 2",
@@ -1809,7 +1810,27 @@ class AgentLoop(PlannerBase):
                 "do NOT invent facts, names, motives, or events; if detail is missing, say 'Not shown in transcript.' "
                 "Do NOT output a numbered recording list."
             )
-            _FOLLOWUP_REMINDER = _SUMMARY_REMINDER if _is_transcript_summary_query else _FORMAT_REMINDER
+            _CONTENT_REMINDER = (
+                "Answer the user's specific question directly, using the "
+                "transcript excerpts above and especially the "
+                "'[Final minutes of the recording]' section. Be concise and "
+                "factual and quote the decisive moment. A show or contest only "
+                "'continues to the next episode' if the transcript explicitly "
+                "says so (e.g. 'to be continued', a cliffhanger, or the host says "
+                "they will resume with the same people next time). If instead the "
+                "host wraps up in this recording - declares a result, gives a "
+                "prize or consolation, thanks the guests, or gives a routine "
+                "sign-off such as 'that's all the time we have' or 'see you next "
+                "time' - then it FINISHED in this recording; a generic sign-off is "
+                "NOT a continuation. If the transcript does not contain the answer, "
+                "say so plainly. Do NOT output a numbered recording list."
+            )
+            if _is_transcript_summary_query:
+                _FOLLOWUP_REMINDER = _SUMMARY_REMINDER
+            elif _is_content_query:
+                _FOLLOWUP_REMINDER = _CONTENT_REMINDER
+            else:
+                _FOLLOWUP_REMINDER = _FORMAT_REMINDER
             if tool_messages:
                 # Native path: add each tool result as a role:tool message
                 messages.extend(tool_messages)
@@ -2026,6 +2047,29 @@ class AgentLoop(PlannerBase):
         if "transcript" in ql:
             return True
         return bool(re.search(r"\b(?:from|for|of)\b", ql) and re.search(r"\b(?:show|episode)\b", ql))
+
+    @staticmethod
+    def _is_transcript_content_intent(query: str) -> bool:
+        """Detect a question about what happens *inside* a recording (a content
+        question), as opposed to a request to list/browse recordings. Content
+        questions must be answered from transcript text, not the recording list."""
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+        if re.search(
+            r"\b(list|show me|which recordings|what recordings|what shows|"
+            r"do i have|did i record|what did i record|what'?s on|"
+            r"upcoming|scheduled)\b",
+            q,
+        ):
+            return False
+        return bool(re.search(
+            r"\b(who|what|whats|when|where|why|how|did|does|was|were|"
+            r"win|won|lose|lost|beat|happen|happened|finish|finished|"
+            r"continue|continued|end|ended|say|said|mention|mentioned|"
+            r"answer|score|winner|result|discuss)\b",
+            q,
+        ))
 
     # ------------------------------------------------------------------
     # Post-hoc answer validation (Layer 3 — Formal Validator)

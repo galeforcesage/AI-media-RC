@@ -1170,12 +1170,20 @@ class Orchestrator:
                         data = transcript_results.get("data", transcript_results)
                         transcript_hits = data.get("results", [])
                     if transcript_hits:
+                        def _start_of(_r):
+                            try:
+                                return float(_r.get("start_time", 0) or 0)
+                            except Exception:
+                                return 0.0
+                        # Read the show in sequence (ending last) rather than in
+                        # bm25 rank order, which scrambles chronology.
+                        _ordered = sorted(transcript_hits[:8], key=_start_of)
                         lines = []
-                        for r in transcript_hits[:2]:
+                        for r in _ordered:
                             title = r.get("title", "Unknown")
                             ep = r.get("episode_title", "")
-                            start = r.get("start_time", 0)
-                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
+                            start = _start_of(r)
+                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:240]
                             mins = int(start // 60)
                             secs = int(start % 60)
                             time_str = f"{mins}:{secs:02d}"
@@ -1192,6 +1200,28 @@ class Orchestrator:
                                 lines.append(f'From "{title}" - "{ep}"{date_str} at {time_str}: {snippet}')
                             else:
                                 lines.append(f'From "{title}"{date_str} at {time_str}: {snippet}')
+
+                        # When the top matches concentrate on a single recording,
+                        # fetch its full transcript so the model sees the opening
+                        # and, crucially, the ending. Scattered keyword snippets
+                        # cannot answer "how did it end / did it finish" questions.
+                        _top_ids = [r.get("recording_id") for r in transcript_hits[:5]
+                                    if r.get("recording_id")]
+                        if _top_ids and len(set(_top_ids)) == 1:
+                            try:
+                                _full = await self.search.transcript_get(_top_ids[0])
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                                if len(_ttext) > 400:
+                                    lines.append(
+                                        "[Opening of the recording]: " + _ttext[:600]
+                                    )
+                                    lines.append(
+                                        "[Final minutes of the recording - how it actually ended]: ..."
+                                        + _ttext[-1800:]
+                                    )
+                            except Exception:
+                                logger.warning("Full-transcript fetch failed; using excerpts only")
                         transcript_context = "\n".join(lines)
                     elif _date_label:
                         # Negative result is informative — surface it so the LLM

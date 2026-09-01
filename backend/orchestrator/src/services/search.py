@@ -160,6 +160,39 @@ class SearchService:
             logger.exception("transcript_search failed")
             return {"error": str(exc)}
 
+    async def transcript_get(self, recording_id: str) -> Dict[str, Any]:
+        """Fetch full transcript + metadata for a single recording via the
+        transcription MCP server (transcript_get tool)."""
+        try:
+            import asyncio, json
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", 8770, limit=1024 * 1024
+            )
+            request = json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "transcript_get",
+                    "arguments": {"recording_id": recording_id},
+                },
+            }) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=8.0)
+            writer.close()
+            await writer.wait_closed()
+            if not line:
+                return {"error": "Empty response from transcription server"}
+            resp = json.loads(line.decode())
+            result = resp.get("result", {})
+            content = result.get("content", [])
+            if content and content[0].get("type") == "text":
+                return json.loads(content[0]["text"])
+            return result
+        except Exception as exc:
+            logger.exception("transcript_get failed")
+            return {"error": str(exc)}
+
     async def inject_transcript_context(
         self, query: str, max_chunks: int = 5
     ) -> str:

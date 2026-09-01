@@ -195,18 +195,21 @@ class MetadataStore:
         terms = [t for t in re.findall(r"[A-Za-z0-9]+", query or "") if t]
         if not terms:
             return []
-        fts_query = " AND ".join(f'"{t}"' for t in terms)
-        try:
-            rows = self._conn.execute(
-                """SELECT t.* FROM transcripts t
+        # Try strict AND first, then fall back to OR so multi-word queries
+        # that share no single chunk still return the best-ranked matches.
+        and_query = " AND ".join(f'"{t}"' for t in terms)
+        or_query = " OR ".join(f'"{t}"' for t in terms)
+        _sql = """SELECT t.* FROM transcripts t
                    INNER JOIN transcripts_fts f ON t.recording_id = f.recording_id
                    WHERE transcripts_fts MATCH ?
                    ORDER BY rank
-                   LIMIT ?""",
-                (fts_query, limit),
-            ).fetchall()
+                   LIMIT ?"""
+        try:
+            rows = self._conn.execute(_sql, (and_query, limit)).fetchall()
+            if not rows and or_query != and_query:
+                rows = self._conn.execute(_sql, (or_query, limit)).fetchall()
         except sqlite3.OperationalError as exc:
-            logger.warning("FTS search failed for %r (sanitized=%r): %s", query, fts_query, exc)
+            logger.warning("FTS search failed for %r (sanitized=%r): %s", query, and_query, exc)
             return []
         return [self._row_to_meta(r) for r in rows]
 
