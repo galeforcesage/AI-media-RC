@@ -36,6 +36,7 @@ class OpenClawPlanner(PlannerBase):
         temporal: str = "",
         domains: list[str] | None = None,
         entity_store: Any | None = None,
+        conversation_context: str = "",
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
@@ -57,6 +58,7 @@ class OpenClawPlanner(PlannerBase):
                 temporal=temporal,
                 domains=domains,
                 entity_store=entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -78,6 +80,7 @@ class OpenClawPlanner(PlannerBase):
             "query": user_query,
             "transcript_context": transcript_context,
             "semantic_context": semantic_context,
+            "conversation_context": conversation_context,
             "systems": systems or [],
             "temporal": temporal,
             "domains": domains or [],
@@ -113,6 +116,7 @@ class OpenClawPlanner(PlannerBase):
                 temporal=temporal,
                 domains=domains,
                 entity_store=entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )

@@ -1070,6 +1070,7 @@ class AgentLoop(PlannerBase):
         temporal: str = "",
         domains: list[str] | None = None,
         entity_store: Any | None = None,
+        conversation_context: str = "",
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
@@ -1163,6 +1164,8 @@ class AgentLoop(PlannerBase):
 
         # Build user message with pre-fetched context
         context_parts = []
+        if conversation_context:
+            context_parts.append(conversation_context.rstrip())
         # Skip semantic context for date-specific queries — the 7B model
         # confuses "relevant recordings from index" with actual query results
         # and filters by those titles instead of searching broadly.

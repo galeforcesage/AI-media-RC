@@ -46,6 +46,7 @@ class QueryRequest(BaseModel):
     synthesize: bool = True
     metadata: Optional[Dict[str, Any]] = None
     systems: Optional[list[str]] = None
+    session_id: Optional[str] = None
 
 
 class PlaybackRequest(BaseModel):
@@ -99,7 +100,7 @@ async def query(request: QueryRequest):
     """
     orch = _require_orchestrator()
     return await _safe_execute(
-        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems)
+        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems, session_id=request.session_id)
     )
 
 
@@ -128,6 +129,7 @@ async def query_stream(request: QueryRequest):
                 synthesize=request.synthesize,
                 metadata=request.metadata,
                 systems=request.systems,
+                session_id=request.session_id,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )

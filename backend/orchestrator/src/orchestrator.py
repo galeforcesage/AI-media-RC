@@ -36,6 +36,7 @@ from services.openclaw_planner import OpenClawPlanner
 from services.planner_registry import PlannerRegistry
 from services.semantic_index import SemanticIndex
 from services.entity_context import EntityContextStore
+from services.conversation_memory import ConversationMemory
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -125,6 +126,12 @@ class Orchestrator:
         # Conversation-scoped entity memory for multi-turn context
         self.entity_store = EntityContextStore(
             ttl=config.get("entity_ttl", 600.0),
+        )
+
+        # Per-session short-term Q&A memory (follow-up questions).
+        self.conversation_memory = ConversationMemory(
+            max_turns=config.get("conversation_max_turns", 4),
+            ttl=config.get("conversation_ttl", 1800.0),
         )
 
         # Transcription queue
@@ -701,12 +708,38 @@ class Orchestrator:
 
         return prompt
 
+    @staticmethod
+    def _looks_like_followup(prompt: str) -> bool:
+        """Heuristic: does this question refer back to a prior turn?
+
+        Conservative -- requires a back-reference phrase, and treats any
+        explicit date or quoted show/episode title as a fresh question.
+        """
+        if not prompt:
+            return False
+        import re as _re
+        if _re.search(r"\(\d{4}-\d{2}-\d{2}", prompt):
+            return False
+        if '"' in prompt or '\u201c' in prompt or '\u201d' in prompt:
+            return False
+        p = prompt.lower()
+        markers = (
+            "that episode", "that show", "that one", "that contest",
+            "that game", "the other", "same episode", "same show",
+            "on that", "in that", "the first team", "the second team",
+            "the first game", "the second game", "the winner",
+            "who won", "what did they", "did they", "earlier",
+            "previously", "you said", "you mentioned",
+        )
+        return any(m in p for m in markers)
+
     async def run_query(
         self,
         prompt: str,
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
         systems: list[str] | None = None,
+        session_id: str | None = None,
         status_callback=None,
         token_callback=None,
     ) -> Dict[str, Any]:
@@ -1132,6 +1165,9 @@ class Orchestrator:
             # ── FTS pre-fetch path (date-scoped content search) ──
             transcript_context = ""
             transcript_hits = []
+            transcript_display: list = []
+            episodes_used: list = []
+            recordings_used: list = []
             if temporal not in ("future", "present"):
                 try:
                     if status_callback:
@@ -1223,6 +1259,32 @@ class Orchestrator:
                             except Exception:
                                 logger.warning("Full-transcript fetch failed; using excerpts only")
                         transcript_context = "\n".join(lines)
+                        # Surface only the episode(s) actually used for
+                        # context -- one card per recording, not every
+                        # keyword chunk. When context concentrated on a
+                        # single recording, show just that one.
+                        _single = bool(_top_ids) and len(set(_top_ids)) == 1
+                        _seen = set()
+                        for _r in transcript_hits:
+                            _rid = _r.get("recording_id")
+                            if _single and _rid != _top_ids[0]:
+                                continue
+                            _k = _rid or (_r.get("title"), _r.get("episode_title"))
+                            if _k in _seen:
+                                continue
+                            _seen.add(_k)
+                            transcript_display.append(_r)
+                            _t = _r.get("title", "Unknown")
+                            _ep = _r.get("episode_title", "")
+                            episodes_used.append(f"{_t} - {_ep}" if _ep else _t)
+                            recordings_used.append({
+                                "id": _rid,
+                                "title": _t,
+                                "episode_title": _ep,
+                                "record_date": _r.get("record_date") or _r.get("air_date"),
+                            })
+                            if len(transcript_display) >= (1 if _single else 3):
+                                break
                     elif _date_label:
                         # Negative result is informative — surface it so the LLM
                         # doesn't hallucinate transcripts for the requested date.
@@ -1231,6 +1293,54 @@ class Orchestrator:
                         )
                 except Exception:
                     logger.warning("Transcript pre-fetch failed, continuing without")
+
+            # Follow-up reuse: when the question refers back to a prior
+            # episode ("that episode", "the other team") and carries no new
+            # date, prefer the recording we answered about last turn rather
+            # than fuzzy FTS matches that surface unrelated shows.
+            try:
+                if self._looks_like_followup(prompt):
+                    _last = self.conversation_memory.last_recordings(session_id)
+                    if _last:
+                        _rec = _last[0]
+                        _rid = _rec.get("id") or ""
+                        _ttext = ""
+                        _fd = {}
+                        if _rid:
+                            try:
+                                _full = await self.search.transcript_get(_rid)
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                            except Exception:
+                                logger.warning("follow-up transcript_get failed")
+                        _title = _rec.get("title") or _fd.get("title") or "Unknown"
+                        _ep = _rec.get("episode_title") or _fd.get("episode_title") or ""
+                        if _ttext:
+                            _parts = [
+                                'Continuing about "' + _title + '"'
+                                + (' - "' + _ep + '"' if _ep else '') + ':',
+                                "[Opening of the recording]: " + _ttext[:900],
+                                "[Final minutes of the recording - how it "
+                                "actually ended]: ..." + _ttext[-1800:],
+                            ]
+                            transcript_context = "\n".join(_parts)
+                        transcript_display = [{
+                            "recording_id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                            "snippet": "",
+                            "start_time": 0,
+                        }]
+                        episodes_used = [f"{_title} - {_ep}" if _ep else _title]
+                        recordings_used = [{
+                            "id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                        }]
+            except Exception:
+                logger.warning("follow-up reuse failed, continuing")
 
             # Pre-fetch semantic context from the vector index (sub-second)
             # Pre-fetch semantic context (skip for future-only — no past media to match)
@@ -1247,6 +1357,13 @@ class Orchestrator:
                 except Exception:
                     logger.warning("Semantic pre-fetch failed, continuing without")
 
+            # Compact memory of earlier turns for follow-up questions.
+            conversation_context = ""
+            try:
+                conversation_context = self.conversation_memory.format_for_prompt(session_id)
+            except Exception:
+                conversation_context = ""
+
             # Run the selected planner (AgentLoop by default).
             primary_name = self._resolve_planner_name(metadata)
             planner = self._get_planner(metadata)
@@ -1258,6 +1375,7 @@ class Orchestrator:
                 temporal=temporal,
                 domains=domains,
                 entity_store=self.entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -1307,10 +1425,21 @@ class Orchestrator:
                     if tts_result.get("status") == "ok":
                         llm_result["audio_path"] = tts_result["audio_path"]
 
-            # Attach transcript hits for the frontend
-            llm_result["transcript_results"] = transcript_hits
+            # Attach transcript hits for the frontend (deduped to the
+            # episode(s) actually used to answer).
+            llm_result["transcript_results"] = transcript_display or transcript_hits
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
+
+            # Record this turn so follow-up questions have context.
+            try:
+                _resp = llm_result.get("llm_response", "")
+                if _resp:
+                    self.conversation_memory.add_turn(
+                        session_id, prompt, _resp, recordings_used
+                    )
+            except Exception:
+                logger.warning("conversation memory update failed")
 
             return llm_result
         except Exception as exc:
