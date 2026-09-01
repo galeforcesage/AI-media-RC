@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -67,43 +66,6 @@ class TranscriptionWorker:
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._last_job_end = time.monotonic()
         self._reaper_task: Optional[asyncio.Task] = None
-        # GPU pause protocol: when an interactive LLM turn (or VSR) needs the
-        # card, the arbiter calls pause_gpu(). A running transcribe checkpoints
-        # at the next segment boundary and unloads; new GPU steps block until
-        # resume_gpu(). _pause_flag is a threading.Event so the should_stop
-        # callback can be read from the Whisper executor thread.
-        self._pause_flag = threading.Event()
-        self._resumed = asyncio.Event()
-        self._resumed.set()
-
-    async def pause_gpu(self) -> None:
-        """Ask batch transcription to yield the GPU. Idempotent. If nothing is
-        actively transcribing, unloads the models now so VRAM frees immediately;
-        otherwise the running job checkpoints and unloads at its next segment."""
-        if self._pause_flag.is_set():
-            return
-        logger.info("GPU pause requested — batch Whisper will checkpoint and yield")
-        self._pause_flag.set()
-        self._resumed.clear()
-        if self._active_jobs == 0:
-            loop = asyncio.get_event_loop()
-            try:
-                await loop.run_in_executor(None, self.engine.unload)
-                await loop.run_in_executor(None, diarization.unload)
-            except Exception:
-                logger.exception("pause_gpu unload failed")
-
-    async def resume_gpu(self) -> None:
-        """Release the pause so batch transcription may resume. Idempotent."""
-        if not self._pause_flag.is_set():
-            return
-        logger.info("GPU resume — batch Whisper may continue")
-        self._pause_flag.clear()
-        self._resumed.set()
-
-    async def _wait_if_paused(self) -> None:
-        while self._pause_flag.is_set():
-            await self._resumed.wait()
 
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
@@ -197,9 +159,6 @@ class TranscriptionWorker:
         """
         if GPU_WAIT_TIMEOUT <= 0 or need_mb <= 0:
             return
-        # An interactive LLM turn (or VSR) may hold the card; don't even start a
-        # GPU step until the arbiter releases the pause.
-        await self._wait_if_paused()
         loop = asyncio.get_running_loop()
         # Hand back our own cached-but-unused blocks first, so we wait on a true
         # shortage rather than on memory we are already holding.
@@ -239,81 +198,6 @@ class TranscriptionWorker:
             self._reaper_task = None
         self.engine.unload()
         diarization.unload()
-
-    async def _transcribe_resumable(self, audio_path: str, loop):
-        """Full-file transcription that can be paused for a higher-priority GPU
-        tenant and resumed where it left off.
-
-        Whisper's segment generator is consumed lazily, so when the arbiter sets
-        the pause flag the engine stops at the next segment boundary and returns
-        what it has plus ``resume_at``. We then unload (freeing VRAM within a
-        second), wait for resume, slice off the already-done prefix and continue.
-        Segments from every leg are concatenated into one transcript.
-        """
-        offset = 0.0
-        full_duration = 0.0
-        all_segments: list = []
-        final_info: Dict[str, Any] = {}
-        while True:
-            await self._wait_if_paused()
-            await self._await_vram("transcription")
-
-            src = audio_path
-            clip: Optional[str] = None
-            if offset > 0.0:
-                if full_duration > offset + 0.5:
-                    clip = await self.extractor.extract_region(
-                        audio_path, offset, full_duration
-                    )
-                if clip:
-                    src = clip
-                else:
-                    # Couldn't slice the remainder — restart the whole file so we
-                    # never duplicate or drop the already-transcribed prefix.
-                    logger.warning("Resume slice unavailable; restarting transcription from 0")
-                    offset = 0.0
-                    all_segments = []
-                    src = audio_path
-
-            try:
-                text, segs, info = await loop.run_in_executor(
-                    None, self.engine.transcribe, src, "en", self._pause_flag.is_set
-                )
-            finally:
-                if clip:
-                    self.extractor.cleanup(clip)
-
-            # Shift a resumed clip's relative timestamps back to absolute time.
-            if clip is not None and offset > 0.0:
-                for s in segs:
-                    s["start"] = round(s["start"] + offset, 2)
-                    s["end"] = round(s["end"] + offset, 2)
-
-            all_segments.extend(segs)
-            final_info = info
-            if clip is None:
-                # This leg saw the whole file, so info.duration is the true length.
-                full_duration = max(full_duration, float(info.get("duration") or 0.0))
-
-            if not info.get("interrupted"):
-                break
-
-            # Checkpointed: unload now so the interactive turn/VSR gets the VRAM,
-            # then block until the arbiter resumes us.
-            resume_rel = float(info.get("resume_at") or 0.0)
-            offset = max(offset, (offset + resume_rel) if clip is not None else resume_rel)
-            try:
-                await loop.run_in_executor(None, self.engine.unload)
-                await loop.run_in_executor(None, diarization.unload)
-            except Exception:
-                logger.exception("checkpoint unload failed")
-            logger.info("Whisper checkpointed at %.1fs — unloaded, awaiting resume", offset)
-            await self._resumed.wait()
-
-        full_text = " ".join(s["text"] for s in all_segments if s.get("text")).strip()
-        final_info.pop("interrupted", None)
-        final_info.pop("resume_at", None)
-        return full_text, all_segments, final_info
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
@@ -484,8 +368,8 @@ class TranscriptionWorker:
             )
         else:
             try:
-                full_text, segments, info = await self._transcribe_resumable(
-                    audio_path, loop
+                full_text, segments, info = await loop.run_in_executor(
+                    None, self.engine.transcribe, audio_path
                 )
                 # Tag STT segments with source for downstream consumers
                 for seg in segments:

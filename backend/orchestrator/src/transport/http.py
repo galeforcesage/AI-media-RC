@@ -289,40 +289,6 @@ async def health():
     return {"status": "ok"}
 
 
-# ------------------------------------------------------------------
-# GPU arbiter — lease endpoints for lower-priority tenants (Paperless)
-# ------------------------------------------------------------------
-
-class GpuLeaseRequest(BaseModel):
-    """A lower-priority tenant asking permission to use the GPU."""
-    tenant: str = "paperless"
-    priority: int = 3          # 2 = batch STT, 3 = paperless (lowest)
-    vram_mb: float = 4000.0    # how much the caller expects to allocate
-
-
-@router.get("/gpu/state")
-async def gpu_arbiter_state():
-    """Live arbiter state: is an interactive session or VSR active, free VRAM."""
-    orch = _require_orchestrator()
-    arb = getattr(orch, "gpu_arbiter", None)
-    if arb is None:
-        raise HTTPException(status_code=503, detail="GPU arbiter not available")
-    return arb.state()
-
-
-@router.post("/gpu/lease")
-async def gpu_arbiter_lease(req: GpuLeaseRequest):
-    """Grant/deny a GPU lease. Paperless (easyOCR + its summariser LLM) polls
-    this and backs off while an AI-remote session or VSR live TV is active.
-    Denials carry a ``retry_after_s`` hint."""
-    orch = _require_orchestrator()
-    arb = getattr(orch, "gpu_arbiter", None)
-    if arb is None:
-        # No arbiter: fail open so Paperless is never permanently blocked.
-        return {"granted": True, "reason": "no-arbiter"}
-    return arb.can_grant(req.priority, req.vram_mb)
-
-
 @router.get("/bridge/devices")
 async def bridge_devices():
     """List connected Channels playback devices (bridge + direct)."""
