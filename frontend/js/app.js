@@ -747,12 +747,12 @@
       // Helper: extract show title from any result format
       function getShowTitle(r) {
         const show = (r.Airing || {}).Show || {};
-        return r.title || r.show_title || show.ShowTitle || '';
+        return String(r.title || r.show_title || show.ShowTitle || '');
       }
       // Helper: extract episode title from any result format
       function getEpTitle(r) {
         const show = (r.Airing || {}).Show || {};
-        return r.episode_title || r.episode || show.ShowEpisode || '';
+        return String(r.episode_title || r.episode || show.ShowEpisode || '');
       }
 
       // Filter to items whose show title or episode title matches the clicked text
@@ -829,8 +829,8 @@
         // Normalize fields across Channels (flat) and SageTV (nested Airing.Show)
         const airing = r.Airing || {};
         const show = airing.Show || {};
-        const showTitle = r.title || r.show_title || show.ShowTitle || title;
-        const ep = r.episode_title || r.episode || show.ShowEpisode || '';
+        const showTitle = String(r.title || r.show_title || show.ShowTitle || title || '');
+        const ep = String(r.episode_title || r.episode || show.ShowEpisode || '');
         const seRaw = r.season_episode || '';
         let seStr = seRaw;
         if (!seStr) {

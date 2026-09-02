@@ -67,7 +67,12 @@ class OpenClawPlanner(PlannerBase):
             return result
 
         logger.info("OpenClaw planner selected (native stub mode)")
-        if status_callback:
+        # Only advertise "Planning with OpenClaw" when a runtime callable is
+        # actually configured and loadable. Otherwise the runtime is guaranteed
+        # to raise "not configured" below and fall back, so announcing it (and
+        # the later "falling back" line) is misleading noise on every query.
+        runtime_available = self._runtime.available()
+        if status_callback and runtime_available:
             await status_callback("Planning with OpenClaw")
 
         tools, _schemas = await self._tool_registry.discover_openai_tools(
@@ -105,7 +110,7 @@ class OpenClawPlanner(PlannerBase):
                     "openai_tools_offered": len(tools),
                 }
 
-            if status_callback:
+            if status_callback and runtime_available:
                 await status_callback("OpenClaw runtime unavailable, falling back")
 
             result = await self._fallback.run(
@@ -123,4 +128,5 @@ class OpenClawPlanner(PlannerBase):
             if isinstance(result, dict):
                 result.setdefault("planner", "openclaw-fallback-runtime")
                 result.setdefault("openclaw_error", str(exc))
+                result.setdefault("openai_tools_offered", len(tools))
             return result
