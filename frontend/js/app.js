@@ -636,12 +636,23 @@
       }
 
       const response = data.response || data.llm_response || data.error || 'No response from server.';
-      UI.addMessage(response, data.error ? 'error' : 'assistant');
-
-      // Render clickable episode cards if transcript results were returned
       const results = data.transcript_results;
-      if (results && results.length > 0) {
-        UI.addEpisodeCards(results);
+
+      if (data.error) {
+        UI.addMessage(response, 'error');
+      } else {
+        // Merge the numbered recordings list (has watched/air-date) with the
+        // transcript results (have play button + snippet) into ONE list so the
+        // two blocks aren't duplicated. Falls back to the old two-block render
+        // when there's no numbered list to merge.
+        const merged = mergeEpisodeResults(response, results);
+        if (merged) {
+          if (merged.prose) UI.addMessage(merged.prose, 'assistant');
+          UI.addEpisodeResults(merged.items, { contentSearch: isContentQuery(text) });
+        } else {
+          UI.addMessage(response, 'assistant');
+          if (results && results.length > 0) UI.addEpisodeCards(results);
+        }
       }
     } catch (e) {
       thinking.remove();
@@ -1108,6 +1119,87 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // Classify a query as a "content" search (about spoken dialogue/topic) vs a
+  // recordings/date listing. Transcript snippets are only meaningful for the
+  // former, so we hide them for plain listings.
+  function isContentQuery(q) {
+    const s = (q || '').toLowerCase();
+    const listing = /\b(what(?:'s| is| was| are| were|'?s)?\s+(?:recorded|record|available|on the dvr|on my dvr)|list\s|unwatched\b|what did i record|what'?s available|show me .*recording)\b/.test(s);
+    const content = /\b(who|what did|what happened|what was said|said|says?|talk|talked|talking|discuss|mention|about|topic|why|how did|when did|quote|scene|moment|happen(?:s|ed)?|storyline|plot)\b/.test(s);
+    return content && !listing;
+  }
+
+  function fmtEpochDate(v) {
+    const n = Number(v);
+    if (!n || Number.isNaN(n)) return '';
+    // Epoch may be seconds or milliseconds.
+    const ms = n > 1e12 ? n : n * 1000;
+    try {
+      return new Date(ms).toLocaleDateString(undefined,
+        { weekday: 'short', month: 'short', day: 'numeric' });
+    } catch (_) { return ''; }
+  }
+
+  // Merge the LLM's numbered recordings list with the structured transcript
+  // results into one deduped list. Returns { items, prose } or null when there
+  // is no numbered list to merge (caller then keeps the legacy two-block render).
+  function mergeEpisodeResults(response, results) {
+    if (!response) return null;
+    const norm = (v) => (v || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    // "1. \"Show\" \"Episode\" S##E## — Tue Aug 25 Unwatched" (also "- " bullets)
+    const lineRe = /^\s*(?:\d+\.|[-•*])\s+["“”]([^"“”]+)["“”](?:\s+["“”]([^"“”]+)["“”])?\s*(.*)$/;
+
+    const items = [];
+    const proseLines = [];
+    for (const line of response.split(/\r?\n/)) {
+      const m = line.match(lineRe);
+      if (!m) { proseLines.push(line); continue; }
+      const showName = (m[1] || '').trim();
+      const epTitle = (m[2] || '').trim();
+      const rest = (m[3] || '').trim();
+      const seM = rest.match(/\bS\d{1,2}E\d{1,3}\b/i);
+      const watchM = rest.match(/\b(Watched|Unwatched|Unknown)\b/i);
+      let dateStr = rest
+        .replace(/\bS\d{1,2}E\d{1,3}\b/i, '')
+        .replace(/\b(Watched|Unwatched|Unknown)\b/i, '')
+        .replace(/^[\s—\-–·|]+|[\s—\-–·|]+$/g, '')
+        .trim();
+      items.push({
+        showName,
+        epTitle,
+        se: seM ? seM[0].toUpperCase() : '',
+        watched: watchM ? watchM[1] : '',
+        dateStr,
+      });
+    }
+    if (items.length === 0) return null;
+
+    // Index transcript results by normalized show+episode to attach playback
+    // data (recording id, snippet, timestamp, channel).
+    const txByKey = {};
+    (results || []).forEach(r => {
+      const show = (r.display_title || r.title || '').replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '');
+      const key = norm(show) + '|' + norm(r.episode_title);
+      if (!txByKey[key]) txByKey[key] = r;
+    });
+    items.forEach(it => {
+      const r = txByKey[norm(it.showName) + '|' + norm(it.epTitle)];
+      if (!r) return;
+      it.recordingId = r.recording_id || '';
+      it.system = r.system || '';
+      it.channel = r.channel || '';
+      it.startTime = (r.start_time != null) ? r.start_time : null;
+      it.snippet = r.snippet || '';
+      if (!it.se && r.se_label) it.se = r.se_label;
+      if (!it.dateStr && (r.record_date || r.air_date)) {
+        it.dateStr = fmtEpochDate(r.record_date || r.air_date);
+      }
+    });
+
+    const prose = proseLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { items, prose };
   }
 
   function formatVttWithSpeakers(vtt) {

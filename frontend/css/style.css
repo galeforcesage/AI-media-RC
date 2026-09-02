@@ -381,6 +381,25 @@ body {
 .ec-title { font-weight: 600; }
 .ec-meta { font-size: 0.8rem; color: var(--text-muted); }
 .ec-snippet { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
+.episode-card .ec-title.show-link {
+  color: var(--primary);
+  text-decoration: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.episode-card .ec-title.show-link:hover { text-decoration: underline; }
+.ec-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.ec-badge.ec-unwatched { color: var(--primary); border-color: var(--primary); }
+.ec-badge.ec-watched { color: var(--text-muted); }
 .episode-results { max-width: 100%; }
 
 .input-row { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
