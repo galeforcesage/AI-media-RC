@@ -219,9 +219,97 @@ const API = (() => {
     return request(`${sessionUrl}/whoami`);
   }
 
+  /**
+   * WebSocket-based streaming query. Opens a persistent connection for
+   * real-time token delivery and tool call visibility.
+   *
+   * @param {string} prompt - User query text
+   * @param {object} callbacks - {onToken, onStatus, onToolCall, onDone, onError}
+   * @param {string[]} systems - DVR systems to query
+   * @returns {object} - {close: Function} to abort the query
+   */
+  function queryWS(prompt, callbacks = {}, systems) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws/query`);
+    let closed = false;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ prompt, systems: systems || undefined }));
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        switch (msg.type) {
+          case 'token':
+            if (callbacks.onToken) callbacks.onToken(msg.text);
+            break;
+          case 'status':
+            if (callbacks.onStatus) callbacks.onStatus(msg.message);
+            break;
+          case 'tool_call':
+            if (callbacks.onToolCall) callbacks.onToolCall(msg);
+            break;
+          case 'done':
+            if (callbacks.onDone) callbacks.onDone(msg);
+            ws.close();
+            break;
+          case 'error':
+            if (callbacks.onError) callbacks.onError(msg.message);
+            ws.close();
+            break;
+        }
+      } catch (_) { /* skip malformed */ }
+    };
+
+    ws.onerror = () => {
+      if (!closed && callbacks.onError) callbacks.onError('WebSocket connection failed');
+    };
+
+    ws.onclose = () => { closed = true; };
+
+    return {
+      close: () => { closed = true; ws.close(); },
+    };
+  }
+
+  /**
+   * Connect to the server event stream for push-based state updates.
+   * Replaces polling when WebSocket is available.
+   *
+   * @param {Function} onEvent - Called with {type, data, ts} for each event
+   * @returns {object} - {close: Function}
+   */
+  function connectEvents(onEvent) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws/events`);
+    let reconnectTimer = null;
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (onEvent) onEvent(msg);
+      } catch (_) {}
+    };
+
+    ws.onclose = () => {
+      // Auto-reconnect after 5 seconds
+      reconnectTimer = setTimeout(() => {
+        if (onEvent) connectEvents(onEvent);
+      }, 5000);
+    };
+
+    return {
+      close: () => {
+        clearTimeout(reconnectTimer);
+        ws.close();
+      },
+    };
+  }
+
   return {
     setBaseUrl, setSessionUrl,
-    query, queryStream, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu, alerts, clearAlerts,
+    query, queryStream, queryWS, connectEvents, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu, alerts, clearAlerts,
     listDevices, bridgeDevices, bridgeStatus, addDevice, updateDevice, discoverDevices, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,

@@ -9,11 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from utils.tracing import start_trace, end_trace
+from utils.metrics import http_requests_total, http_request_duration, http_errors_total
 
 logger = logging.getLogger(__name__)
 
@@ -73,17 +77,31 @@ class SystemRequest(BaseModel):
 # Centralized error wrapper
 # ------------------------------------------------------------------
 
-async def _safe_execute(coro):
-    """Await a coroutine and convert errors to HTTPException."""
+async def _safe_execute(coro, operation: str = "request"):
+    """Await a coroutine and convert errors to HTTPException. Traces the execution."""
+    root_span = start_trace(f"http.{operation}", {"http.operation": operation})
+    start = time.time()
     try:
         result = await coro
         if isinstance(result, dict) and "error" in result:
+            root_span.set_error(result["error"])
+            http_errors_total.inc(labels={"operation": operation})
+            end_trace(root_span)
             raise HTTPException(status_code=422, detail=result["error"])
+        http_requests_total.inc(labels={"operation": operation})
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         return result
     except HTTPException:
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         raise
     except Exception as exc:
         logger.exception("Unhandled transport error")
+        root_span.set_error(str(exc))
+        http_errors_total.inc(labels={"operation": operation})
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -99,7 +117,8 @@ async def query(request: QueryRequest):
     """
     orch = _require_orchestrator()
     return await _safe_execute(
-        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems)
+        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems),
+        operation="query",
     )
 
 

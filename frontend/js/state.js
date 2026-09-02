@@ -118,12 +118,28 @@ const State = (() => {
     }
   }
 
+  let _eventStream = null;
+
   function startPolling(intervalMs = 7000) {
     stopPolling();
     refreshSession();
     refreshBridgeDevices();
+
+    // Try WebSocket events stream first (push-based, no polling needed)
+    try {
+      _eventStream = API.connectEvents((evt) => {
+        if (evt.type === 'playback_update' && evt.data) {
+          set({ session: evt.data, connected: true });
+        } else if (evt.type === 'health' && evt.data) {
+          set({ connected: evt.data.status === 'ok' });
+        }
+      });
+    } catch (_) {
+      _eventStream = null;
+    }
+
+    // Fall back to polling if WS not available or as a supplement
     state.polling = setInterval(refreshSession, intervalMs);
-    // Bridge device list changes rarely — poll every 30s
     state._bridgePoll = setInterval(refreshBridgeDevices, 30000);
   }
 
@@ -135,6 +151,10 @@ const State = (() => {
     if (state._bridgePoll) {
       clearInterval(state._bridgePoll);
       state._bridgePoll = null;
+    }
+    if (_eventStream) {
+      _eventStream.close();
+      _eventStream = null;
     }
   }
 

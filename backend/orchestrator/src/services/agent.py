@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
+from utils.tracing import span as trace_span, start_span, end_span
+from utils.metrics import agent_iterations_total, agent_tool_calls_total, agent_tool_duration, agent_tool_errors_total
 from services.planner_base import PlannerBase
 from services.mcp_tool_registry import MCPToolRegistry
 
@@ -1116,6 +1118,13 @@ class AgentLoop(PlannerBase):
         )
         trace_start = time.monotonic()
 
+        # Start observability span for the agent loop
+        agent_span = start_span("agent.run", {
+            "query_length": len(user_query),
+            "systems": systems,
+            "temporal": temporal or "",
+        })
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": await self._build_system_prompt(systems)},
         ]
@@ -1210,6 +1219,7 @@ class AgentLoop(PlannerBase):
 
         for iteration in range(self._max_iterations):
             logger.info("Agent loop iteration %d/%d", iteration + 1, self._max_iterations)
+            agent_iterations_total.inc()
 
             if status_callback:
                 if iteration == 0:
@@ -1530,7 +1540,11 @@ class AgentLoop(PlannerBase):
                     step_start = time.monotonic()
                     result = await self._execute_tool(tool_name, tool_args)
                     step_ms = (time.monotonic() - step_start) * 1000
+                    agent_tool_calls_total.inc(labels={"tool": tool_name})
+                    agent_tool_duration.observe(step_ms / 1000.0)
                     self._tool_results_cache[call_key] = result
+                    if result.get("error"):
+                        agent_tool_errors_total.inc(labels={"tool": tool_name})
                     # Extract entities from tool results for conversation context
                     if self._entity_store and isinstance(result, dict):
                         self._entity_store.extract_from_tool_result(tool_name, result)
@@ -1863,6 +1877,9 @@ class AgentLoop(PlannerBase):
         trace.model = llm_result.get("model", "")
         trace.iterations = self._max_iterations
         trace.total_ms = (time.monotonic() - trace_start) * 1000
+        agent_span.set_attribute("iterations", self._max_iterations)
+        agent_span.set_attribute("status", "max_iterations")
+        end_span(agent_span)
         trace.log()
         return {
             "status": "ok",
