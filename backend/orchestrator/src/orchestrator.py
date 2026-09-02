@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 from utils.logger import get_logger
 from registry.commands import CommandRegistry
 from services.llm import LLMService
+from services.gpu_router import GpuRouterLeaseManager
 from services.whisper import WhisperService
 from services.tts import TTSService
 from services.llm_pipeline import LLMPipeline
@@ -57,6 +58,14 @@ class Orchestrator:
         self.registry = CommandRegistry()
 
         # Core AI services
+        # GPU Resource Broker lease manager — lets the LLM share the GPU with
+        # paperless-ai / VSR via short leases; fails open to the static
+        # base_url/model when the broker is disabled or unreachable.
+        self.gpu_router = GpuRouterLeaseManager(
+            config.get("gpu_router", {}),
+            fallback_base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
+            fallback_model=config.get("llm", {}).get("model", "hermes3:8b"),
+        )
         self.llm = LLMService(
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
             base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
@@ -66,6 +75,7 @@ class Orchestrator:
             num_predict=config.get("llm", {}).get("num_predict", 512),
             num_ctx=config.get("llm", {}).get("num_ctx", 4096),
             max_concurrent=config.get("llm", {}).get("max_concurrent", 1),
+            lease_manager=self.gpu_router,
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),

@@ -56,6 +56,7 @@ class LLMService:
         num_predict: int = DEFAULT_NUM_PREDICT,
         num_ctx: int = DEFAULT_NUM_CTX,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT_LLM,
+        lease_manager: Optional[Any] = None,
     ) -> None:
         self.model_path = model_path
         self.base_url = base_url.rstrip("/")
@@ -67,9 +68,39 @@ class LLMService:
         self.loaded = False
         self._lock = asyncio.Lock()
         self._inference_semaphore = asyncio.Semaphore(max_concurrent)
+        # Optional GPU Resource Broker lease manager. When present and enabled
+        # it hands us an effective (endpoint, model) per call and manages the
+        # GPU lease; when absent or disabled every call uses the static
+        # base_url/model below (fail-open).
+        self._lease_mgr = lease_manager
+
+    async def _begin_lease(self, session_id: Optional[str]) -> tuple[str, str, Optional[str]]:
+        """Resolve the effective (base_url, model) for a call, acquiring or
+        reusing a broker lease when enabled. Falls open to the static
+        endpoint/model on any problem."""
+        if self._lease_mgr is None:
+            return self.base_url, self.model, None
+        try:
+            return await self._lease_mgr.begin(session_id or "app")
+        except Exception:
+            logger.exception("GPU router begin failed — using static endpoint")
+            return self.base_url, self.model, None
+
+    async def _end_lease(self, token: Optional[str]) -> None:
+        if self._lease_mgr is None or token is None:
+            return
+        try:
+            await self._lease_mgr.end(token)
+        except Exception:
+            logger.exception("GPU router end failed")
 
     async def load(self) -> None:
         """Verify Ollama is reachable and the model is available."""
+        if self._lease_mgr is not None:
+            try:
+                await self._lease_mgr.startup()
+            except Exception:
+                logger.exception("GPU router startup failed — continuing with static endpoint")
         async with self._lock:
             if self.loaded:
                 return
@@ -95,6 +126,11 @@ class LLMService:
     async def unload(self) -> None:
         """Mark service as unloaded."""
         self.loaded = False
+        if self._lease_mgr is not None:
+            try:
+                await self._lease_mgr.release_all()
+            except Exception:
+                logger.exception("GPU router release_all failed")
         logger.info("LLM service unloaded")
 
     async def generate(
@@ -102,6 +138,7 @@ class LLMService:
         prompt: str,
         params: Dict[str, Any] | None = None,
         metadata: Dict[str, Any] | None = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate a response via Ollama.
@@ -110,9 +147,10 @@ class LLMService:
             Dict with status, prompt, response, and model.
         """
         logger.info("LLM generating response (prompt length=%d)", len(prompt))
+        base_url, model, _lease = await self._begin_lease(session_id)
         try:
             payload = {
-                "model": self.model,
+                "model": model,
                 "system": SYSTEM_PROMPT,
                 "prompt": prompt,
                 "stream": False,
@@ -124,13 +162,13 @@ class LLMService:
             }
             if params:
                 payload["options"].update(params)
-            if "qwen3" in self.model:
+            if "qwen3" in model:
                 payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/generate", json=payload
+                    f"{base_url}/api/generate", json=payload
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -144,7 +182,7 @@ class LLMService:
                 "status": "ok",
                 "prompt": prompt,
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM generation timed out")
@@ -152,11 +190,14 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM generation error")
             return {"error": str(exc)}
+        finally:
+            await self._end_lease(_lease)
 
     async def generate_chat(
         self,
         messages: list[Dict[str, Any]],
         params: Dict[str, Any] | None = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Multi-turn chat via Ollama /api/chat.
@@ -169,9 +210,10 @@ class LLMService:
             Dict with status, response, and model.
         """
         logger.info("LLM chat generation (%d messages)", len(messages))
+        base_url, model, _lease = await self._begin_lease(session_id)
         try:
             payload: Dict[str, Any] = {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "stream": False,
                 "options": {
@@ -181,13 +223,13 @@ class LLMService:
                     "num_thread": self.num_threads,
                 },
             }
-            if "qwen3" in self.model:
+            if "qwen3" in model:
                 payload["think"] = False
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/chat", json=payload,
+                    f"{base_url}/api/chat", json=payload,
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -204,7 +246,7 @@ class LLMService:
             return {
                 "status": "ok",
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM chat generation timed out")
@@ -212,6 +254,8 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM chat generation error")
             return {"error": str(exc)}
+        finally:
+            await self._end_lease(_lease)
 
     async def stream_chat(
         self,
@@ -219,6 +263,7 @@ class LLMService:
         token_callback=None,
         tools: list[Dict[str, Any]] | None = None,
         params: Dict[str, Any] | None = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Streaming multi-turn chat via Ollama /api/chat.
@@ -232,9 +277,10 @@ class LLMService:
         """
         logger.info("LLM streaming chat (%d messages, %d tools)",
                      len(messages), len(tools) if tools else 0)
+        base_url, model, _lease = await self._begin_lease(session_id)
         try:
             payload: Dict[str, Any] = {
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "stream": True,
                 "options": {
@@ -250,7 +296,7 @@ class LLMService:
                 payload["tools"] = tools
             # Disable qwen3 thinking mode — it wastes the token budget
             # on <think> reasoning and produces empty responses with many tools
-            if "qwen3" in self.model:
+            if "qwen3" in model:
                 payload["think"] = False
             # Log payload size for debugging context overflow
             payload_json = json.dumps(payload)
@@ -262,7 +308,7 @@ class LLMService:
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/chat", json=payload,
+                    f"{base_url}/api/chat", json=payload,
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -327,7 +373,7 @@ class LLMService:
                     "status": "ok",
                     "response": response_text,
                     "tool_calls": accumulated_tool_calls,
-                    "model": self.model,
+                    "model": model,
                 }
 
             logger.info(
@@ -337,7 +383,7 @@ class LLMService:
             return {
                 "status": "ok",
                 "response": response_text,
-                "model": self.model,
+                "model": model,
             }
         except asyncio.TimeoutError:
             logger.error("LLM stream_chat timed out")
@@ -345,16 +391,20 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM stream_chat error")
             return {"error": str(exc)}
+        finally:
+            await self._end_lease(_lease)
 
     async def stream(
         self,
         prompt: str,
         params: Dict[str, Any] | None = None,
+        session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """Stream tokens from Ollama as an async generator."""
         logger.info("LLM streaming response (prompt length=%d)", len(prompt))
+        base_url, model, _lease = await self._begin_lease(session_id)
         payload = {
-            "model": self.model,
+            "model": model,
             "system": SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": True,
@@ -364,12 +414,14 @@ class LLMService:
                 "num_thread": self.num_threads,
             },
         }
+        if "qwen3" in model:
+            payload["think"] = False
         try:
             timeout = aiohttp.ClientTimeout(total=300)
             async with self._inference_semaphore:
               async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.base_url}/api/generate", json=payload
+                    f"{base_url}/api/generate", json=payload
                 ) as resp:
                     async for line in resp.content:
                         if not line:
@@ -386,3 +438,5 @@ class LLMService:
         except Exception as exc:
             logger.exception("LLM streaming error")
             yield f"[Error: {exc}]"
+        finally:
+            await self._end_lease(_lease)
