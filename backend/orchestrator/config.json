@@ -13,27 +13,6 @@
         "num_ctx": 8192,
         "max_concurrent": 1
     },
-    "gpu_router": {
-        "enabled": true,
-        "url": "http://10.0.0.10:7235",
-        "application_id": "sagetv-ai-remote",
-        "service_class": "TOLERANT",
-        "request_timeout_seconds": 10,
-        "lease_ttl_seconds": 300,
-        "idle_release_seconds": 120,
-        "queue_max_wait_ms": 4000,
-        "broker_cooldown_seconds": 60,
-        "broker_fail_threshold": 2,
-        "provider_endpoints": {
-            "sagetv-cl-ollama": "http://10.0.0.10:11434",
-            "predator-tc-ollama": "http://10.0.0.11:11434"
-        },
-        "modes": [
-            { "name": "qwen3-14b", "model": "qwen3:14b", "quality_rank": 3, "vram_mb": 11000 },
-            { "name": "qwen25-14b", "model": "qwen2.5:14b", "quality_rank": 2, "vram_mb": 10000 },
-            { "name": "hermes3-8b", "model": "hermes3:8b", "quality_rank": 1, "vram_mb": 6000 }
-        ]
-    },
     "whisper": {
         "model_path": "models/whisper",
         "model_size": "base"

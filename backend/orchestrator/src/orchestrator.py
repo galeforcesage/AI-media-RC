@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 from utils.logger import get_logger
 from registry.commands import CommandRegistry
 from services.llm import LLMService
-from services.gpu_router import GpuRouterLeaseManager
+from services.lease import load_lease_manager
 from services.whisper import WhisperService
 from services.tts import TTSService
 from services.llm_pipeline import LLMPipeline
@@ -58,10 +58,11 @@ class Orchestrator:
         self.registry = CommandRegistry()
 
         # Core AI services
-        # GPU Resource Broker lease manager — lets the LLM share the GPU with
-        # paperless-ai / VSR via short leases; fails open to the static
-        # base_url/model when the broker is disabled or unreachable.
-        self.gpu_router = GpuRouterLeaseManager(
+        # Optional GPU-lease manager. A private plugin (named by the
+        # GPU_ROUTER_PLUGIN env var) can share the GPU with other apps via
+        # short leases; when no plugin is configured this is a no-op that uses
+        # the static base_url/model below. Either way the LLM fails open.
+        self.gpu_router = load_lease_manager(
             config.get("gpu_router", {}),
             fallback_base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
             fallback_model=config.get("llm", {}).get("model", "hermes3:8b"),

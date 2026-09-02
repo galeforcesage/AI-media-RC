@@ -6,8 +6,8 @@ Wants=network-online.target ollama.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-User=sagetv
-Group=sagetv
+User=MEDIA_USER
+Group=MEDIA_USER
 WorkingDirectory=/home/USER_HOME/AI-media-RC
 ExecStart=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh all
 ExecStop=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh stop
