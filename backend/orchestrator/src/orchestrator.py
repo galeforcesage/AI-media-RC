@@ -857,6 +857,34 @@ class Orchestrator:
             if _has_inline_transcript:
                 _is_meta_transcript = False
 
+            # Detect plain recordings-listing/inventory queries ("what did I
+            # record", "what's on my DVR", "list recordings from last week").
+            # These are NOT content questions, so the single-recording
+            # transcript content pre-fetch below must NOT hijack them into a
+            # one-show answer. For these we skip the pre-fetch entirely and let
+            # the agent enumerate every recording via the DVR search tools
+            # (the authoritative source), instead of collapsing to the one
+            # recording whose transcript best matches the question text.
+            _recordings_listing_re = re.compile(
+                r"\bwhat\b[^?]*\b(?:record(?:ed|ings?)?|dvr|taped?|captured?)\b"
+                r"|\b(?:list|show\s+me)\b[^?]*\b(?:record(?:ed|ings?)?|dvr)\b"
+                r"|\bwhat(?:'s| is| are| do\s+i\s+have)\b[^?]*\brecord(?:ed|ings?)?\b"
+                r"|\bwhat\s+did\s+i\s+record\b",
+                re.I,
+            )
+            _content_marker_re = re.compile(
+                r"\b(?:how\s+did|what\s+happened|who\s+won|what\s+was\s+said|"
+                r"about|summar(?:y|ize|ise)|recap|ending|ended|\bend\b)\b",
+                re.I,
+            )
+            _is_recordings_listing = (
+                bool(_recordings_listing_re.search(prompt))
+                and not _content_marker_re.search(prompt)
+                and not _summary_title
+                and not _has_inline_transcript
+                and not _is_meta_transcript
+            )
+
             if _has_inline_transcript:
                 if status_callback:
                     await status_callback("Analyzing transcript")
@@ -1179,7 +1207,7 @@ class Orchestrator:
             transcript_display: list = []
             episodes_used: list = []
             recordings_used: list = []
-            if temporal not in ("future", "present"):
+            if temporal not in ("future", "present") and not _is_recordings_listing:
                 try:
                     if status_callback:
                         await status_callback("Searching transcripts")
