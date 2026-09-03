@@ -204,25 +204,28 @@ const UI = (() => {
       const showName = it.showName || 'Unknown';
       const epTitle = it.epTitle || '';
       const se = it.se || '';
-      const displayTitle = epTitle
-        ? `${showName} — ${epTitle}${se ? ' ' + se : ''}`
-        : showName;
-      const linkTitle = epTitle ? `${showName} — ${epTitle}` : showName;
 
       const card = document.createElement('div');
       card.className = 'episode-card';
       card.dataset.recordingId = it.recordingId || '';
-      card.dataset.title = linkTitle;
+      // Play button resolves by series title (same as the original cards).
+      card.dataset.title = showName;
       card.dataset.system = it.system || '';
 
-      // Clicking the episode name opens the show-metadata popup (which itself
-      // offers "View Transcript" + "View Show Details"), matching the numbered
-      // list the user liked. Carry the recording id so the popup can go straight
-      // to this recording's transcript.
-      const titleHtml =
-        `<a class="ec-title show-link" href="#" data-title="${esc(linkTitle)}"` +
-        (it.recordingId ? ` data-recording-id="${esc(it.recordingId)}"` : '') +
-        `>${esc(displayTitle)}</a>`;
+      // Two separate links, matching the numbered list the user had:
+      //  • series name  → series metadata popup (no show-context)
+      //  • episode name → episode popup, with the series passed as data-show
+      // Both use the existing `.show-link` handler → showMetadataPopup(title,
+      // showContext). Searching the *combined* "Series — Episode" string
+      // matched nothing, which is what broke the popup before.
+      const showLink =
+        `<a class="ec-title show-link" href="#" data-title="${esc(showName)}">${esc(showName)}</a>`;
+      const epLink = epTitle
+        ? ` <a class="ec-title ec-ep-link show-link" href="#" ` +
+          `data-title="${esc(epTitle)}" data-show="${esc(showName)}">${esc(epTitle)}</a>`
+        : '';
+      const seHtml = se ? ` <span class="ec-se">${esc(se)}</span>` : '';
+      const titleHtml = showLink + epLink + seHtml;
 
       const metaBits = [];
       if (it.dateStr) metaBits.push(esc(it.dateStr));
