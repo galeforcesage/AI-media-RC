@@ -347,7 +347,7 @@ def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
 _TOOL_SECTIONS = {
     "sagetv": """
 ## SageTV Tools
-PAST: sagetv_search_recordings(title?, episode_title?, actor?, genre?, channel?, season?, episode?, start_date? YYYY-MM-DD, end_date? YYYY-MM-DD, watched? bool, limit?) | sagetv_get_recordings(limit?, offset?) | sagetv_get_recent_recordings(limit?) | sagetv_get_recording(media_file_id)
+PAST: sagetv_search_recordings(title?, episode_title?, actor?, genre?, channel?, season?, episode?, start_date? YYYY-MM-DD, end_date? YYYY-MM-DD, watched? bool, limit?) | sagetv_get_recordings(limit?, offset?) | sagetv_get_recent_recordings(limit?, days?) | sagetv_get_recording(media_file_id)
 PRESENT: sagetv_get_active_recordings() | sagetv_get_now_playing()
 FUTURE: sagetv_get_upcoming_recordings() | sagetv_search_shows(query)
 ANY: sagetv_get_airing(airing_id) | sagetv_get_show(show_id) | sagetv_list_genres()

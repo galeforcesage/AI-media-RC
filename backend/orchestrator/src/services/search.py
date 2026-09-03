@@ -72,6 +72,22 @@ class SearchService:
             logger.exception("search_upcoming failed")
             return {"error": str(exc)}
 
+    async def _sagetv_recordings(self, query: str) -> Dict[str, Any]:
+        """Search the SageTV *recordings library* by title.
+
+        The plain ``sagetv.search`` hits the live guide/EPG (upcoming shows),
+        so a past recording that has aged out of the guide returns nothing.
+        The metadata popup needs the actual recording, so also search the
+        recordings library by title.
+        """
+        try:
+            return await self.orchestrator.execute(
+                "sagetv.search_recordings", {"title": query}
+            )
+        except Exception as exc:
+            logger.exception("sagetv recordings search failed")
+            return {"error": str(exc)}
+
     async def search_all(self, query: str) -> Dict[str, Any]:
         """
         Fan-out search across all backends + upcoming concurrently.
@@ -81,10 +97,11 @@ class SearchService:
         targets = ("sagetv", "channels")
         tasks = [self.search_programs(t, query) for t in targets]
         tasks.append(self.search_upcoming(query))
+        tasks.append(self._sagetv_recordings(query))
         raw = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: Dict[str, Any] = {}
-        labels = list(targets) + ["upcoming"]
+        labels = list(targets) + ["upcoming", "sagetv_recordings"]
         for label, res in zip(labels, raw):
             if isinstance(res, Exception):
                 logger.error("search_all error for %s: %s", label, res)

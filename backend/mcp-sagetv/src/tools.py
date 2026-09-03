@@ -136,6 +136,7 @@ def _slim_recording(mf: Dict) -> Dict:
         "season_episode": se,
         "channel": channel.get("ChannelName", ""),
         "recorded": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
+        "record_date": int(start_ms) // 1000 if start_ms else None,
         "duration_min": round((mf.get("FileDuration", 0) or 0) / 60000, 1),
         "description": show.get("ShowDescription", ""),
         "genres": show.get("ShowCategory", ""),
@@ -1021,13 +1022,43 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
 
 
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
-    """Get the most recently completed recordings."""
-    limit = int(args.get("limit", 20))
-    data = await client.call("GetMediaFiles", ["T"], size=limit)
+    """Get the most recently completed recordings.
+
+    SageTV's GetMediaFiles returns files in import order, NOT by air date, so a
+    plain fetch can surface years-old imports. When a `days` window is given we
+    pull a wide set and filter by the real recording start time (epoch), then
+    sort newest-first so "what recorded in the last N days" is truthful.
+    """
+    days = args.get("days")
+    try:
+        days = int(days) if days not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        days = None
+    if days is not None and days <= 0:
+        days = None
+    limit = int(args.get("limit", 50 if days else 20))
+    # When filtering by date, scan a wide window since import order != air date.
+    fetch = 400 if days else limit
+    data = await client.call("GetMediaFiles", ["T"], size=fetch)
     if not data:
         return _ok(data=[], message="No recent recordings")
     items = data if isinstance(data, list) else []
-    return _ok(data=_slim_recordings(items), message=f"{len(items)} recent recordings")
+    slim = _slim_recordings(items)
+    if isinstance(slim, list):
+        if days is not None:
+            import time as _time
+            cutoff = int(_time.time()) - days * 86400
+            slim = [
+                r for r in slim
+                if isinstance(r, dict) and (r.get("record_date") or 0) >= cutoff
+            ]
+        slim.sort(
+            key=lambda r: (r.get("record_date") or 0) if isinstance(r, dict) else 0,
+            reverse=True,
+        )
+        slim = slim[:limit]
+    suffix = f" in the last {days} days" if days is not None else ""
+    return _ok(data=slim, message=f"{len(slim)} recent recordings{suffix}")
 
 
 async def sagetv_get_active_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -1531,9 +1562,10 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_search_recordings,
     },
     "sagetv_get_recent_recordings": {
-        "description": "Get the most recently completed recordings.",
+        "description": "Get the most recently completed recordings. Pass 'days' to restrict to recordings whose air/record date is within the last N days (filtered by real recording time, not import order).",
         "input_schema": {"type": "object", "properties": {
-            "limit": {"type": "integer", "description": "Max results (default 20)"},
+            "limit": {"type": "integer", "description": "Max results (default 20, or 50 when days is set)"},
+            "days": {"type": "integer", "description": "Only include recordings from the last N days (by actual record date)"},
         }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_recent_recordings,
