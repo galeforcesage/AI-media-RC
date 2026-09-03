@@ -928,7 +928,7 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     if watched is False:
         watched = None
 
-    data = await client.call("GetMediaFiles", ["T"])
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
     if not data or not isinstance(data, list):
         return _ok(data=[], message="No recordings found")
 
@@ -1005,8 +1005,18 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
                 continue
 
         results.append(mf)
-        if len(results) >= limit:
-            break
+
+    # Full library is import-ordered (oldest first); sort matches by real
+    # recording start time so the newest recordings surface, then cap.
+    def _raw_start(mf: Dict) -> int:
+        air = mf.get("Airing") or {}
+        try:
+            return int(mf.get("FileStartTime") or air.get("AiringStartTime") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    results.sort(key=_raw_start, reverse=True)
+    results = results[:limit]
 
     slimmed = _slim_recordings(results)
     n_avail = sum(1 for r in slimmed if r.get("status") == "available")
@@ -1024,10 +1034,11 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
     """Get the most recently completed recordings.
 
-    SageTV's GetMediaFiles returns files in import order, NOT by air date, so a
-    plain fetch can surface years-old imports. When a `days` window is given we
-    pull a wide set and filter by the real recording start time (epoch), then
-    sort newest-first so "what recorded in the last N days" is truthful.
+    SageTV's GetMediaFiles returns files in ASCENDING import order, so a bounded
+    fetch (size=N) returns the OLDEST N files, not the newest. To answer "what
+    recorded recently" we must pull the full library and sort by the real
+    recording start time (FileStartTime). A `days` window then filters to the
+    last N days by that real time so the result is truthful.
     """
     days = args.get("days")
     try:
@@ -1037,26 +1048,27 @@ async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
     if days is not None and days <= 0:
         days = None
     limit = int(args.get("limit", 50 if days else 20))
-    # When filtering by date, scan a wide window since import order != air date.
-    fetch = 400 if days else limit
-    data = await client.call("GetMediaFiles", ["T"], size=fetch)
-    if not data:
-        return _ok(data=[], message="No recent recordings")
+    # Pull the whole library (size caps at the real total) so the newest
+    # recordings — which sit at the tail of the import-ordered list — are seen.
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
     items = data if isinstance(data, list) else []
+    if not items:
+        return _ok(data=[], message="No recent recordings")
+
+    def _raw_start(mf: Dict) -> int:
+        air = mf.get("Airing") or {}
+        try:
+            return int(mf.get("FileStartTime") or air.get("AiringStartTime") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    items.sort(key=_raw_start, reverse=True)
+    if days is not None:
+        import time as _time
+        cutoff_ms = (int(_time.time()) - days * 86400) * 1000
+        items = [mf for mf in items if _raw_start(mf) >= cutoff_ms]
+    items = items[:limit]
     slim = _slim_recordings(items)
-    if isinstance(slim, list):
-        if days is not None:
-            import time as _time
-            cutoff = int(_time.time()) - days * 86400
-            slim = [
-                r for r in slim
-                if isinstance(r, dict) and (r.get("record_date") or 0) >= cutoff
-            ]
-        slim.sort(
-            key=lambda r: (r.get("record_date") or 0) if isinstance(r, dict) else 0,
-            reverse=True,
-        )
-        slim = slim[:limit]
     suffix = f" in the last {days} days" if days is not None else ""
     return _ok(data=slim, message=f"{len(slim)} recent recordings{suffix}")
 
