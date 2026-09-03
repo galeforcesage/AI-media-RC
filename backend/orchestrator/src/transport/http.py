@@ -230,8 +230,53 @@ async def search(
 async def search_transcripts(
     q: str = Query(..., min_length=1, description="Search query"),
 ):
-    """Search transcripts by title/episode using FTS5 cross-search index."""
+    """Resolve which recordings have a transcript for a title query.
+
+    The show-info popup asks "does show/episode X have a transcript" — that's a
+    TITLE lookup, not a dialogue search. transcript_cross_search matches spoken
+    words, so querying a series name like "Press Your Luck" returned unrelated
+    shows that merely *said* the phrase, and the popup concluded "No transcript
+    available" even though the recording is fully transcribed. So match against
+    the transcript inventory by title/episode/recording_id first, and only fall
+    back to the dialogue search when nothing matches by title.
+    """
     orch = _require_orchestrator()
+
+    import re
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+    qn = _norm(q)
+
+    # Title lookup against the transcript inventory.
+    recent = await orch.agent._call_transcription(
+        "transcript_list_recent", {"limit": 1000}
+    )
+    inventory = []
+    if isinstance(recent, dict) and recent.get("success") and "data" in recent:
+        _d = recent["data"]
+        inventory = _d.get("recent") or _d.get("results") or []
+
+    seen: dict = {}
+    for r in inventory:
+        rid = r.get("recording_id", "")
+        title = r.get("title", "")
+        episode = r.get("episode_title") or r.get("episode") or ""
+        haystack = _norm(f"{title} {episode} {rid}")
+        if qn and qn in haystack:
+            if rid and rid not in seen:
+                seen[rid] = {
+                    "recording_id": rid,
+                    "title": title,
+                    "episode": episode,
+                    "snippet": "",
+                    "system": r.get("system", ""),
+                }
+    if seen:
+        return {"results": list(seen.values()), "count": len(seen)}
+
+    # Fallback: dialogue (full-text) search when nothing matched by title.
     result = await orch.agent._call_transcription(
         "transcript_cross_search", {"query": q, "limit": 50}
     )
