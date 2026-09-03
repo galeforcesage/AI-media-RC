@@ -2062,6 +2062,9 @@ class AgentLoop(PlannerBase):
         if re.search(
             r"\b(list|show me|which recordings|what recordings|what shows|"
             r"do i have|did i record|what did i record|what'?s on|"
+            r"what was recorded|what recorded|"
+            r"recorded (?:over|last|this|in|on|during|between|since|today|"
+            r"yesterday|recently|the)|"
             r"upcoming|scheduled)\b",
             q,
         ):
