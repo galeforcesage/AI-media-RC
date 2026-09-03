@@ -636,7 +636,11 @@
       }
 
       const response = data.response || data.llm_response || data.error || 'No response from server.';
-      const results = data.transcript_results;
+      // For a plain recordings-listing query the backend ships per-row DVR
+      // metadata (channel/date/watched) in episode_meta — that's a DVR
+      // question, not a transcript one. Content queries still use
+      // transcript_results (snippets + timestamps).
+      const results = data.episode_meta || data.transcript_results;
 
       if (data.error) {
         UI.addMessage(response, 'error');

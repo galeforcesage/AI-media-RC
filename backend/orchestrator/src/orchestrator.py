@@ -1467,6 +1467,23 @@ class Orchestrator:
             # Attach transcript hits for the frontend (deduped to the
             # episode(s) actually used to answer).
             llm_result["transcript_results"] = transcript_display or transcript_hits
+
+            # A plain recordings-listing query ("what recorded on 32.1 last
+            # week") is a DVR question, not a transcript question. The frontend
+            # still wants per-row channel/date/watched so it can show "(32.1)"
+            # and play the show. Source that straight from the authoritative DVR
+            # recordings tool — no transcript index involved — and ship it in a
+            # dedicated episode_meta side-channel (transcript_results stays for
+            # actual content answers).
+            if _is_recordings_listing:
+                try:
+                    _rows = await self._listing_episode_rows(prompt)
+                    if _rows:
+                        llm_result["episode_meta"] = _rows
+                except Exception:
+                    logger.warning(
+                        "recordings-listing enrichment failed", exc_info=True
+                    )
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
 
@@ -1484,6 +1501,66 @@ class Orchestrator:
         except Exception as exc:
             logger.exception("run_query failed")
             return {"error": str(exc)}
+
+    async def _listing_episode_rows(self, prompt: str) -> list:
+        """Build flat per-recording rows for a recordings-listing query.
+
+        Sourced purely from the authoritative Channels DVR recordings tool —
+        this is a DVR/inventory question, not a transcript question, so channel
+        and air date come straight from the recording metadata. No transcript
+        index, no single-show narrowing, no content. The frontend merges these
+        onto the numbered list by show+episode to show "(channel)" and play the
+        show.
+        """
+        from datetime import datetime as _dt
+
+        # Resolve the date window from the rewritten prompt "(YYYY-MM-DD to …)".
+        _qd = re.search(
+            r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
+        )
+        _start = _end = None
+        if _qd:
+            try:
+                _s = _dt.strptime(_qd.group(1), "%Y-%m-%d")
+                _e = _dt.strptime(_qd.group(2) or _qd.group(1), "%Y-%m-%d")
+                _start = int(_s.timestamp())
+                _end = int(_e.timestamp()) + 86399
+            except Exception:
+                _start = _end = None
+
+        rows: list = []
+        try:
+            _rec = await self._channels.call_tool("channels_get_recordings", {})
+            _list = _rec.get("data", _rec) if isinstance(_rec, dict) else _rec
+            if not isinstance(_list, list):
+                return []
+            for _r in _list:
+                _rd = _r.get("record_date") or _r.get("original_air_epoch")
+                try:
+                    _rdi = int(float(_rd)) if _rd is not None else None
+                except Exception:
+                    _rdi = None
+                if _start is not None and _rdi is not None and not (
+                    _start <= _rdi <= _end
+                ):
+                    continue
+                rows.append({
+                    "display_title": _r.get("title") or "",
+                    "title": _r.get("title") or "",
+                    "episode_title": _r.get("episode_title") or None,
+                    "se_label": _r.get("season_episode") or None,
+                    "channel": _r.get("channel") or "",
+                    "record_date": _rdi,
+                    "watched": _r.get("watched"),
+                    "system": "channelsdvr",
+                    "recording_id": _r.get("id") or "",
+                })
+        except Exception:
+            logger.warning(
+                "recordings-listing: DVR fetch failed", exc_info=True
+            )
+            return []
+        return rows
 
     async def run_query_voice(self, audio_path: str) -> Dict[str, Any]:
         """Run a voice query: audio → transcription → LLM → TTS."""
