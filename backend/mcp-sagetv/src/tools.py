@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import enum
 import logging
+import os
 import re
 from typing import Any, Callable, Coroutine, Dict
 
@@ -821,14 +822,48 @@ async def sagetv_get_commercial_segments(client: SageXClient, args: Dict) -> Dic
 # ENTITY LOOKUP TOOLS
 # ==================================================================
 
+async def _find_mediafile_by_basename(client: SageXClient, file_path: str) -> Any:
+    """Resolve a raw SageTV MediaFile by matching its on-disk filename.
+
+    Channels-DVR-imported files are named ``{Title}-{ChannelsID}-{Segment}.mpg``
+    where the middle number is the *Channels DVR* recording ID, NOT the SageTV
+    MediaFileID. Looking such a file up by the embedded number fails, so we fall
+    back to scanning the full library and matching on the SegmentFiles basename.
+    """
+    if not file_path:
+        return None
+    stem = os.path.basename(str(file_path))
+    stem_noext = os.path.splitext(stem)[0]
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
+    items = data if isinstance(data, list) else []
+    for mf in items:
+        segs = mf.get("SegmentFiles") or []
+        if isinstance(segs, str):
+            segs = [segs]
+        for sp in segs:
+            b = os.path.basename(str(sp))
+            if b == stem or os.path.splitext(b)[0] == stem_noext:
+                return mf
+    return None
+
+
 async def sagetv_get_recording(client: SageXClient, args: Dict) -> Dict:
-    """Get a single recording by MediaFile ID — fully hydrated with Airing + Show."""
-    media_file_id = str(args.get("media_file_id", ""))
-    if not media_file_id:
-        return _fail("missing_media_file_id", "MediaFile ID is required")
-    mf = await client.call("GetMediaFileForID", [media_file_id])
+    """Get a single recording — fully hydrated with Airing + Show.
+
+    Resolves by MediaFile ID when given; falls back to matching an on-disk
+    filename (``file_path``) so Channels-DVR-imported files — whose filename
+    embeds the Channels ID rather than the SageTV MediaFileID — still resolve.
+    """
+    media_file_id = str(args.get("media_file_id", "") or "")
+    file_path = str(args.get("file_path", "") or args.get("filename", "") or "")
+    mf = None
+    if media_file_id:
+        mf = await client.call("GetMediaFileForID", [media_file_id])
+    if not mf and file_path:
+        mf = await _find_mediafile_by_basename(client, file_path)
     if not mf:
-        return _fail("not_found", f"MediaFile {media_file_id} not found")
+        return _fail("not_found",
+                     f"MediaFile not found (id={media_file_id!r} file={file_path!r})")
     return _ok(data=mf, message="Recording retrieved")
 
 
@@ -1512,10 +1547,11 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
     # ---- Entity Lookup ----
     "sagetv_get_recording": {
-        "description": "Get a single recording by MediaFile ID, fully hydrated with Airing + Show + Channel data. Returns: mediaFileId, filePath, fileSize, startTime, endTime, duration, isRecording, isComplete, isWatched, isArchived, recordingQuality, container, resolution, airingId, showId, channelId, and user properties.",
+        "description": "Get a single recording by MediaFile ID (or by on-disk file_path when the ID is unknown), fully hydrated with Airing + Show + Channel data. Returns: mediaFileId, filePath, fileSize, startTime, endTime, duration, isRecording, isComplete, isWatched, isArchived, recordingQuality, container, resolution, airingId, showId, channelId, and user properties.",
         "input_schema": {"type": "object", "properties": {
             "media_file_id": {"type": "string", "description": "The MediaFile ID"},
-        }, "required": ["media_file_id"]},
+            "file_path": {"type": "string", "description": "On-disk recording path or filename; used to resolve the MediaFile when media_file_id is unknown or wrong (e.g. Channels-DVR-imported files)."},
+        }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_recording,
     },
