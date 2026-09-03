@@ -1477,7 +1477,7 @@ class Orchestrator:
             # actual content answers).
             if _is_recordings_listing:
                 try:
-                    _rows = await self._listing_episode_rows(prompt)
+                    _rows = await self._listing_episode_rows(prompt, active)
                     if _rows:
                         llm_result["episode_meta"] = _rows
                 except Exception:
@@ -1502,19 +1502,22 @@ class Orchestrator:
             logger.exception("run_query failed")
             return {"error": str(exc)}
 
-    async def _listing_episode_rows(self, prompt: str) -> list:
+    async def _listing_episode_rows(self, prompt: str, active: list) -> list:
         """Build flat per-recording rows for a recordings-listing query.
 
-        Sourced purely from the authoritative Channels DVR recordings tool —
-        this is a DVR/inventory question, not a transcript question, so channel
-        and air date come straight from the recording metadata. No transcript
-        index, no single-show narrowing, no content. The frontend merges these
-        onto the numbered list by show+episode to show "(channel)" and play the
-        show.
+        Sourced from the DVR recordings tools for whichever systems are ACTIVE
+        (respecting the AI-focus scope) - this is a DVR/inventory question, not
+        a transcript question. Never query a system the user has focused out,
+        so a SageTV-only session never leaks Channels DVR recordings (and vice
+        versa). No transcript index, no single-show narrowing. The frontend
+        merges these onto the numbered list by show+episode to show the channel
+        and play the show on the right system.
         """
         from datetime import datetime as _dt
 
-        # Resolve the date window from the rewritten prompt "(YYYY-MM-DD to …)".
+        _active = set(active or ["sagetv", "channelsdvr"])
+
+        # Resolve the date window from the rewritten prompt "(YYYY-MM-DD to ...)".
         _qd = re.search(
             r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
         )
@@ -1529,37 +1532,72 @@ class Orchestrator:
                 _start = _end = None
 
         rows: list = []
-        try:
-            _rec = await self._channels.call_tool("channels_get_recordings", {})
-            _list = _rec.get("data", _rec) if isinstance(_rec, dict) else _rec
-            if not isinstance(_list, list):
-                return []
-            for _r in _list:
-                _rd = _r.get("record_date") or _r.get("original_air_epoch")
-                try:
-                    _rdi = int(float(_rd)) if _rd is not None else None
-                except Exception:
-                    _rdi = None
-                if _start is not None and _rdi is not None and not (
-                    _start <= _rdi <= _end
-                ):
-                    continue
-                rows.append({
-                    "display_title": _r.get("title") or "",
-                    "title": _r.get("title") or "",
-                    "episode_title": _r.get("episode_title") or None,
-                    "se_label": _r.get("season_episode") or None,
-                    "channel": _r.get("channel") or "",
-                    "record_date": _rdi,
-                    "watched": _r.get("watched"),
-                    "system": "channelsdvr",
-                    "recording_id": _r.get("id") or "",
-                })
-        except Exception:
-            logger.warning(
-                "recordings-listing: DVR fetch failed", exc_info=True
-            )
-            return []
+
+        # Channels DVR — has epoch record_date + broadcast channel.
+        if "channelsdvr" in _active and hasattr(self, "_channels"):
+            try:
+                _rec = await self._channels.call_tool(
+                    "channels_get_recordings", {}
+                )
+                _list = _rec.get("data", _rec) if isinstance(_rec, dict) else _rec
+                for _r in (_list or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    _rd = _r.get("record_date") or _r.get("original_air_epoch")
+                    try:
+                        _rdi = int(float(_rd)) if _rd is not None else None
+                    except Exception:
+                        _rdi = None
+                    if _start is not None and _rdi is not None and not (
+                        _start <= _rdi <= _end
+                    ):
+                        continue
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": _rdi,
+                        "watched": _r.get("watched"),
+                        "system": "channelsdvr",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: Channels DVR fetch failed",
+                    exc_info=True,
+                )
+
+        # SageTV — no epoch record_date/broadcast channel; the agent's numbered
+        # list supplies the date. Include what the SageTV tool returns.
+        if "sagetv" in _active and hasattr(self, "_sagetv"):
+            try:
+                _srec = await self._sagetv.call_tool(
+                    "sagetv_get_recent_recordings", {"days": 30}
+                )
+                _slist = (
+                    _srec.get("data", _srec) if isinstance(_srec, dict) else _srec
+                )
+                for _r in (_slist or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": None,
+                        "watched": _r.get("watched"),
+                        "system": "sagetv",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: SageTV fetch failed", exc_info=True
+                )
+
         return rows
 
     async def run_query_voice(self, audio_path: str) -> Dict[str, Any]:

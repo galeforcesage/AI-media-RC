@@ -638,23 +638,28 @@
       const response = data.response || data.llm_response || data.error || 'No response from server.';
       // For a plain recordings-listing query the backend ships per-row DVR
       // metadata (channel/date/watched) in episode_meta — that's a DVR
-      // question, not a transcript one. Content queries still use
-      // transcript_results (snippets + timestamps).
-      const results = data.episode_meta || data.transcript_results;
+      // question, not a transcript one — used ONLY to enrich the numbered
+      // list. Content queries use transcript_results (snippets + timestamps).
+      const meta = data.episode_meta;
+      const results = data.transcript_results;
 
       if (data.error) {
         UI.addMessage(response, 'error');
       } else {
         // Merge the numbered recordings list (has watched/air-date) with the
-        // transcript results (have play button + snippet) into ONE list so the
-        // two blocks aren't duplicated. Falls back to the old two-block render
-        // when there's no numbered list to merge.
-        const merged = mergeEpisodeResults(response, results);
+        // structured results into ONE list so the two blocks aren't
+        // duplicated. Falls back to the old two-block render when there's no
+        // numbered list to merge.
+        const merged = mergeEpisodeResults(response, meta || results);
         if (merged) {
           if (merged.prose) UI.addMessage(merged.prose, 'assistant');
           UI.addEpisodeResults(merged.items, { contentSearch: isContentQuery(text) });
         } else {
           UI.addMessage(response, 'assistant');
+          // Only fall back to transcript content cards. Never dump raw
+          // episode_meta here — it is enrichment for the numbered list, not a
+          // standalone result set, and doing so previously surfaced
+          // wrong-system recordings when the model returned no list.
           if (results && results.length > 0) UI.addEpisodeCards(results);
         }
       }
