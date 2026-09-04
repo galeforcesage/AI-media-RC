@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 from utils.logger import get_logger
 from registry.commands import CommandRegistry
 from services.llm import LLMService
+from services.lease import load_lease_manager
 from services.whisper import WhisperService
 from services.tts import TTSService
 from services.llm_pipeline import LLMPipeline
@@ -36,6 +37,7 @@ from services.openclaw_planner import OpenClawPlanner
 from services.planner_registry import PlannerRegistry
 from services.semantic_index import SemanticIndex
 from services.entity_context import EntityContextStore
+from services.conversation_memory import ConversationMemory
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -56,6 +58,15 @@ class Orchestrator:
         self.registry = CommandRegistry()
 
         # Core AI services
+        # Optional GPU-lease manager. A private plugin (named by the
+        # GPU_ROUTER_PLUGIN env var) can share the GPU with other apps via
+        # short leases; when no plugin is configured this is a no-op that uses
+        # the static base_url/model below. Either way the LLM fails open.
+        self.gpu_router = load_lease_manager(
+            config.get("gpu_router", {}),
+            fallback_base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
+            fallback_model=config.get("llm", {}).get("model", "hermes3:8b"),
+        )
         self.llm = LLMService(
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
             base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
@@ -65,6 +76,7 @@ class Orchestrator:
             num_predict=config.get("llm", {}).get("num_predict", 512),
             num_ctx=config.get("llm", {}).get("num_ctx", 4096),
             max_concurrent=config.get("llm", {}).get("max_concurrent", 1),
+            lease_manager=self.gpu_router,
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
@@ -125,6 +137,12 @@ class Orchestrator:
         # Conversation-scoped entity memory for multi-turn context
         self.entity_store = EntityContextStore(
             ttl=config.get("entity_ttl", 600.0),
+        )
+
+        # Per-session short-term Q&A memory (follow-up questions).
+        self.conversation_memory = ConversationMemory(
+            max_turns=config.get("conversation_max_turns", 4),
+            ttl=config.get("conversation_ttl", 1800.0),
         )
 
         # Transcription queue
@@ -701,12 +719,38 @@ class Orchestrator:
 
         return prompt
 
+    @staticmethod
+    def _looks_like_followup(prompt: str) -> bool:
+        """Heuristic: does this question refer back to a prior turn?
+
+        Conservative -- requires a back-reference phrase, and treats any
+        explicit date or quoted show/episode title as a fresh question.
+        """
+        if not prompt:
+            return False
+        import re as _re
+        if _re.search(r"\(\d{4}-\d{2}-\d{2}", prompt):
+            return False
+        if '"' in prompt or '\u201c' in prompt or '\u201d' in prompt:
+            return False
+        p = prompt.lower()
+        markers = (
+            "that episode", "that show", "that one", "that contest",
+            "that game", "the other", "same episode", "same show",
+            "on that", "in that", "the first team", "the second team",
+            "the first game", "the second game", "the winner",
+            "who won", "what did they", "did they", "earlier",
+            "previously", "you said", "you mentioned",
+        )
+        return any(m in p for m in markers)
+
     async def run_query(
         self,
         prompt: str,
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
         systems: list[str] | None = None,
+        session_id: str | None = None,
         status_callback=None,
         token_callback=None,
     ) -> Dict[str, Any]:
@@ -812,6 +856,34 @@ class Orchestrator:
                 _is_meta_transcript = False
             if _has_inline_transcript:
                 _is_meta_transcript = False
+
+            # Detect plain recordings-listing/inventory queries ("what did I
+            # record", "what's on my DVR", "list recordings from last week").
+            # These are NOT content questions, so the single-recording
+            # transcript content pre-fetch below must NOT hijack them into a
+            # one-show answer. For these we skip the pre-fetch entirely and let
+            # the agent enumerate every recording via the DVR search tools
+            # (the authoritative source), instead of collapsing to the one
+            # recording whose transcript best matches the question text.
+            _recordings_listing_re = re.compile(
+                r"\bwhat\b[^?]*\b(?:record(?:ed|ings?)?|dvr|taped?|captured?)\b"
+                r"|\b(?:list|show\s+me)\b[^?]*\b(?:record(?:ed|ings?)?|dvr)\b"
+                r"|\bwhat(?:'s| is| are| do\s+i\s+have)\b[^?]*\brecord(?:ed|ings?)?\b"
+                r"|\bwhat\s+did\s+i\s+record\b",
+                re.I,
+            )
+            _content_marker_re = re.compile(
+                r"\b(?:how\s+did|what\s+happened|who\s+won|what\s+was\s+said|"
+                r"about|summar(?:y|ize|ise)|recap|ending|ended|\bend\b)\b",
+                re.I,
+            )
+            _is_recordings_listing = (
+                bool(_recordings_listing_re.search(prompt))
+                and not _content_marker_re.search(prompt)
+                and not _summary_title
+                and not _has_inline_transcript
+                and not _is_meta_transcript
+            )
 
             if _has_inline_transcript:
                 if status_callback:
@@ -1132,7 +1204,10 @@ class Orchestrator:
             # ── FTS pre-fetch path (date-scoped content search) ──
             transcript_context = ""
             transcript_hits = []
-            if temporal not in ("future", "present"):
+            transcript_display: list = []
+            episodes_used: list = []
+            recordings_used: list = []
+            if temporal not in ("future", "present") and not _is_recordings_listing:
                 try:
                     if status_callback:
                         await status_callback("Searching transcripts")
@@ -1170,12 +1245,20 @@ class Orchestrator:
                         data = transcript_results.get("data", transcript_results)
                         transcript_hits = data.get("results", [])
                     if transcript_hits:
+                        def _start_of(_r):
+                            try:
+                                return float(_r.get("start_time", 0) or 0)
+                            except Exception:
+                                return 0.0
+                        # Read the show in sequence (ending last) rather than in
+                        # bm25 rank order, which scrambles chronology.
+                        _ordered = sorted(transcript_hits[:8], key=_start_of)
                         lines = []
-                        for r in transcript_hits[:2]:
+                        for r in _ordered:
                             title = r.get("title", "Unknown")
                             ep = r.get("episode_title", "")
-                            start = r.get("start_time", 0)
-                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
+                            start = _start_of(r)
+                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:240]
                             mins = int(start // 60)
                             secs = int(start % 60)
                             time_str = f"{mins}:{secs:02d}"
@@ -1192,7 +1275,55 @@ class Orchestrator:
                                 lines.append(f'From "{title}" - "{ep}"{date_str} at {time_str}: {snippet}')
                             else:
                                 lines.append(f'From "{title}"{date_str} at {time_str}: {snippet}')
+
+                        # When the top matches concentrate on a single recording,
+                        # fetch its full transcript so the model sees the opening
+                        # and, crucially, the ending. Scattered keyword snippets
+                        # cannot answer "how did it end / did it finish" questions.
+                        _top_ids = [r.get("recording_id") for r in transcript_hits[:5]
+                                    if r.get("recording_id")]
+                        if _top_ids and len(set(_top_ids)) == 1:
+                            try:
+                                _full = await self.search.transcript_get(_top_ids[0])
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                                if len(_ttext) > 400:
+                                    lines.append(
+                                        "[Opening of the recording]: " + _ttext[:600]
+                                    )
+                                    lines.append(
+                                        "[Final minutes of the recording - how it actually ended]: ..."
+                                        + _ttext[-1800:]
+                                    )
+                            except Exception:
+                                logger.warning("Full-transcript fetch failed; using excerpts only")
                         transcript_context = "\n".join(lines)
+                        # Surface only the episode(s) actually used for
+                        # context -- one card per recording, not every
+                        # keyword chunk. When context concentrated on a
+                        # single recording, show just that one.
+                        _single = bool(_top_ids) and len(set(_top_ids)) == 1
+                        _seen = set()
+                        for _r in transcript_hits:
+                            _rid = _r.get("recording_id")
+                            if _single and _rid != _top_ids[0]:
+                                continue
+                            _k = _rid or (_r.get("title"), _r.get("episode_title"))
+                            if _k in _seen:
+                                continue
+                            _seen.add(_k)
+                            transcript_display.append(_r)
+                            _t = _r.get("title", "Unknown")
+                            _ep = _r.get("episode_title", "")
+                            episodes_used.append(f"{_t} - {_ep}" if _ep else _t)
+                            recordings_used.append({
+                                "id": _rid,
+                                "title": _t,
+                                "episode_title": _ep,
+                                "record_date": _r.get("record_date") or _r.get("air_date"),
+                            })
+                            if len(transcript_display) >= (1 if _single else 3):
+                                break
                     elif _date_label:
                         # Negative result is informative — surface it so the LLM
                         # doesn't hallucinate transcripts for the requested date.
@@ -1201,6 +1332,54 @@ class Orchestrator:
                         )
                 except Exception:
                     logger.warning("Transcript pre-fetch failed, continuing without")
+
+            # Follow-up reuse: when the question refers back to a prior
+            # episode ("that episode", "the other team") and carries no new
+            # date, prefer the recording we answered about last turn rather
+            # than fuzzy FTS matches that surface unrelated shows.
+            try:
+                if self._looks_like_followup(prompt):
+                    _last = self.conversation_memory.last_recordings(session_id)
+                    if _last:
+                        _rec = _last[0]
+                        _rid = _rec.get("id") or ""
+                        _ttext = ""
+                        _fd = {}
+                        if _rid:
+                            try:
+                                _full = await self.search.transcript_get(_rid)
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                            except Exception:
+                                logger.warning("follow-up transcript_get failed")
+                        _title = _rec.get("title") or _fd.get("title") or "Unknown"
+                        _ep = _rec.get("episode_title") or _fd.get("episode_title") or ""
+                        if _ttext:
+                            _parts = [
+                                'Continuing about "' + _title + '"'
+                                + (' - "' + _ep + '"' if _ep else '') + ':',
+                                "[Opening of the recording]: " + _ttext[:900],
+                                "[Final minutes of the recording - how it "
+                                "actually ended]: ..." + _ttext[-1800:],
+                            ]
+                            transcript_context = "\n".join(_parts)
+                        transcript_display = [{
+                            "recording_id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                            "snippet": "",
+                            "start_time": 0,
+                        }]
+                        episodes_used = [f"{_title} - {_ep}" if _ep else _title]
+                        recordings_used = [{
+                            "id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                        }]
+            except Exception:
+                logger.warning("follow-up reuse failed, continuing")
 
             # Pre-fetch semantic context from the vector index (sub-second)
             # Pre-fetch semantic context (skip for future-only — no past media to match)
@@ -1217,6 +1396,13 @@ class Orchestrator:
                 except Exception:
                     logger.warning("Semantic pre-fetch failed, continuing without")
 
+            # Compact memory of earlier turns for follow-up questions.
+            conversation_context = ""
+            try:
+                conversation_context = self.conversation_memory.format_for_prompt(session_id)
+            except Exception:
+                conversation_context = ""
+
             # Run the selected planner (AgentLoop by default).
             primary_name = self._resolve_planner_name(metadata)
             planner = self._get_planner(metadata)
@@ -1228,6 +1414,7 @@ class Orchestrator:
                 temporal=temporal,
                 domains=domains,
                 entity_store=self.entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -1277,15 +1464,141 @@ class Orchestrator:
                     if tts_result.get("status") == "ok":
                         llm_result["audio_path"] = tts_result["audio_path"]
 
-            # Attach transcript hits for the frontend
-            llm_result["transcript_results"] = transcript_hits
+            # Attach transcript hits for the frontend (deduped to the
+            # episode(s) actually used to answer).
+            llm_result["transcript_results"] = transcript_display or transcript_hits
+
+            # A plain recordings-listing query ("what recorded on 32.1 last
+            # week") is a DVR question, not a transcript question. The frontend
+            # still wants per-row channel/date/watched so it can show "(32.1)"
+            # and play the show. Source that straight from the authoritative DVR
+            # recordings tool — no transcript index involved — and ship it in a
+            # dedicated episode_meta side-channel (transcript_results stays for
+            # actual content answers).
+            if _is_recordings_listing:
+                try:
+                    _rows = await self._listing_episode_rows(prompt, active)
+                    if _rows:
+                        llm_result["episode_meta"] = _rows
+                except Exception:
+                    logger.warning(
+                        "recordings-listing enrichment failed", exc_info=True
+                    )
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
+
+            # Record this turn so follow-up questions have context.
+            try:
+                _resp = llm_result.get("llm_response", "")
+                if _resp:
+                    self.conversation_memory.add_turn(
+                        session_id, prompt, _resp, recordings_used
+                    )
+            except Exception:
+                logger.warning("conversation memory update failed")
 
             return llm_result
         except Exception as exc:
             logger.exception("run_query failed")
             return {"error": str(exc)}
+
+    async def _listing_episode_rows(self, prompt: str, active: list) -> list:
+        """Build flat per-recording rows for a recordings-listing query.
+
+        Sourced from the DVR recordings tools for whichever systems are ACTIVE
+        (respecting the AI-focus scope) - this is a DVR/inventory question, not
+        a transcript question. Never query a system the user has focused out,
+        so a SageTV-only session never leaks Channels DVR recordings (and vice
+        versa). No transcript index, no single-show narrowing. The frontend
+        merges these onto the numbered list by show+episode to show the channel
+        and play the show on the right system.
+        """
+        from datetime import datetime as _dt
+
+        _active = set(active or ["sagetv", "channelsdvr"])
+
+        # Resolve the date window from the rewritten prompt "(YYYY-MM-DD to ...)".
+        _qd = re.search(
+            r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
+        )
+        _start = _end = None
+        if _qd:
+            try:
+                _s = _dt.strptime(_qd.group(1), "%Y-%m-%d")
+                _e = _dt.strptime(_qd.group(2) or _qd.group(1), "%Y-%m-%d")
+                _start = int(_s.timestamp())
+                _end = int(_e.timestamp()) + 86399
+            except Exception:
+                _start = _end = None
+
+        rows: list = []
+
+        # Channels DVR — has epoch record_date + broadcast channel.
+        if "channelsdvr" in _active and hasattr(self, "_channels"):
+            try:
+                _rec = await self._channels.call_tool(
+                    "channels_get_recordings", {}
+                )
+                _list = _rec.get("data", _rec) if isinstance(_rec, dict) else _rec
+                for _r in (_list or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    _rd = _r.get("record_date") or _r.get("original_air_epoch")
+                    try:
+                        _rdi = int(float(_rd)) if _rd is not None else None
+                    except Exception:
+                        _rdi = None
+                    if _start is not None and _rdi is not None and not (
+                        _start <= _rdi <= _end
+                    ):
+                        continue
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": _rdi,
+                        "watched": _r.get("watched"),
+                        "system": "channelsdvr",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: Channels DVR fetch failed",
+                    exc_info=True,
+                )
+
+        # SageTV — no epoch record_date/broadcast channel; the agent's numbered
+        # list supplies the date. Include what the SageTV tool returns.
+        if "sagetv" in _active and hasattr(self, "_sagetv"):
+            try:
+                _srec = await self._sagetv.call_tool(
+                    "sagetv_get_recent_recordings", {"days": 30}
+                )
+                _slist = (
+                    _srec.get("data", _srec) if isinstance(_srec, dict) else _srec
+                )
+                for _r in (_slist or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": None,
+                        "watched": _r.get("watched"),
+                        "system": "sagetv",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: SageTV fetch failed", exc_info=True
+                )
+
+        return rows
 
     async def run_query_voice(self, audio_path: str) -> Dict[str, Any]:
         """Run a voice query: audio → transcription → LLM → TTS."""

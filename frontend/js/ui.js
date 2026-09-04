@@ -185,6 +185,75 @@ const UI = (() => {
     el['messages'].scrollTop = el['messages'].scrollHeight;
   }
 
+  // Unified, deduped episode list. Each row carries watched/air-date (from the
+  // recordings answer) plus a ▶ play button and clickable name (from transcript
+  // results). The transcript snippet is shown only for content searches, where
+  // the matched dialogue is meaningful.
+  function addEpisodeResults(items, opts = {}) {
+    if (!items || items.length === 0) return;
+    const contentSearch = !!opts.contentSearch;
+    const bubble = document.createElement('div');
+    bubble.className = 'message assistant episode-results';
+
+    const heading = document.createElement('div');
+    heading.className = 'episode-results-heading';
+    heading.textContent = 'Matching episodes:';
+    bubble.appendChild(heading);
+
+    items.forEach(it => {
+      const showName = it.showName || 'Unknown';
+      const epTitle = it.epTitle || '';
+      const se = it.se || '';
+
+      const card = document.createElement('div');
+      card.className = 'episode-card';
+      card.dataset.recordingId = it.recordingId || '';
+      // Play button resolves by series title (same as the original cards).
+      card.dataset.title = showName;
+      card.dataset.system = it.system || '';
+
+      // Two separate links, matching the numbered list the user had:
+      //  • series name  → series metadata popup (no show-context)
+      //  • episode name → episode popup, with the series passed as data-show
+      // Both use the existing `.show-link` handler → showMetadataPopup(title,
+      // showContext). Searching the *combined* "Series — Episode" string
+      // matched nothing, which is what broke the popup before.
+      const showLink =
+        `<a class="ec-title show-link" href="#" data-title="${esc(showName)}">${esc(showName)}</a>`;
+      const epLink = epTitle
+        ? ` <a class="ec-title ec-ep-link show-link" href="#" ` +
+          `data-title="${esc(epTitle)}" data-show="${esc(showName)}">${esc(epTitle)}</a>`
+        : '';
+      const seHtml = se ? ` <span class="ec-se">${esc(se)}</span>` : '';
+      const titleHtml = showLink + epLink + seHtml;
+
+      const metaBits = [];
+      if (it.dateStr) metaBits.push(esc(it.dateStr));
+      if (it.channel) metaBits.push(`(${esc(it.channel)})`);
+      if (contentSearch && it.startTime != null) metaBits.push(`at ${esc(formatTime(it.startTime))}`);
+      let metaHtml = metaBits.length ? `<span class="ec-meta">${metaBits.join(' · ')}</span>` : '';
+      if (it.watched) {
+        const wl = String(it.watched).toLowerCase();
+        const cls = wl === 'watched' ? 'ec-badge ec-watched'
+          : wl === 'unwatched' ? 'ec-badge ec-unwatched' : 'ec-badge';
+        metaHtml += ` <span class="${cls}">${esc(it.watched)}</span>`;
+      }
+
+      const rawSnip = (it.snippet || '').replace(/<\/?b>/g, '');
+      const snip = (contentSearch && rawSnip)
+        ? `<span class="ec-snippet">${esc(rawSnip.substring(0, 120))}…</span>` : '';
+
+      card.innerHTML =
+        `<div class="ec-text">${titleHtml}${metaHtml}${snip}</div>` +
+        `<button class="ec-play-btn" title="Play on device">▶</button>`;
+
+      bubble.appendChild(card);
+    });
+
+    el['messages'].appendChild(bubble);
+    el['messages'].scrollTop = el['messages'].scrollHeight;
+  }
+
   function clearMessages() {
     el['messages'].innerHTML = '';
   }
@@ -568,7 +637,7 @@ const UI = (() => {
 
   return {
     cacheElements, updateNowPlaying, formatTime, updateDpad,
-    addMessage, addMessageHTML, addEpisodeCards, clearMessages,
+    addMessage, addMessageHTML, addEpisodeCards, addEpisodeResults, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
     renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab, renderAlerts,
