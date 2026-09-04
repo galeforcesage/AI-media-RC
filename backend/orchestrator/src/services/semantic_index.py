@@ -315,7 +315,7 @@ class SemanticIndex:
             from services.mcp_client import MCPClient
             client = MCPClient(host="127.0.0.1", port=8766, name="sagetv")
             try:
-                result = await client.call_tool("get_recordings", {"limit": 5000})
+                result = await client.call_tool("sagetv_get_recordings", {"limit": 5000})
             finally:
                 await client.close()
 
@@ -334,37 +334,49 @@ class SemanticIndex:
         return docs
 
     def _sagetv_rec_to_doc(self, rec: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        """Convert a SageTV recording to an indexable document."""
-        # SageTV nests: rec -> Airing -> Show -> {Title, EpisodeTitle}
-        airing = rec.get("Airing", rec)
-        show = airing.get("Show", airing)
+        """Convert a SageTV recording to an indexable document.
 
-        title = show.get("ShowTitle") or show.get("Title") or rec.get("MediaTitle") or ""
+        ``sagetv_get_recordings`` returns the *slimmed* recording shape
+        (see mcp-sagetv ``_slim_recording``): flat keys like ``title``,
+        ``episode_title``, ``season_episode``, ``channel``, ``record_date``
+        (epoch seconds), ``description`` and ``genres`` — not the raw nested
+        Airing/Show MediaFile. Parse that shape here.
+        """
+        if not isinstance(rec, dict):
+            return None
+
+        title = rec.get("title") or ""
         if not title:
             return None
 
-        episode = show.get("ShowEpisode") or show.get("EpisodeTitle") or ""
-        description = show.get("ShowDescription") or ""
-        channel_info = airing.get("Channel", {})
-        channel = channel_info.get("ChannelName") or channel_info.get("ChannelNumber") or ""
-        start_time = rec.get("FileStartTime") or airing.get("AiringStartTime") or ""
-        media_id = str(rec.get("MediaFileID") or rec.get("id") or "")
+        episode = rec.get("episode_title") or ""
+        se = rec.get("season_episode") or ""
+        channel = rec.get("channel") or ""
+        description = rec.get("description") or ""
+        genres = rec.get("genres") or ""
+        media_id = str(rec.get("id") or "")
+        record_date = rec.get("record_date")  # epoch seconds
 
-        # Build text
+        # Build searchable text
         parts = [f'"{title}"']
         if episode:
             parts.append(f'episode "{episode}"')
+        if se:
+            parts.append(se)
         if channel:
             parts.append(f"on {channel}")
-        if start_time:
+        if record_date:
             try:
                 from datetime import datetime
-                dt = datetime.fromtimestamp(int(start_time) / 1000)
-                parts.append(f"recorded {dt.strftime('%Y-%m-%d')}")
+                parts.append(f"recorded {datetime.fromtimestamp(int(record_date)).strftime('%Y-%m-%d')}")
             except (ValueError, TypeError, OSError):
                 pass
         if description:
             parts.append(f"— {description[:150]}")
+        if genres:
+            gtxt = genres if isinstance(genres, str) else ", ".join(str(g) for g in list(genres)[:5])
+            if gtxt:
+                parts.append(f"[{gtxt}]")
 
         text = " ".join(parts)
         meta = {
@@ -373,6 +385,10 @@ class SemanticIndex:
             "episode": episode[:200],
             "channel": str(channel)[:100],
         }
+        if se:
+            meta["season_episode"] = str(se)[:16]
+        if record_date:
+            meta["date"] = str(record_date)[:20]
         if media_id:
             meta["media_id"] = media_id[:50]
 
