@@ -357,6 +357,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 .episode-card .ec-transcript-link:hover {
   text-decoration: underline;
@@ -390,6 +393,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 .episode-card .ec-title.show-link:hover { text-decoration: underline; }
 .ec-badge {

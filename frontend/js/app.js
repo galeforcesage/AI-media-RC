@@ -239,6 +239,9 @@
     document.getElementById('messages').addEventListener('click', (e) => {
       const link = e.target.closest('.ec-transcript-link');
       if (!link) return;
+      // Don't hijack a text selection (let the user copy the episode name).
+      const sel = window.getSelection();
+      if (sel && sel.toString().trim().length > 0) return;
       e.preventDefault();
       const recordingId = link.dataset.recordingId;
       const txTitle = link.dataset.title;
@@ -250,6 +253,9 @@
     document.getElementById('messages').addEventListener('click', async (e) => {
       const link = e.target.closest('.show-link');
       if (!link) return;
+      // Don't hijack a text selection (let the user copy the series/episode name).
+      const sel = window.getSelection();
+      if (sel && sel.toString().trim().length > 0) return;
       e.preventDefault();
       const title = link.dataset.title;
       if (!title) return;
