@@ -438,11 +438,31 @@ class TranscriptionWorker:
 
         # Step 6: Enrich (only for complete or final incremental jobs)
         if self.enrichment and not (is_incremental and not is_final):
+            # For incremental recordings, `segments` only covers the final
+            # increment. Chunking that alone indexes just the last slice of the
+            # recording, leaving the cross-search chunk index nearly empty (the
+            # cause of transcripts that were searchable by title but produced no
+            # recap content). The store now holds the full accumulated VTT, so
+            # rebuild the complete segment list from it before chunking.
+            enrich_segments = segments
+            if is_incremental:
+                try:
+                    saved = self.store.get(store_id)
+                    if saved and saved.vtt:
+                        full_segments = cc_extractor._parse_webvtt(saved.vtt)
+                        if len(full_segments) > len(enrich_segments):
+                            enrich_segments = full_segments
+                except Exception:
+                    logger.warning(
+                        "Failed to rebuild full segments from VTT for %s; "
+                        "chunking final increment only",
+                        store_id, exc_info=True,
+                    )
             try:
                 await self.enrichment.enrich({
                     "recording_id": store_id,
                     "system": job.system,
-                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in segments],
+                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in enrich_segments],
                     "diarization_turns": diarization_turns,
                     "transcript_text": full_text,
                     "word_count": len(full_text.split()),
