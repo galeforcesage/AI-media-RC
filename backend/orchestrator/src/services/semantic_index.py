@@ -309,25 +309,39 @@ class SemanticIndex:
         return {"id": f"channels_{file_id or hash(text)}", "text": text, "meta": meta}
 
     async def _fetch_sagetv_recordings(self) -> List[Dict[str, str]]:
-        """Fetch recordings from SageTV via MCP client."""
+        """Fetch recordings from SageTV via MCP client.
+
+        The full library is fetched in pages because a single 5000-item
+        response exceeds the MCP client's 1 MB line-read buffer
+        ("Separator is not found, and chunk exceed the limit").
+        """
         docs = []
         try:
             from services.mcp_client import MCPClient
             client = MCPClient(host="127.0.0.1", port=8766, name="sagetv")
             try:
-                result = await client.call_tool("sagetv_get_recordings", {"limit": 5000})
+                page = 400
+                offset = 0
+                fetched = 0
+                while offset < 40000:  # safety cap
+                    result = await client.call_tool(
+                        "sagetv_get_recordings", {"limit": page, "offset": offset}
+                    )
+                    data = result.get("data", result) if isinstance(result, dict) else result
+                    recordings = data.get("recordings", data) if isinstance(data, dict) else data
+                    if not isinstance(recordings, list) or not recordings:
+                        break
+                    for rec in recordings:
+                        doc = self._sagetv_rec_to_doc(rec)
+                        if doc:
+                            docs.append(doc)
+                    fetched += len(recordings)
+                    if len(recordings) < page:
+                        break
+                    offset += page
             finally:
                 await client.close()
 
-            data = result.get("data", result) if isinstance(result, dict) else result
-            recordings = data.get("recordings", data) if isinstance(data, dict) else data
-            if not isinstance(recordings, list):
-                recordings = []
-
-            for rec in recordings:
-                doc = self._sagetv_rec_to_doc(rec)
-                if doc:
-                    docs.append(doc)
             logger.info("Fetched %d recordings from SageTV", len(docs))
         except Exception as exc:
             logger.warning("Failed to fetch SageTV recordings: %s", exc)
