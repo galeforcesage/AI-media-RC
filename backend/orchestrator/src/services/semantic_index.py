@@ -35,6 +35,19 @@ COLLECTION_NAME = "media_index"
 CHROMA_DIR = os.path.join(os.path.expanduser("~"), ".llm-remote", "chroma_db")
 CHANNELS_DVR_URL = "http://localhost:8089"
 
+# Transcript chunk index (layer-3 FTS DB) used as a third semantic source so
+# spoken dialogue — not just metadata — is vector-searchable. Lives in the
+# sibling transcription service; overridable via env for non-standard layouts.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_TRANSCRIPT_INDEX_DB = os.path.abspath(
+    os.path.join(_THIS_DIR, "..", "..", "..", "transcription", "transcript_index.db")
+)
+TRANSCRIPT_INDEX_DB = os.environ.get("TRANSCRIPT_INDEX_DB", _DEFAULT_TRANSCRIPT_INDEX_DB)
+# Skip trivially short chunks (filler/fragments) to cut noise and doc count.
+_MIN_CHUNK_CHARS = 40
+# Cap chunk text embedded per doc so vectors stay tight and prompt context small.
+_MAX_CHUNK_CHARS = 400
+
 # How often to refresh the index (seconds)
 REFRESH_INTERVAL = 1800  # 30 minutes (incremental, so lightweight)
 
@@ -151,13 +164,19 @@ class SemanticIndex:
         n_results = min(n_results, self._collection.count())
         embedding = self._embedder.encode(query).tolist()
 
-        # Filter by active systems if not all are selected
+        # Filter by active systems if not all are selected. Metadata docs carry
+        # the system in "source"; transcript-chunk docs carry "source":
+        # "transcript" plus the originating DVR system in "system" — match
+        # either so spoken-content hits still respect the active focus.
         where_filter = None
         if systems and set(systems) != {"sagetv", "channelsdvr"}:
-            if len(systems) == 1:
-                where_filter = {"source": systems[0]}
-            else:
-                where_filter = {"source": {"$in": systems}}
+            sys_list = list(systems)
+            where_filter = {
+                "$or": [
+                    {"source": {"$in": sys_list}},
+                    {"system": {"$in": sys_list}},
+                ]
+            }
 
         results = self._collection.query(
             query_embeddings=[embedding],
@@ -219,12 +238,19 @@ class SemanticIndex:
         sagetv_docs = await self._fetch_sagetv_recordings()
         docs.extend(sagetv_docs)
 
+        # Fetch transcript chunks (spoken content) — read directly from the
+        # transcription service's layer-3 chunk DB (CPU-bound sqlite read runs
+        # in an executor). This makes actual dialogue vector-searchable, not
+        # just recording metadata.
+        loop = asyncio.get_event_loop()
+        chunk_docs = await loop.run_in_executor(None, self._fetch_transcript_chunks)
+        docs.extend(chunk_docs)
+
         if not docs:
             logger.warning("No recordings fetched for indexing")
             return self._doc_count
 
         # Update ChromaDB in executor (CPU-bound embedding)
-        loop = asyncio.get_event_loop()
         count = await loop.run_in_executor(None, self._upsert_docs, docs)
 
         elapsed = time.time() - t0
@@ -407,6 +433,92 @@ class SemanticIndex:
             meta["media_id"] = media_id[:50]
 
         return {"id": f"sagetv_{media_id or hash(text)}", "text": text, "meta": meta}
+
+    def _fetch_transcript_chunks(self) -> List[Dict[str, str]]:
+        """Load transcript chunks as indexable docs (spoken-content source).
+
+        Reads the transcription service's layer-3 chunk DB directly (read-only)
+        and joins each chunk to its recording metadata so a hit carries a title
+        / channel. One doc per chunk; trivially short chunks are skipped.
+        """
+        docs: List[Dict[str, str]] = []
+        path = TRANSCRIPT_INDEX_DB
+        if not os.path.exists(path):
+            logger.warning("Transcript chunk DB not found at %s; skipping", path)
+            return docs
+
+        import sqlite3
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT c.recording_id AS rid, c.chunk_index AS cidx,
+                       c.start_time AS start_time, c.text AS text,
+                       r.title AS title, r.episode_title AS episode,
+                       r.channel AS channel, r.record_date AS record_date,
+                       r.system AS system
+                FROM transcript_chunks c
+                LEFT JOIN recordings r ON c.recording_id = r.recording_id
+                WHERE length(c.text) >= ?
+                """,
+                (_MIN_CHUNK_CHARS,),
+            ).fetchall()
+            for row in rows:
+                doc = self._chunk_row_to_doc(row)
+                if doc:
+                    docs.append(doc)
+            logger.info("Fetched %d transcript chunks for indexing", len(docs))
+        except Exception as exc:
+            logger.warning("Failed to fetch transcript chunks: %s", exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return docs
+
+    def _chunk_row_to_doc(self, row: Any) -> Optional[Dict[str, str]]:
+        """Convert a transcript_chunks row to an indexable document."""
+        text = (row["text"] or "").strip()
+        if len(text) < _MIN_CHUNK_CHARS:
+            return None
+
+        rid = row["rid"] or ""
+        cidx = row["cidx"]
+        title = (row["title"] or "").strip()
+        episode = (row["episode"] or "").strip()
+        channel = (row["channel"] or "").strip()
+        record_date = row["record_date"]
+        system = (row["system"] or "").strip()
+
+        snippet = text[:_MAX_CHUNK_CHARS]
+        # Ground the dialogue with its show title so a hit is self-describing.
+        doc_text = f'{title}: "{snippet}"' if title else f'"{snippet}"'
+
+        meta: Dict[str, Any] = {
+            "source": "transcript",
+            "type": "transcript_chunk",
+            "recording_id": rid[:200],
+            "title": title[:200],
+            "episode": episode[:200],
+            "channel": channel[:100],
+            "chunk_index": int(cidx) if cidx is not None else 0,
+        }
+        if system:
+            meta["system"] = system[:32]
+        if record_date:
+            meta["date"] = str(record_date)[:20]
+        try:
+            if row["start_time"] is not None:
+                meta["start_time"] = float(row["start_time"])
+        except (TypeError, ValueError):
+            pass
+
+        doc_id = f"chunk_{hashlib.md5(rid.encode()).hexdigest()[:12]}_{cidx}"
+        return {"id": doc_id, "text": doc_text, "meta": meta}
 
     def _upsert_docs(self, docs: List[Dict[str, str]]) -> int:
         """Embed and upsert documents into ChromaDB (sync, runs in executor).
