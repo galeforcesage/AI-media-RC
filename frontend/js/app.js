@@ -1329,7 +1329,10 @@
       pbParams.action_hint = state.session.state === 'playing' ? 'pause' : 'play';
     }
     try {
-      await API.playback(action, pbParams);
+      const res = await API.playback(action, pbParams);
+      if (res && res.success === false) {
+        UI.addMessage(res.message || 'Playback command was rejected.', 'error');
+      }
       State.refreshSession();
     } catch (e) {
       UI.addMessage('Playback error: ' + e.message, 'error');

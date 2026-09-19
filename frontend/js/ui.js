@@ -288,12 +288,15 @@ const UI = (() => {
     const picker = el['device-picker'];
     picker.innerHTML = '<option value="">Select device...</option>';
 
-    // Show registered session-manager devices
+    // Show registered session-manager devices (online first; SageTV offline flagged)
     if (devices && devices.length > 0) {
-      devices.forEach(d => {
+      const isOfflineSage = d => d.system === 'sagetv' && !d.online;
+      const sorted = [...devices].sort((a, b) => (isOfflineSage(a) ? 1 : 0) - (isOfflineSage(b) ? 1 : 0));
+      sorted.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.device_id;
-        opt.textContent = d.friendly_name || d.device_id;
+        const base = d.friendly_name || d.device_id;
+        opt.textContent = isOfflineSage(d) ? `${base} (offline)` : base;
         if (d.device_id === selectedId) opt.selected = true;
         picker.appendChild(opt);
       });
@@ -343,7 +346,7 @@ const UI = (() => {
     const table = document.createElement('table');
     table.className = 'admin-table';
     table.innerHTML = `<thead><tr>
-      <th>Name</th><th>ID</th><th>System</th><th>Default</th><th></th>
+      <th>Name</th><th>ID</th><th>System</th><th>State</th><th>Default</th><th></th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
     devices.forEach(d => {
@@ -355,10 +358,14 @@ const UI = (() => {
       const shortId = d.device_id.startsWith('sagetv-ctx-')
         ? d.device_id.slice('sagetv-ctx-'.length)
         : d.device_id;
+      const stateCell = d.system === 'sagetv'
+        ? (d.online ? '🟢 online' : '⚪ offline')
+        : '—';
       tr.innerHTML = `
         <td class="device-name-cell" data-action="rename-device" data-id="${esc(d.device_id)}" data-name="${esc(d.friendly_name || '')}" title="Click to rename">${nameDisplay}</td>
         <td class="device-id-cell">${esc(shortId)}</td>
         <td>${esc(d.system || '-')}</td>
+        <td>${stateCell}</td>
         <td>${d.is_default ? '★' : ''}</td>
         <td>
           <button class="btn-tiny btn-danger" data-action="delete-device" data-id="${esc(d.device_id)}">✕</button>
