@@ -38,6 +38,7 @@
     },
     "semantic": {
         "embed_model": "all-MiniLM-L6-v2",
+        "embed_device": "cpu",
         "encode_batch_size": 64
     },
     "mcp": {

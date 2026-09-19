@@ -60,8 +60,20 @@ const API = (() => {
   }
 
   // Orchestrator endpoints
+  // Stable per-browser conversation id so follow-up questions keep context.
+  function convId() {
+    let id = localStorage.getItem('conv_id');
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : String(Date.now()) + Math.random().toString(16).slice(2);
+      localStorage.setItem('conv_id', id);
+    }
+    return id;
+  }
+
   async function query(text, systems) {
-    return request(`${baseUrl}/api/query`, 'POST', { prompt: text, systems: systems || undefined });
+    return request(`${baseUrl}/api/query`, 'POST', { prompt: text, systems: systems || undefined, session_id: convId() });
   }
 
   /**
@@ -73,7 +85,7 @@ const API = (() => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ prompt: text, systems: systems || undefined }),
+      body: JSON.stringify({ prompt: text, systems: systems || undefined, session_id: convId() }),
       signal: signal || undefined,
     });
     if (resp.status === 401) { window.location.href = '/login.html'; throw new Error('unauthorized'); }

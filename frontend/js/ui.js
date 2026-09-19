@@ -185,6 +185,75 @@ const UI = (() => {
     el['messages'].scrollTop = el['messages'].scrollHeight;
   }
 
+  // Unified, deduped episode list. Each row carries watched/air-date (from the
+  // recordings answer) plus a ▶ play button and clickable name (from transcript
+  // results). The transcript snippet is shown only for content searches, where
+  // the matched dialogue is meaningful.
+  function addEpisodeResults(items, opts = {}) {
+    if (!items || items.length === 0) return;
+    const contentSearch = !!opts.contentSearch;
+    const bubble = document.createElement('div');
+    bubble.className = 'message assistant episode-results';
+
+    const heading = document.createElement('div');
+    heading.className = 'episode-results-heading';
+    heading.textContent = 'Matching episodes:';
+    bubble.appendChild(heading);
+
+    items.forEach(it => {
+      const showName = it.showName || 'Unknown';
+      const epTitle = it.epTitle || '';
+      const se = it.se || '';
+
+      const card = document.createElement('div');
+      card.className = 'episode-card';
+      card.dataset.recordingId = it.recordingId || '';
+      // Play button resolves by series title (same as the original cards).
+      card.dataset.title = showName;
+      card.dataset.system = it.system || '';
+
+      // Two separate links, matching the numbered list the user had:
+      //  • series name  → series metadata popup (no show-context)
+      //  • episode name → episode popup, with the series passed as data-show
+      // Both use the existing `.show-link` handler → showMetadataPopup(title,
+      // showContext). Searching the *combined* "Series — Episode" string
+      // matched nothing, which is what broke the popup before.
+      const showLink =
+        `<a class="ec-title show-link" href="#" data-title="${esc(showName)}">${esc(showName)}</a>`;
+      const epLink = epTitle
+        ? ` <a class="ec-title ec-ep-link show-link" href="#" ` +
+          `data-title="${esc(epTitle)}" data-show="${esc(showName)}">${esc(epTitle)}</a>`
+        : '';
+      const seHtml = se ? ` <span class="ec-se">${esc(se)}</span>` : '';
+      const titleHtml = showLink + epLink + seHtml;
+
+      const metaBits = [];
+      if (it.dateStr) metaBits.push(esc(it.dateStr));
+      if (it.channel) metaBits.push(`(${esc(it.channel)})`);
+      if (contentSearch && it.startTime != null) metaBits.push(`at ${esc(formatTime(it.startTime))}`);
+      let metaHtml = metaBits.length ? `<span class="ec-meta">${metaBits.join(' · ')}</span>` : '';
+      if (it.watched) {
+        const wl = String(it.watched).toLowerCase();
+        const cls = wl === 'watched' ? 'ec-badge ec-watched'
+          : wl === 'unwatched' ? 'ec-badge ec-unwatched' : 'ec-badge';
+        metaHtml += ` <span class="${cls}">${esc(it.watched)}</span>`;
+      }
+
+      const rawSnip = (it.snippet || '').replace(/<\/?b>/g, '');
+      const snip = (contentSearch && rawSnip)
+        ? `<span class="ec-snippet">${esc(rawSnip.substring(0, 120))}…</span>` : '';
+
+      card.innerHTML =
+        `<div class="ec-text">${titleHtml}${metaHtml}${snip}</div>` +
+        `<button class="ec-play-btn" title="Play on device">▶</button>`;
+
+      bubble.appendChild(card);
+    });
+
+    el['messages'].appendChild(bubble);
+    el['messages'].scrollTop = el['messages'].scrollHeight;
+  }
+
   function clearMessages() {
     el['messages'].innerHTML = '';
   }
@@ -219,12 +288,15 @@ const UI = (() => {
     const picker = el['device-picker'];
     picker.innerHTML = '<option value="">Select device...</option>';
 
-    // Show registered session-manager devices
+    // Show registered session-manager devices (online first; SageTV offline flagged)
     if (devices && devices.length > 0) {
-      devices.forEach(d => {
+      const isOfflineSage = d => d.system === 'sagetv' && !d.online;
+      const sorted = [...devices].sort((a, b) => (isOfflineSage(a) ? 1 : 0) - (isOfflineSage(b) ? 1 : 0));
+      sorted.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.device_id;
-        opt.textContent = d.friendly_name || d.device_id;
+        const base = d.friendly_name || d.device_id;
+        opt.textContent = isOfflineSage(d) ? `${base} (offline)` : base;
         if (d.device_id === selectedId) opt.selected = true;
         picker.appendChild(opt);
       });
@@ -274,7 +346,7 @@ const UI = (() => {
     const table = document.createElement('table');
     table.className = 'admin-table';
     table.innerHTML = `<thead><tr>
-      <th>Name</th><th>ID</th><th>System</th><th>Default</th><th></th>
+      <th>Name</th><th>ID</th><th>System</th><th>State</th><th>Default</th><th></th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
     devices.forEach(d => {
@@ -286,10 +358,14 @@ const UI = (() => {
       const shortId = d.device_id.startsWith('sagetv-ctx-')
         ? d.device_id.slice('sagetv-ctx-'.length)
         : d.device_id;
+      const stateCell = d.system === 'sagetv'
+        ? (d.online ? '🟢 online' : '⚪ offline')
+        : '—';
       tr.innerHTML = `
         <td class="device-name-cell" data-action="rename-device" data-id="${esc(d.device_id)}" data-name="${esc(d.friendly_name || '')}" title="Click to rename">${nameDisplay}</td>
         <td class="device-id-cell">${esc(shortId)}</td>
         <td>${esc(d.system || '-')}</td>
+        <td>${stateCell}</td>
         <td>${d.is_default ? '★' : ''}</td>
         <td>
           <button class="btn-tiny btn-danger" data-action="delete-device" data-id="${esc(d.device_id)}">✕</button>
@@ -568,7 +644,7 @@ const UI = (() => {
 
   return {
     cacheElements, updateNowPlaying, formatTime, updateDpad,
-    addMessage, addMessageHTML, addEpisodeCards, clearMessages,
+    addMessage, addMessageHTML, addEpisodeCards, addEpisodeResults, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
     renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab, renderAlerts,

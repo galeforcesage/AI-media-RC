@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from typing import Any, Dict, List, Optional
@@ -64,7 +65,7 @@ class MetadataEnrichmentPipeline:
 
         try:
             # 1. Fetch metadata from MCP server
-            metadata = await self.fetch_metadata(system, recording_id)
+            metadata = await self.fetch_metadata(system, recording_id, job.get("file_path"))
             if metadata is None:
                 metadata = {"title": recording_id}
                 logger.warning("No metadata found for %s, using recording_id as title", recording_id)
@@ -257,17 +258,20 @@ class MetadataEnrichmentPipeline:
         return chunks
 
     async def fetch_metadata(
-        self, system: str, recording_id: str
+        self, system: str, recording_id: str, file_path: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Fetch recording metadata from the appropriate MCP server via JSON-RPC."""
         if system == "sagetv":
             host, port = self._parse_addr(self.sagetv_url)
             tool = "sagetv_get_recording"
             # SageTV filenames: {Title}-{MediaFileID}-{Segment}.ext
-            # Extract the MediaFileID from the recording_id
+            # Extract the MediaFileID from the recording_id. NOTE: for
+            # Channels-DVR-imported files the embedded number is the Channels
+            # recording ID, not the SageTV MediaFileID, so also pass file_path
+            # to let the tool fall back to a filename match.
             parts = recording_id.rsplit("-", 2)
             media_file_id = parts[-2] if len(parts) >= 3 else recording_id
-            arguments = {"media_file_id": media_file_id}
+            arguments = {"media_file_id": media_file_id, "file_path": file_path or recording_id}
         elif system == "channelsdvr":
             host, port = self._parse_addr(self.channels_url)
             tool = "channels_get_recording"
@@ -323,42 +327,78 @@ class MetadataEnrichmentPipeline:
 
     @staticmethod
     def _normalize_sagetv_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize SageTV API response into standard metadata dict."""
-        data = raw.get("data") or raw
-        airing = data.get("Airing") or data.get("airing") or {}
-        show = airing.get("Show") or airing.get("show") or {}
-        channel = airing.get("Channel") or airing.get("channel") or {}
+        """Normalize a raw SageTV MediaFile into the standard metadata dict.
 
-        # Extract cast/actors — SageTV returns them in the Show object
-        people = show.get("People") or show.get("people") or []
-        roles = show.get("Roles") or show.get("roles") or []
+        ``sagetv_get_recording`` returns the raw SageTV MediaFile object
+        (from GetMediaFileForID / GetMediaFiles), whose fields are named
+        ``ShowTitle``, ``ChannelName``, ``FileStartTime`` (epoch **ms**), etc.
+        This mirrors ``mcp-sagetv``'s ``_slim_recording`` so titles, channel,
+        and dates actually populate (previously the wrong camelCase keys were
+        read, leaving every SageTV transcript with null metadata).
+        """
+        data = raw.get("data") or raw
+        airing = data.get("Airing") or {}
+        show = airing.get("Show") or {}
+        channel = airing.get("Channel") or {}
+
+        def _ms_to_s(v: Any) -> Optional[int]:
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                return None
+            if iv <= 0:
+                return None
+            # SageTV epochs are milliseconds (13 digits); convert to seconds.
+            return iv // 1000 if iv > 10_000_000_000 else iv
+
+        title = show.get("ShowTitle") or ""
+        ep_title = show.get("ShowEpisode") or ""
+        # Imported files often carry ShowTitle = server name (e.g. "SageTV9")
+        # with the real name embedded in ShowEpisode as a filename. Recover it.
+        if re.match(r"^SageTV\d*$", str(title), re.IGNORECASE) and ep_title and "-" in ep_title:
+            parts = ep_title.split("-")
+            title = parts[0]
+            rest = "-".join(parts[1:])
+            rest = re.sub(r"^S\d+E\d+-", "", rest)
+            rest = re.sub(r"-\d+-\d+$", "", rest)
+            if rest:
+                ep_title = rest
+
+        people = show.get("PeopleListInShow") or show.get("People") or []
         actors = []
-        for i, person in enumerate(people):
-            name = person if isinstance(person, str) else str(person)
-            role = roles[i] if i < len(roles) and roles[i] else None
-            # Use role as "character name" when it looks like a character (not "Actor"/"Host")
-            actors.append({
-                "name": name,
-                "role": role if role and role not in ("Actor", "Guest", "Host", "Narrator", "Judge") else None,
-                "billing_order": i,
-            })
+        if isinstance(people, list):
+            for i, person in enumerate(people):
+                name = person if isinstance(person, str) else str(person)
+                if name:
+                    actors.append({"name": name, "role": None, "billing_order": i})
+
+        seg = data.get("SegmentFiles") or []
+        if isinstance(seg, str):
+            seg = [seg]
+        file_path = seg[0] if seg else None
+
+        duration_ms = data.get("FileDuration") or 0
+        try:
+            duration_s = int(duration_ms) / 1000 if duration_ms else None
+        except (TypeError, ValueError):
+            duration_s = None
 
         return {
-            "title": show.get("Title") or show.get("title") or "",
-            "episode_title": show.get("EpisodeTitle") or show.get("episodeTitle"),
-            "season": show.get("SeasonNumber") or show.get("seasonNumber"),
-            "episode": show.get("EpisodeNumber") or show.get("episodeNumber"),
-            "genre": show.get("Category") or show.get("category") or show.get("Genre") or [],
-            "channel": channel.get("CallSign") or channel.get("callSign"),
-            "channel_number": channel.get("ChannelNumber") or channel.get("channelNumber"),
-            "air_date": airing.get("StartTime") or airing.get("startTime"),
-            "record_date": data.get("StartTime") or data.get("startTime"),
-            "duration": data.get("Duration") or data.get("duration"),
-            "file_path": data.get("SegmentFiles") or data.get("segmentFiles"),
-            "file_size": data.get("Size") or data.get("size"),
-            "description": show.get("Description") or show.get("description"),
-            "rating": show.get("Rated") or show.get("ParentalRating") or show.get("rated"),
-            "source_id": show.get("ExternalID") or show.get("externalID"),
+            "title": title,
+            "episode_title": ep_title or None,
+            "season": show.get("ShowSeasonNumber"),
+            "episode": show.get("ShowEpisodeNumber"),
+            "genre": show.get("ShowCategory") or "",
+            "channel": channel.get("ChannelName") or None,
+            "channel_number": channel.get("ChannelNumber") or None,
+            "air_date": _ms_to_s(airing.get("AiringStartTime")),
+            "record_date": _ms_to_s(data.get("FileStartTime") or airing.get("AiringStartTime")),
+            "duration": duration_s,
+            "file_path": file_path,
+            "file_size": data.get("Size"),
+            "description": show.get("ShowDescription") or None,
+            "rating": show.get("ShowParentalRating") or None,
+            "source_id": show.get("ShowExternalID") or None,
             "actors": actors,
         }
 

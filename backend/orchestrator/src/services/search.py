@@ -72,6 +72,22 @@ class SearchService:
             logger.exception("search_upcoming failed")
             return {"error": str(exc)}
 
+    async def _sagetv_recordings(self, query: str) -> Dict[str, Any]:
+        """Search the SageTV *recordings library* by title.
+
+        The plain ``sagetv.search`` hits the live guide/EPG (upcoming shows),
+        so a past recording that has aged out of the guide returns nothing.
+        The metadata popup needs the actual recording, so also search the
+        recordings library by title.
+        """
+        try:
+            return await self.orchestrator.execute(
+                "sagetv.search_recordings", {"title": query}
+            )
+        except Exception as exc:
+            logger.exception("sagetv recordings search failed")
+            return {"error": str(exc)}
+
     async def search_all(self, query: str) -> Dict[str, Any]:
         """
         Fan-out search across all backends + upcoming concurrently.
@@ -81,10 +97,11 @@ class SearchService:
         targets = ("sagetv", "channels")
         tasks = [self.search_programs(t, query) for t in targets]
         tasks.append(self.search_upcoming(query))
+        tasks.append(self._sagetv_recordings(query))
         raw = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: Dict[str, Any] = {}
-        labels = list(targets) + ["upcoming"]
+        labels = list(targets) + ["upcoming", "sagetv_recordings"]
         for label, res in zip(labels, raw):
             if isinstance(res, Exception):
                 logger.error("search_all error for %s: %s", label, res)
@@ -158,6 +175,39 @@ class SearchService:
             return result
         except Exception as exc:
             logger.exception("transcript_search failed")
+            return {"error": str(exc)}
+
+    async def transcript_get(self, recording_id: str) -> Dict[str, Any]:
+        """Fetch full transcript + metadata for a single recording via the
+        transcription MCP server (transcript_get tool)."""
+        try:
+            import asyncio, json
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", 8770, limit=1024 * 1024
+            )
+            request = json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "transcript_get",
+                    "arguments": {"recording_id": recording_id},
+                },
+            }) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=8.0)
+            writer.close()
+            await writer.wait_closed()
+            if not line:
+                return {"error": "Empty response from transcription server"}
+            resp = json.loads(line.decode())
+            result = resp.get("result", {})
+            content = result.get("content", [])
+            if content and content[0].get("type") == "text":
+                return json.loads(content[0]["text"])
+            return result
+        except Exception as exc:
+            logger.exception("transcript_get failed")
             return {"error": str(exc)}
 
     async def inject_transcript_context(

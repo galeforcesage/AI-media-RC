@@ -102,3 +102,11 @@ scripts/cleanup_r8168.sh
 scripts/diag_gpu.sh
 scripts/fix_gpu_*.sh
 scripts/force_remove_*.sh
+
+# Private GPU-lease plugin (ships from galeforcesage/gpu-priority-lock, never here)
+backend/orchestrator/src/services/gpu_router.py
+
+# AC-4 capable ffmpeg: ~30 MB, platform-specific, and not ours to redistribute.
+# Install it with scripts/install-ac4-ffmpeg.sh
+bin/ffmpeg-ac4
+bin/ffprobe-ac4

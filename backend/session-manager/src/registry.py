@@ -44,9 +44,14 @@ class DeviceRegistry:
                 last_seen REAL DEFAULT 0,
                 paired_at REAL DEFAULT 0,
                 pairing_method TEXT DEFAULT 'manual',
-                is_default INTEGER DEFAULT 0
+                is_default INTEGER DEFAULT 0,
+                online INTEGER DEFAULT 0
             )
         """)
+        # Migrate older DBs that predate the `online` column
+        cols = [r[1] for r in self._conn.execute("PRAGMA table_info(devices)").fetchall()]
+        if "online" not in cols:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN online INTEGER DEFAULT 0")
         self._conn.commit()
         logger.info("Device registry opened: %s (%d device limit)", self.db_path, self.device_limit)
 
@@ -68,13 +73,13 @@ class DeviceRegistry:
         self._conn.execute(
             """INSERT OR REPLACE INTO devices
                (device_id, friendly_name, system, ip_address, platform,
-                capabilities, last_seen, paired_at, pairing_method, is_default)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                capabilities, last_seen, paired_at, pairing_method, is_default, online)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (device.device_id, device.friendly_name, device.system,
              device.ip_address, device.platform,
              json.dumps(device.capabilities),
              device.last_seen, device.paired_at,
-             device.pairing_method, int(device.is_default)),
+             device.pairing_method, int(device.is_default), int(device.online)),
         )
         self._conn.commit()
         logger.info("Device added: %s (%s)", device.device_id, device.friendly_name)
@@ -132,6 +137,35 @@ class DeviceRegistry:
             (time.time(), device_id),
         )
         self._conn.commit()
+
+    def set_online(self, device_id: str, online: bool) -> None:
+        """Mark a device online/offline. Coming online also refreshes last_seen."""
+        if online:
+            self._conn.execute(
+                "UPDATE devices SET online = 1, last_seen = ? WHERE device_id = ?",
+                (time.time(), device_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE devices SET online = 0 WHERE device_id = ?", (device_id,)
+            )
+        self._conn.commit()
+
+    def mark_offline_except(self, system: str, online_ids: List[str]) -> int:
+        """Mark every currently-online device of `system` offline unless its
+        device_id is in `online_ids`. Returns the number of rows changed.
+
+        Rows, names, and default flags are preserved — only `online` changes.
+        """
+        placeholders = ",".join("?" for _ in online_ids)
+        params: List = [system]
+        sql = "UPDATE devices SET online = 0 WHERE system = ? AND online = 1"
+        if online_ids:
+            sql += f" AND device_id NOT IN ({placeholders})"
+            params.extend(online_ids)
+        cur = self._conn.execute(sql, params)
+        self._conn.commit()
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # Default device
