@@ -787,6 +787,11 @@ class Orchestrator:
                 return {"status": "error", "llm_response": f"Command failed: {exc}", "transcript_results": []}
 
         try:
+            # Active systems for this query (respects AI-focus scope). Defined
+            # here so the whole normal path can use it — the fast-path above
+            # returns early with its own local copy.
+            active = systems or ["sagetv", "channelsdvr"]
+
             # Classify temporal intent to skip irrelevant pre-fetches
             temporal = self._classify_temporal(prompt)
             logger.info("Temporal intent: %s", temporal)
@@ -884,6 +889,32 @@ class Orchestrator:
                 and not _has_inline_transcript
                 and not _is_meta_transcript
             )
+
+            # ── Deterministic date-scoped recordings listing ──
+            # The local model is unreliable at BOTH picking the filtered DVR
+            # search tool and honoring the resolved date window, so for a plain
+            # "what did I record <date>" question it tends to call the
+            # unfiltered listing tool and dump the entire library. When we have
+            # resolved a concrete date window, answer authoritatively from the
+            # DVR search tools instead of trusting the model to filter.
+            _listing_win = re.search(
+                r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
+            )
+            if _is_recordings_listing and _listing_win:
+                _win_start = _listing_win.group(1)
+                _win_end = _listing_win.group(2) or _listing_win.group(1)
+                try:
+                    _det = await self._deterministic_recordings_listing(
+                        active, _win_start, _win_end, status_callback
+                    )
+                except Exception:
+                    logger.warning(
+                        "deterministic recordings listing failed, falling back",
+                        exc_info=True,
+                    )
+                    _det = None
+                if _det is not None:
+                    return _det
 
             if _has_inline_transcript:
                 if status_callback:
@@ -1582,13 +1613,18 @@ class Orchestrator:
                 for _r in (_slist or []):
                     if not isinstance(_r, dict):
                         continue
+                    try:
+                        _srd = _r.get("record_date")
+                        _srdi = int(float(_srd)) if _srd is not None else None
+                    except Exception:
+                        _srdi = None
                     rows.append({
                         "display_title": _r.get("title") or "",
                         "title": _r.get("title") or "",
                         "episode_title": _r.get("episode_title") or None,
                         "se_label": _r.get("season_episode") or None,
                         "channel": _r.get("channel") or "",
-                        "record_date": None,
+                        "record_date": _srdi,
                         "watched": _r.get("watched"),
                         "system": "sagetv",
                         "recording_id": _r.get("id") or "",
@@ -1599,6 +1635,141 @@ class Orchestrator:
                 )
 
         return rows
+
+    async def _deterministic_recordings_listing(
+        self, active, start_date: str, end_date: str, status_callback=None
+    ):
+        """Answer a date-scoped "what did I record <date>" listing directly.
+
+        The local model is unreliable at BOTH picking the date-filtered DVR
+        search tool and honoring the resolved window, so it tends to call the
+        unfiltered listing tool and dump the entire library. When we already
+        have a concrete date window, bypass the model entirely: query the
+        authoritative DVR search tools (SageTV date search is proven correct;
+        Channels is filtered in Python by record_date epoch), format a clean
+        numbered list the frontend can parse, and attach episode_meta so the
+        cards enrich. Returns a run_query-shaped dict, or None to fall back to
+        the normal model path.
+        """
+        from datetime import datetime as _dt
+        from services.agent import _format_recording_line
+
+        _active = set(active or ["sagetv", "channelsdvr"])
+
+        # Inclusive epoch-second window (for Python-side Channels filtering).
+        try:
+            _s = _dt.strptime(start_date, "%Y-%m-%d")
+            _e = _dt.strptime(end_date, "%Y-%m-%d")
+            _start_epoch = int(_s.timestamp())
+            _end_epoch = int(_e.timestamp()) + 86399
+        except Exception:
+            return None
+
+        if status_callback:
+            await status_callback("Fetching DVR recordings")
+
+        recs: list = []
+
+        # SageTV — authoritative date-filtered search.
+        if "sagetv" in _active and hasattr(self, "_sagetv"):
+            try:
+                _res = await self._sagetv.call_tool(
+                    "sagetv_search_recordings",
+                    {"start_date": start_date, "end_date": end_date, "limit": 200},
+                )
+                _data = _res.get("data", _res) if isinstance(_res, dict) else _res
+                for _r in (_data or []):
+                    if isinstance(_r, dict):
+                        _row = dict(_r)
+                        _row["system"] = "sagetv"
+                        recs.append(_row)
+            except Exception:
+                logger.warning(
+                    "deterministic listing: SageTV search failed", exc_info=True
+                )
+
+        # Channels DVR — fetch all, filter by record_date epoch in Python.
+        if "channelsdvr" in _active and hasattr(self, "_channels"):
+            try:
+                _res = await self._channels.call_tool(
+                    "channels_get_recordings", {}
+                )
+                _data = _res.get("data", _res) if isinstance(_res, dict) else _res
+                for _r in (_data or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    _rd = _r.get("record_date") or _r.get("original_air_epoch")
+                    try:
+                        _rdi = int(float(_rd)) if _rd is not None else None
+                    except Exception:
+                        _rdi = None
+                    if _rdi is None or not (_start_epoch <= _rdi <= _end_epoch):
+                        continue
+                    _row = dict(_r)
+                    _row["system"] = "channelsdvr"
+                    _row["record_date"] = _rdi
+                    recs.append(_row)
+            except Exception:
+                logger.warning(
+                    "deterministic listing: Channels fetch failed", exc_info=True
+                )
+
+        def _rd_key(r) -> int:
+            v = r.get("record_date")
+            try:
+                return int(float(v))
+            except Exception:
+                return 0
+
+        recs.sort(key=_rd_key, reverse=True)
+
+        _win = start_date if start_date == end_date else f"{start_date} to {end_date}"
+
+        if not recs:
+            return {
+                "status": "ok",
+                "llm_response": f"No recordings found for {_win}.",
+                "iterations": 1,
+                "transcript_results": [],
+                "episode_meta": [],
+                "fast_path": True,
+            }
+
+        lines: list = []
+        meta: list = []
+        for _i, _r in enumerate(recs, 1):
+            _line_rec = dict(_r)
+            if not _line_rec.get("air_date"):
+                # SageTV carries a readable "recorded" string; Channels carries
+                # only an epoch — derive a YYYY-MM-DD for the visible line.
+                _ad = _r.get("recorded")
+                if not _ad:
+                    _rk = _rd_key(_r)
+                    if _rk:
+                        _ad = _dt.fromtimestamp(_rk).strftime("%Y-%m-%d")
+                _line_rec["air_date"] = _ad or ""
+            lines.append(_format_recording_line(_i, _line_rec))
+            meta.append({
+                "display_title": _r.get("title") or "",
+                "title": _r.get("title") or "",
+                "episode_title": _r.get("episode_title") or None,
+                "se_label": _r.get("season_episode") or None,
+                "channel": _r.get("channel") or "",
+                "record_date": _rd_key(_r) or None,
+                "watched": _r.get("watched"),
+                "system": _r.get("system"),
+                "recording_id": _r.get("id") or "",
+            })
+
+        _header = f"You recorded {len(recs)} program(s) on {_win}:"
+        return {
+            "status": "ok",
+            "llm_response": _header + "\n" + "\n".join(lines),
+            "iterations": 1,
+            "transcript_results": [],
+            "episode_meta": meta,
+            "fast_path": True,
+        }
 
     async def run_query_voice(self, audio_path: str) -> Dict[str, Any]:
         """Run a voice query: audio → transcription → LLM → TTS."""
