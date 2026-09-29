@@ -27,7 +27,7 @@
     },
     "agent": {
         "max_iterations": 5,
-        "planner": "openclaw",
+        "planner": "auto",
         "openclaw": {
             "enabled": true,
             "timeout_ms": 30000,
@@ -55,7 +55,6 @@
     "sagetv_url": "http://localhost:8080",
     "sagetv_user": "sage",
     "sagetv_pass": "frey",
-    "sagetv_credentials_note": "Published defaults (username: sage, password: frey)",
     "session_manager_url": "http://127.0.0.1:8769",
     "paths": {
         "sagetv_media": "/var/media/tv",

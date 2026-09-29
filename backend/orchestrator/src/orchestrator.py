@@ -172,18 +172,93 @@ class Orchestrator:
         # Session manager URL for device → session_id resolution
         self._session_url = config.get("session_manager_url", "http://127.0.0.1:8769")
 
-    def _resolve_planner_name(self, metadata: Dict[str, Any] | None = None) -> str:
-        """Resolve planner name from request metadata, then config defaults."""
+    # Heuristics for the "auto" router: multi-step / reasoning-heavy queries
+    # are sent to OpenClaw; everything else stays on the fast local AgentLoop.
+    # Kept intentionally conservative so the vast majority of remote commands
+    # never pay the OpenClaw latency tax.
+    _COMPLEX_PATTERNS = [
+        re.compile(p, re.IGNORECASE)
+        for p in (
+            r"\bkeep only\b",
+            r"\bdelete\b.*\b(keep|only|except)\b",
+            r"\bbuild (me )?a\b",
+            r"\bmake (me )?a\b.*\b(playlist|list|schedule|lineup)\b",
+            r"\bplaylist\b",
+            r"\bline ?up\b",
+            r"\bsuggest\b",
+            r"\brecommend\b",
+            r"\bwhat should (i|we)\b",
+            r"\bcompare\b",
+            r"\borgani[sz]e\b",
+            r"\bclean ?up\b",
+            r"\bfind (every|all)\b.*\b(and|then|only|keep|delete)\b",
+            r"\band then\b",
+            r"\bmarathon\b",
+            r"\bfor (my |the )?(family|kids|tonight|us)\b",
+            r"\bplan (me |us |out )?\b",
+            r"\bfigure out\b",
+        )
+    ]
+
+    def _classify_planner(self, prompt: str | None) -> str:
+        """Route complex/multi-step queries to OpenClaw, simple ones local.
+
+        Only ever returns "openclaw" when OpenClaw is enabled in config;
+        otherwise (and for any simple query) returns "agentloop".
+        """
+        openclaw_enabled = bool(
+            self.config.get("agent", {}).get("openclaw", {}).get("enabled", False)
+        )
+        if not openclaw_enabled:
+            return "agentloop"
+
+        text = (prompt or "").strip().lower()
+        if not text:
+            return "agentloop"
+
+        for pat in self._COMPLEX_PATTERNS:
+            if pat.search(text):
+                logger.info(
+                    "Auto-router: complex query -> openclaw (matched /%s/)",
+                    pat.pattern,
+                )
+                return "openclaw"
+
+        # Secondary signal: several action clauses chained together usually
+        # implies a multi-step task even without a keyword match.
+        connectors = len(re.findall(r"\b(and|then|also|plus|after that)\b", text))
+        if connectors >= 2 and len(text.split()) >= 12:
+            logger.info("Auto-router: multi-clause query -> openclaw")
+            return "openclaw"
+
+        return "agentloop"
+
+    def _resolve_planner_name(
+        self, metadata: Dict[str, Any] | None = None, prompt: str | None = None
+    ) -> str:
+        """Resolve planner name from request metadata, then config defaults.
+
+        A resolved value of "auto" (from either request metadata or config)
+        triggers heuristic intent-routing via :meth:`_classify_planner`.
+        """
         requested = None
         if isinstance(metadata, dict):
             requested = metadata.get("planner")
         if isinstance(requested, str) and requested.strip():
-            return requested.strip().lower()
-        return str(self.config.get("agent", {}).get("planner", "agentloop")).strip().lower()
+            name = requested.strip().lower()
+        else:
+            name = str(
+                self.config.get("agent", {}).get("planner", "agentloop")
+            ).strip().lower()
+        if name == "auto":
+            return self._classify_planner(prompt)
+        return name
 
-    def _get_planner(self, metadata: Dict[str, Any] | None = None):
+    def _get_planner(
+        self, metadata: Dict[str, Any] | None = None, prompt: str | None = None
+    ):
         """Get planner instance with fallback to agentloop if unknown."""
-        planner_name = self._resolve_planner_name(metadata)
+        planner_name = self._resolve_planner_name(metadata, prompt)
         try:
             planner = self._planner_registry.get(planner_name)
             if planner_name != "agentloop":
@@ -1435,8 +1510,8 @@ class Orchestrator:
                 conversation_context = ""
 
             # Run the selected planner (AgentLoop by default).
-            primary_name = self._resolve_planner_name(metadata)
-            planner = self._get_planner(metadata)
+            primary_name = self._resolve_planner_name(metadata, prompt)
+            planner = self._get_planner(metadata, prompt)
             agent_result = await planner.run(
                 prompt,
                 transcript_context=transcript_context,
