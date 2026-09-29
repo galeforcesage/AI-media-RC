@@ -580,8 +580,16 @@ class Orchestrator:
 
     # Week-range patterns handled deterministically (dateparser returns
     # single dates for these, but MCP tools need start..end ranges).
+    # Bare "last week" / "previous week" = the prior Sun-Sat calendar week.
     _WEEK_RANGE_RE = re.compile(
-        r"\b(last|past|this\s+past|previous)\s+week\b", re.IGNORECASE
+        r"\b(?:last|previous)\s+week\b", re.IGNORECASE
+    )
+    # "past week", "this past week", "this last week" = the rolling last 7 days
+    # up to today. This is what people mean by "this past/last week" (the week
+    # just gone, including the most recent days), NOT the prior calendar week.
+    # Checked before _WEEK_RANGE_RE so it wins over the bare "last week" match.
+    _ROLLING_WEEK_RE = re.compile(
+        r"\b(?:this\s+past|this\s+last|past)\s+week\b", re.IGNORECASE
     )
     _THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
     _NEXT_WEEK_RE = re.compile(r"\bnext\s+week\b", re.IGNORECASE)
@@ -644,6 +652,14 @@ class Orchestrator:
             prompt = self._LAST_N_DAYS_RE.sub(
                 f"{m.group(0)} ({s} to {e})", prompt, count=1)
             return prompt  # range phrases are exclusive — skip NL parse
+
+        m = self._ROLLING_WEEK_RE.search(prompt)
+        if m:
+            s = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            e = now.strftime("%Y-%m-%d")
+            prompt = self._ROLLING_WEEK_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
 
         m = self._WEEK_RANGE_RE.search(prompt)
         if m:
