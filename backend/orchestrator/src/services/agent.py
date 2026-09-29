@@ -971,11 +971,11 @@ class AgentLoop(PlannerBase):
             f"- Last 7 days (rolling): {week_ago_iso} to {today_iso}\n"
             f"{day_ref}\n"
             f"WHEN THE USER SAYS 'this week' — set date_from={this_week_start_iso} and date_to={this_week_end_iso}. "
-            f"WHEN THE USER SAYS 'past week', 'this past week', 'this last week', 'the last week', "
-            f"'the past week', 'in the last week', 'over the last week', 'over the past week', "
-            f"'last 7 days', 'recent', or 'lately' — set date_from={week_ago_iso} and date_to={today_iso}. "
-            f"ONLY when the user says exactly 'last week' (the previous Sunday-Saturday calendar week, with no "
-            f"'this'/'the'/'past' qualifier) — set date_from={last_week_start_iso} and date_to={last_week_end_iso}. "
+            f"WHEN THE USER SAYS 'last week', 'past week', 'this past week', 'this last week', "
+            f"'over the last week', 'in the last week', 'last 7 days', 'recent', or 'lately' — "
+            f"set date_from={week_ago_iso} and date_to={today_iso}. "
+            f"WHEN THE USER SAYS 'previous week' (the prior Sunday-Saturday calendar week) — "
+            f"set date_from={last_week_start_iso} and date_to={last_week_end_iso}. "
             f"NEVER use any other date. NEVER use a year other than {today_iso[:4]}.\n"
         )
 

@@ -580,16 +580,16 @@ class Orchestrator:
 
     # Week-range patterns handled deterministically (dateparser returns
     # single dates for these, but MCP tools need start..end ranges).
-    # Bare "last week" / "previous week" = the prior Sun-Sat calendar week.
+    # "previous week" = the prior Sunday-Saturday calendar week.
     _WEEK_RANGE_RE = re.compile(
-        r"\b(?:last|previous)\s+week\b", re.IGNORECASE
+        r"\bprevious\s+week\b", re.IGNORECASE
     )
-    # "past week", "this past week", "this last week" = the rolling last 7 days
-    # up to today. This is what people mean by "this past/last week" (the week
-    # just gone, including the most recent days), NOT the prior calendar week.
-    # Checked before _WEEK_RANGE_RE so it wins over the bare "last week" match.
+    # "last week", "past week", "this past week", "over/in/during the last
+    # week", etc. all contain "last week" or "past week" and mean the rolling
+    # last 7 days up to today (the week just gone, including the most recent
+    # days) — NOT the prior calendar week. Checked before _WEEK_RANGE_RE.
     _ROLLING_WEEK_RE = re.compile(
-        r"\b(?:this\s+past|this\s+last|past)\s+week\b", re.IGNORECASE
+        r"\b(?:last|past)\s+week\b", re.IGNORECASE
     )
     _THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
     _NEXT_WEEK_RE = re.compile(r"\bnext\s+week\b", re.IGNORECASE)
