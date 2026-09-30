@@ -965,7 +965,11 @@ class Orchestrator:
                 r"\bwhat\b[^?]*\b(?:record(?:ed|ings?)?|dvr|taped?|captured?)\b"
                 r"|\b(?:list|show\s+me)\b[^?]*\b(?:record(?:ed|ings?)?|dvr)\b"
                 r"|\bwhat(?:'s| is| are| do\s+i\s+have)\b[^?]*\brecord(?:ed|ings?)?\b"
-                r"|\bwhat\s+did\s+i\s+record\b",
+                r"|\bwhat\s+did\s+i\s+record\b"
+                r"|\b(?:anything|something|any(?:thing)?\s+(?:shows?|programs?|recordings?))\b"
+                r"[^?]*\b(?:record(?:ed|ing|ings)?|dvr|taped?|captur\w*)\b"
+                r"|\bdid\s+(?:anything|something|we|i|it|my\s+dvr|the\s+dvr|anything\s+else)\b"
+                r"[^?]*\brecord\w*",
                 re.I,
             )
             _content_marker_re = re.compile(
