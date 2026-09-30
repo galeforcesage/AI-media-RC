@@ -976,7 +976,12 @@ class Orchestrator:
                 r"|\b(?:episodes?|shows?|recordings?|programs?)\b[^?]*"
                 r"\b(?:do\s+i\s+have|have\s+i\s+got|i\s+have|i've\s+got|i\s+got)\b"
                 r"|\bdo\s+i\s+have\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
-                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b",
+                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                # Phase-2 metadata cues that imply a DVR inventory search:
+                # original-air-date ("... that originally aired in 1974") and
+                # an explicit character/role ("... with the character Columbo").
+                r"|\b(?:originally\s+aired|first\s+aired|original\s+air\s+date)\b"
+                r"|\b(?:the\s+)?character\s+(?:named\s+|called\s+)?[A-Z]",
                 re.I,
             )
             _content_marker_re = re.compile(

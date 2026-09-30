@@ -58,11 +58,13 @@ FILTER_CASES = [
     },
     {
         "text": "shows with the character Columbo",
-        "expected_unsupported": {"character"},
+        "expected": {"character": "Columbo"},
+        "expected_unsupported": set(),
     },
     {
         "text": "shows that originally aired in 1974",
-        "expected_unsupported": {"original_air_date"},
+        "expected": {"original_air_date": "1974"},
+        "expected_unsupported": set(),
     },
     {
         "text": "uh show show me Law and Order from yesterday",
@@ -104,7 +106,9 @@ def test_series_title_versus_character_name():
 
     character = extract_filters("shows with the character Columbo")
     assert character.character == "Columbo"
-    assert "character" in character.unsupported_requests()
+    # Character is now filterable server-side (SageTV cast-role list), so it
+    # is no longer reported as unsupported.
+    assert "character" not in character.unsupported_requests()
     # Must not silently become an actor or title.
     assert character.actor is None
     assert character.title is None
@@ -148,11 +152,16 @@ def test_empty_transcript_query_with_metadata_filters():
     assert f.transcript_query is None
 
 
-def test_original_air_date_not_treated_as_record_date():
+def test_original_air_date_year_is_filterable():
     f = extract_filters("shows that originally aired in 1974")
-    assert "original_air_date" in f.unsupported_requests()
+    # A concrete year is now server-side filterable, not unsupported.
+    assert f.original_air_date == "1974"
+    assert "original_air_date" not in f.unsupported_requests()
     # Must NOT become a recording-date filter.
     assert f.recorded_between is None
+    res = compile_filters(f, now=datetime(2026, 9, 30))
+    for call in res.calls:
+        assert call.args.get("original_air_year") == 1974
 
 
 # ── Capability compiler ────────────────────────────────────────────────────
@@ -191,11 +200,42 @@ def test_compile_respects_active_systems():
     assert {c.target for c in res.calls} == {"sagetv_recordings"}
 
 
-def test_compile_reports_unsupported_without_coercion():
+def test_character_routes_to_sagetv_only():
+    # Character filtering is SageTV-only (Channels has no character metadata),
+    # so a character query must emit a SageTV call carrying the filter and
+    # must NOT dump the Channels library with an unconstrained call.
     f = extract_filters("shows with the character Columbo")
     res = compile_filters(f, now=datetime(2026, 9, 30))
-    assert "character" in res.unsupported
-    assert res.clarification_reason
+    targets = {c.target for c in res.calls}
+    assert "sagetv_recordings" in targets
+    assert "channels_recordings" not in targets
+    sage = next(c for c in res.calls if c.target == "sagetv_recordings")
+    assert sage.args["character"] == "Columbo"
+    # Nothing unsupported: the request was fully honored by SageTV.
+    assert not res.unsupported
+
+
+def test_character_query_does_not_capture_interrogative_as_title():
+    # "what recordings do I have with the character X" must NOT set title
+    # to the interrogative "what" (which would dump the Channels library).
+    f = extract_filters("what recordings do I have with the character Himself")
+    assert f.character == "Himself"
+    assert f.title is None
+    res = compile_filters(f, now=datetime(2026, 9, 30))
+    assert {c.target for c in res.calls} == {"sagetv_recordings"}
+    assert res.calls[0].args.get("character") == "Himself"
+    assert "title" not in res.calls[0].args
+
+
+def test_original_air_date_without_year_is_reported_unsupported():
+    # "originally aired" with no concrete year can't be resolved to a filter.
+    f = extract_filters("shows that originally aired")
+    assert f.original_air_date == "requested"
+    assert "original_air_date" in f.unsupported_requests()
+    res = compile_filters(f, now=datetime(2026, 9, 30))
+    assert "original_air_date" in res.unsupported
+    for call in res.calls:
+        assert "original_air_year" not in call.args
 
 
 def test_unwatched_filter_never_emitted():

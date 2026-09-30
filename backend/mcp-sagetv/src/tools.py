@@ -58,6 +58,16 @@ def _epoch_ms_to_readable(epoch_ms: int) -> str:
         return ""
 
 
+def _epoch_ms_year(epoch_ms: int) -> int | None:
+    """Return the calendar year for an epoch-ms timestamp, or None."""
+    try:
+        if not epoch_ms:
+            return None
+        return datetime.datetime.fromtimestamp(int(epoch_ms) / 1000.0).year
+    except (ValueError, OSError, TypeError):
+        return None
+
+
 def _date_str_to_epoch_ms(date_str: str, end_of_day: bool = False) -> int:
     """Convert a YYYY-MM-DD string to epoch milliseconds.
     If end_of_day=True, returns 23:59:59.999 of that day."""
@@ -144,6 +154,10 @@ def _slim_recording(mf: Dict) -> Dict:
         "image": show.get("ShowImage", ""),
         "cast": show.get("PeopleListInShow", []),
         "content_rating": show.get("ShowParentalRating", ""),
+        "original_air_epoch": (
+            int(show.get("OriginalAiringDate")) // 1000
+            if show.get("OriginalAiringDate") else None
+        ),
         "watched": bool(airing.get("IsWatched", False)),
     }
     # Status: SageTV files are always on disk (no trash concept).
@@ -950,6 +964,15 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     watched = args.get("watched")
     archived = args.get("archived")
     recording_state = args.get("recording_state")
+    character = args.get("character", "")
+    original_air_year = args.get("original_air_year")
+    if original_air_year is not None:
+        try:
+            original_air_year = int(original_air_year)
+        except (TypeError, ValueError):
+            original_air_year = None
+        if original_air_year == 0:
+            original_air_year = None
     limit = int(args.get("limit", 50))
 
     # ── Sanitize LLM-provided args ──
@@ -1002,6 +1025,20 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
         if genre:
             rec_cat = show.get("ShowCategory", "")
             if genre.lower() not in rec_cat.lower():
+                continue
+
+        if character:
+            # PeopleAndCharacterListInShow entries are "Actor Name -- Character".
+            pac = show.get("PeopleAndCharacterListInShow") or []
+            roles = []
+            for entry in pac:
+                if isinstance(entry, str) and "--" in entry:
+                    roles.append(entry.split("--", 1)[1].strip().lower())
+            if not any(character.lower() in r for r in roles):
+                continue
+
+        if original_air_year is not None:
+            if _epoch_ms_year(show.get("OriginalAiringDate")) != original_air_year:
                 continue
 
         if season is not None:
@@ -1588,11 +1625,12 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_list_genres,
     },
     "sagetv_search_recordings": {
-        "description": "Search recordings with filters: title, episode_title, actor, genre, channel, season, episode, date range, watched, archived, recording state.",
+        "description": "Search recordings with filters: title, episode_title, actor, character, genre, channel, season, episode, date range, original_air_year, watched, archived, recording state.",
         "input_schema": {"type": "object", "properties": {
             "title": {"type": "string", "description": "Show name substring filter (case-insensitive). Use the SHOW NAME only."},
             "episode_title": {"type": "string", "description": "Episode title/name substring filter (case-insensitive)."},
             "actor": {"type": "string", "description": "Actor/cast member name substring filter (case-insensitive)."},
+            "character": {"type": "string", "description": "Character/role name substring filter (case-insensitive), matched against the character side of the cast list."},
             "genre": {"type": "string", "description": "Genre/category substring filter (e.g. 'drama', 'comedy'). Use sagetv_list_genres to see valid values."},
             "channel": {"type": "string", "description": "Channel number or name filter"},
             "season": {"type": "integer", "description": "Season number filter (e.g. 3 for S03)"},
@@ -1601,6 +1639,7 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD). Preferred over end_time."},
             "start_time": {"type": "integer", "description": "Minimum start time (epoch ms). Use start_date instead."},
             "end_time": {"type": "integer", "description": "Maximum end time (epoch ms). Use end_date instead."},
+            "original_air_year": {"type": "integer", "description": "Original-air-date year filter (e.g. 2019). Matches the episode's first-aired year, not the recording date."},
             "watched": {"type": "boolean", "description": "Filter by watched status"},
             "archived": {"type": "boolean", "description": "Filter by archived/library status"},
             "recording_state": {"type": "string", "enum": ["recording", "complete"], "description": "Filter by recording state"},

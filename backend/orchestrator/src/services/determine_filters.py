@@ -50,6 +50,11 @@ except Exception:  # pragma: no cover
     _CHICAGO = None
 
 
+# A bare four-digit year (1900-2099) — the only ``original_air_date`` form we
+# can currently resolve to a concrete server-side filter.
+_YEAR_ONLY_RE = re.compile(r"(?:19|20)\d{2}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 1. Normalized filter model (intermediate representation)
 # ══════════════════════════════════════════════════════════════════════════
@@ -162,11 +167,18 @@ class DetermineFilters(StrictModel):
         return fields
 
     def unsupported_requests(self) -> set[str]:
-        """Requested filters that no backend can honor yet (Phase 2)."""
+        """Requested filters that no backend can honor as given.
+
+        ``character`` and ``original_air_date`` are now filterable server-side
+        (SageTV cast-role list / episode original-air year). The only remaining
+        honest gap is an ``original_air_date`` request with no concrete year to
+        match on (e.g. "originally aired" with no year) — reported so the user
+        knows the constraint was understood but couldn't be applied.
+        """
         unsupported: set[str] = set()
-        if self.character:
-            unsupported.add("character")
-        if self.original_air_date:
+        if self.original_air_date and not _YEAR_ONLY_RE.fullmatch(
+            self.original_air_date.strip()
+        ):
             unsupported.add("original_air_date")
         return unsupported
 
@@ -180,13 +192,14 @@ class DetermineFilters(StrictModel):
 
 BACKEND_CAPABILITIES: dict[str, set[str]] = {
     "sagetv_recordings": {
-        "title", "episode_title", "actor", "genre", "channel",
-        "season", "episode", "recorded_between", "watched",
-        "archived", "recording_state", "limit",
+        "title", "episode_title", "actor", "character", "genre", "channel",
+        "season", "episode", "recorded_between", "original_air_date",
+        "watched", "archived", "recording_state", "limit",
     },
     "channels_recordings": {
         "title", "episode_title", "actor", "genre", "channel",
-        "season", "episode", "recorded_between", "watched", "limit",
+        "season", "episode", "recorded_between", "original_air_date",
+        "watched", "limit",
     },
     "sagetv_upcoming": {
         "recorded_between", "limit",
@@ -451,6 +464,8 @@ def _build_args(filters: DetermineFilters, target: str) -> dict:
         args["episode_title"] = filters.episode_title
     if "actor" in supported and filters.actor:
         args["actor"] = filters.actor
+    if "character" in supported and filters.character:
+        args["character"] = filters.character
     if "genre" in supported and filters.genre:
         args["genre"] = filters.genre
     if "channel" in supported and filters.channel:
@@ -482,6 +497,11 @@ def _build_args(filters: DetermineFilters, target: str) -> dict:
 
     if "recorded_between" in supported:
         args.update(map_date_filter(filters, target))
+
+    if "original_air_date" in supported and filters.original_air_date:
+        _yr = filters.original_air_date.strip()
+        if _YEAR_ONLY_RE.fullmatch(_yr):
+            args["original_air_year"] = int(_yr)
 
     if "limit" in supported:
         args["limit"] = filters.limit
@@ -556,6 +576,8 @@ def compile_filters(
 
     # ── Recording / upcoming search per system ─────────────────────────
     target_map = UPCOMING_TARGETS if upcoming else RECORDING_TARGETS
+    # Honorable constraints the user actually asked for (minus result caps).
+    honorable = (requested - filters.unsupported_requests()) - {"limit"}
     for system in selected:
         target = target_map[system]
         supported = BACKEND_CAPABILITIES[target]
@@ -563,6 +585,13 @@ def compile_filters(
             (requested - supported) - filters.unsupported_requests()
         )
         args = _build_args(filters, target)
+        # If the user asked for a concrete constraint but this backend can
+        # honor none of it, skip the call rather than dumping its whole
+        # library (e.g. a character query against Channels, which has no
+        # character metadata).
+        _constraining = {k for k in args if k not in ("limit", "system")}
+        if honorable and not _constraining:
+            continue
         result.calls.append(
             BackendCall(target=target, tool=TARGET_TOOL[target],
                         args=args, dropped=dropped)
@@ -818,13 +847,8 @@ def extract_filters(prompt: str) -> DetermineFilters:
                 seen.append(s)
         f["systems"] = seen
 
-    # Clarification when title vs character is genuinely ambiguous.
-    if f.get("character") and not (f.get("title") or f.get("actor")):
-        f.setdefault(
-            "clarification_reason",
-            "This looks like a character name. Character filtering isn't "
-            "supported yet; did you mean the series title or an actor?",
-        )
+    # Character now routes to SageTV's cast-role filter, so no capability
+    # clarification is needed here.
 
     return DetermineFilters(**f)
 
@@ -873,9 +897,16 @@ def _extract_title(working: str) -> str | None:
             cand = _clean_entity(m.group(1))
             if cand:
                 cand = _strip_inventory_preamble(cand)
-            # Reject leftover command verbs / determiners.
+            # Reject leftover command verbs / determiners / interrogatives
+            # that a greedy "<X> recordings/episodes" cue can capture when the
+            # real constraint is elsewhere (e.g. "what recordings do I have
+            # with the character X" → cand "what").
             if cand and cand.lower() not in (
                 "the", "my", "me", "a", "an", "all", "any", "some", "list",
+                "what", "whats", "what's", "which", "who", "whose", "where",
+                "when", "why", "how", "do", "does", "did", "have", "has",
+                "i", "we", "you", "it", "that", "this", "show", "shows",
+                "recording", "recordings", "episode", "episodes",
             ):
                 # Drop a leading stray verb like "find"/"list"/"get".
                 cand = re.sub(
