@@ -843,12 +843,36 @@ _TITLE_CUE_PATTERNS = [
 ]
 _TITLE_CUE_RE = [re.compile(p, re.I) for p in _TITLE_CUE_PATTERNS]
 
+# Leading interrogative / inventory lead-ins that precede the real show name
+# in phrasings like "what are all the <show> episodes", "how many <show>
+# episodes do I have", "do I have any <show> episodes". Stripped iteratively.
+# A lone leading "the"/"my" is deliberately NOT stripped so titles such as
+# "The Voice" survive; only "all the"/"all my" chains are removed.
+_PREAMBLE_STRIP = re.compile(
+    r"^(?:"
+    r"what(?:'s| is| are)?|which|how\s+many|"
+    r"do\s+i\s+have(?:\s+any)?|have\s+i\s+got|i\s+have|i've\s+got|"
+    r"all(?:\s+(?:the|my|of))?|any|some"
+    r")\s+",
+    re.I,
+)
+
+
+def _strip_inventory_preamble(cand: str) -> str:
+    prev = None
+    while prev != cand:
+        prev = cand
+        cand = _PREAMBLE_STRIP.sub("", cand).strip()
+    return cand
+
 
 def _extract_title(working: str) -> str | None:
     for rx in _TITLE_CUE_RE:
         m = rx.search(working)
         if m:
             cand = _clean_entity(m.group(1))
+            if cand:
+                cand = _strip_inventory_preamble(cand)
             # Reject leftover command verbs / determiners.
             if cand and cand.lower() not in (
                 "the", "my", "me", "a", "an", "all", "any", "some", "list",

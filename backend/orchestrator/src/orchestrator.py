@@ -969,7 +969,14 @@ class Orchestrator:
                 r"|\b(?:anything|something|any(?:thing)?\s+(?:shows?|programs?|recordings?))\b"
                 r"[^?]*\b(?:record(?:ed|ing|ings)?|dvr|taped?|captur\w*)\b"
                 r"|\bdid\s+(?:anything|something|we|i|it|my\s+dvr|the\s+dvr|anything\s+else)\b"
-                r"[^?]*\brecord\w*",
+                r"[^?]*\brecord\w*"
+                # DVR-inventory phrasings that omit the word "record": "what
+                # <show> episodes do I have", "all the X episodes I have",
+                # "do I have any X episodes", "how many X episodes do I have".
+                r"|\b(?:episodes?|shows?|recordings?|programs?)\b[^?]*"
+                r"\b(?:do\s+i\s+have|have\s+i\s+got|i\s+have|i've\s+got|i\s+got)\b"
+                r"|\bdo\s+i\s+have\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b",
                 re.I,
             )
             _content_marker_re = re.compile(
