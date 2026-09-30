@@ -329,3 +329,27 @@ def test_inventory_preamble_preserves_leading_the():
     assert extract_filters("show me The Voice recordings").title == "The Voice"
     assert extract_filters("recordings of The Office").title == "The Office"
 
+
+def test_compile_upcoming_emits_upcoming_targets():
+    # A future/scheduled query must compile to the *upcoming* tools, not the
+    # past-recordings search, so it can answer "what's going to record".
+    f = extract_filters("what shows are going to record over the next 7 days")
+    res = compile_filters(f, upcoming=True, now=datetime(2026, 9, 30))
+    targets = {c.target for c in res.calls}
+    assert targets == {"sagetv_upcoming", "channels_upcoming"}
+    tools = {c.tool for c in res.calls}
+    assert tools == {
+        "sagetv_get_upcoming_recordings",
+        "channels_get_upcoming_recordings",
+    }
+
+
+def test_compile_upcoming_respects_active_systems():
+    f = extract_filters("what is scheduled tonight")
+    res = compile_filters(
+        f, active_systems=["channelsdvr"], upcoming=True,
+        now=datetime(2026, 9, 30),
+    )
+    assert {c.target for c in res.calls} == {"channels_upcoming"}
+
+

@@ -466,6 +466,17 @@ class Orchestrator:
         r"what(?:'s| is)\s+(?:on\s+now|playing|airing))\b",
         re.IGNORECASE,
     )
+    # Upcoming / scheduled-recording intent (future DVR jobs, not past files).
+    _UPCOMING_RE = re.compile(
+        r"\b(?:going\s+to|gonna|about\s+to|will|set\s+to)\s+record\b"
+        r"|\bupcoming\b|\bscheduled?\b|\bschedule\b"
+        r"|\brecord(?:ing|s)?\s+(?:today|tonight|tomorrow|this\s+week|"
+        r"next\b|over\s+the\s+next|in\s+the\s+next|coming)\b"
+        r"|\b(?:over\s+the\s+|in\s+the\s+)?(?:next|coming)\s+\d+\s+(?:days?|weeks?)\b"
+        r"|\bwhat\s+records\b"
+        r"|\bwhat(?:'s| is)\s+(?:on\s+)?(?:tonight|coming\s+up)\b",
+        re.IGNORECASE,
+    )
 
     def _classify_temporal(self, prompt: str) -> str:
         """Classify query temporal intent: 'past', 'future', 'present', or 'both'."""
@@ -989,8 +1000,17 @@ class Orchestrator:
                 r"about|summar(?:y|ize|ise)|recap|ending|ended|\bend\b)\b",
                 re.I,
             )
+            _is_upcoming_listing = (
+                bool(self._UPCOMING_RE.search(prompt))
+                and not self._PAST_RE.search(prompt)
+                and not _content_marker_re.search(prompt)
+                and not _summary_title
+                and not _has_inline_transcript
+                and not _is_meta_transcript
+            )
             _is_recordings_listing = (
                 bool(_recordings_listing_re.search(prompt))
+                and not _is_upcoming_listing
                 and not _content_marker_re.search(prompt)
                 and not _summary_title
                 and not _has_inline_transcript
@@ -1008,6 +1028,20 @@ class Orchestrator:
             _listing_win = re.search(
                 r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
             )
+            if _is_upcoming_listing:
+                try:
+                    _up = await self._compiled_upcoming_listing(
+                        prompt, active, status_callback
+                    )
+                except Exception:
+                    logger.warning(
+                        "compiled upcoming listing failed, falling back",
+                        exc_info=True,
+                    )
+                    _up = None
+                if _up is not None:
+                    return _up
+
             if _is_recordings_listing:
                 try:
                     _det = await self._compiled_recordings_listing(
@@ -1785,6 +1819,202 @@ class Orchestrator:
             e = dr.end_utc.strftime("%Y-%m-%d")
             label += f" on {s}" if s == e else f" from {s} to {e}"
         return label
+
+    def _resolve_future_window(self, prompt: str):
+        """Resolve a forward-looking date window (YYYY-MM-DD, YYYY-MM-DD).
+
+        Upcoming/scheduled queries look ahead, so unlike ``resolve_date_range``
+        (which resolves backward) this anchors on *today* and extends into the
+        future. Falls back to a today..today+7 horizon when no explicit window
+        is present.
+        """
+        now = datetime.now()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        p = prompt.lower()
+
+        m = re.search(r"(?:next|coming)\s+(\d+)\s+days?", p)
+        if m:
+            n = int(m.group(1))
+            return (
+                today.strftime("%Y-%m-%d"),
+                (today + timedelta(days=n)).strftime("%Y-%m-%d"),
+            )
+        m = re.search(r"(?:next|coming)\s+(\d+)\s+weeks?", p)
+        if m:
+            n = int(m.group(1))
+            return (
+                today.strftime("%Y-%m-%d"),
+                (today + timedelta(days=7 * n)).strftime("%Y-%m-%d"),
+            )
+        if re.search(r"\btonight\b|\btoday\b", p):
+            return today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+        if re.search(r"\btomorrow\b", p):
+            d = today + timedelta(days=1)
+            return d.strftime("%Y-%m-%d"), d.strftime("%Y-%m-%d")
+        if re.search(r"\bthis\s+week\b", p):
+            # Remaining days of the current week (through Saturday).
+            days_to_sat = (5 - today.weekday()) % 7
+            end = today + timedelta(days=days_to_sat)
+            return today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        if re.search(r"\bnext\s+week\b", p):
+            # Next calendar week (upcoming Sunday..Saturday).
+            start = today + timedelta(days=((6 - today.weekday()) % 7) + 1)
+            end = start + timedelta(days=6)
+            return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        # Default forward horizon.
+        return (
+            today.strftime("%Y-%m-%d"),
+            (today + timedelta(days=7)).strftime("%Y-%m-%d"),
+        )
+
+    async def _compiled_upcoming_listing(
+        self, prompt: str, active, status_callback=None
+    ):
+        """Authoritatively answer an upcoming/scheduled-recording query.
+
+        Routes future intent ("what's going to record over the next 7 days",
+        "what's scheduled tonight") to the DVR *upcoming* tools rather than the
+        past-recordings search. Compiles title/channel/limit from the request
+        and injects a forward date window resolved from the prompt.
+
+        Returns a run_query-shaped dict, or ``None`` to fall back to the model.
+        """
+        from services.determine_filters import extract_filters, compile_filters
+
+        f = extract_filters(prompt)
+        res = compile_filters(f, active_systems=active, upcoming=True)
+        _up_calls = [
+            c for c in res.calls
+            if c.target in ("sagetv_upcoming", "channels_upcoming")
+        ]
+        if not _up_calls:
+            return None
+
+        start_date, end_date = self._resolve_future_window(prompt)
+
+        if status_callback:
+            await status_callback("Checking scheduled recordings")
+
+        recs: list = []
+        for call in _up_calls:
+            is_sage = call.target.startswith("sagetv")
+            client = self._sagetv if is_sage else self._channels
+            system = "sagetv" if is_sage else "channelsdvr"
+            if not hasattr(self, "_sagetv"):
+                continue
+            args = dict(call.args)
+            if start_date:
+                args["start_date"] = start_date
+            if end_date:
+                args["end_date"] = end_date
+            # The upcoming tools take an explicit window, not a compiled
+            # recorded_between; drop any stale date keys the compiler emitted.
+            args.pop("recorded_between", None)
+            try:
+                _r = await client.call_tool(call.tool, args)
+            except Exception:
+                logger.warning(
+                    "compiled upcoming: %s failed", call.tool, exc_info=True
+                )
+                continue
+            _data = _r.get("data", _r) if isinstance(_r, dict) else _r
+            # SageTV returns data as a flat list; Channels wraps it as
+            # {"scheduled": [...], "skipped": [...]}. Normalise both.
+            rows: list = []
+            if isinstance(_data, dict):
+                rows = list(_data.get("scheduled", []) or [])
+                rows += list(_data.get("skipped", []) or [])
+                if not rows:
+                    rows = list(
+                        _data.get("results", _data.get("recordings", [])) or []
+                    )
+            elif isinstance(_data, list):
+                rows = _data
+            for _row in rows:
+                if isinstance(_row, dict):
+                    rr = dict(_row)
+                    rr["system"] = system
+                    recs.append(rr)
+
+        def _st_key(r):
+            st = str(r.get("start_time") or "")
+            try:
+                return datetime.strptime(st[:19], "%Y-%m-%d %I:%M %p")
+            except Exception:
+                return datetime.max
+
+        recs.sort(key=_st_key)
+        _label = self._describe_filters(f)
+
+        if not recs:
+            _win = (
+                f" between {start_date} and {end_date}"
+                if start_date and end_date else ""
+            )
+            return {
+                "status": "ok",
+                "llm_response": f"No upcoming recordings found{_label}{_win}.",
+                "iterations": 1,
+                "transcript_results": [],
+                "episode_meta": [],
+                "fast_path": True,
+            }
+
+        lines: list = []
+        meta: list = []
+        for _i, _r in enumerate(recs, 1):
+            _title = _r.get("title") or "(untitled)"
+            _ep = _r.get("episode_title")
+            _se = _r.get("season_episode")
+            if not _se:
+                _s = _r.get("season")
+                _e = _r.get("episode")
+                if _s and _e:
+                    try:
+                        _se = f"S{int(_s):02d}E{int(_e):02d}"
+                    except Exception:
+                        _se = None
+            _chan = _r.get("channel") or ""
+            _when = _r.get("start_time") or _r.get("air_date") or ""
+            _bits = [f'{_i}. "{_title}"']
+            if _ep:
+                _bits.append(f'"{_ep}"')
+            if _se:
+                _bits.append(_se)
+            _line = " ".join(_bits)
+            _suffix = []
+            if _when:
+                _suffix.append(str(_when))
+            if _chan:
+                _suffix.append(f"({_chan})")
+            if _suffix:
+                _line += " \u2014 " + " ".join(_suffix)
+            lines.append(_line)
+            meta.append({
+                "display_title": _title,
+                "title": _title,
+                "episode_title": _ep or None,
+                "se_label": _se or None,
+                "channel": _chan,
+                "air_date": _r.get("air_date") or None,
+                "start_time": _r.get("start_time") or None,
+                "system": _r.get("system"),
+                "recording_id": _r.get("id") or "",
+            })
+
+        _win = (
+            f" between {start_date} and {end_date}"
+            if start_date and end_date else ""
+        )
+        _header = f"You have {len(recs)} upcoming recording(s){_label}{_win}:"
+        return {
+            "status": "ok",
+            "llm_response": _header + "\n" + "\n".join(lines),
+            "iterations": 1,
+            "transcript_results": [],
+            "episode_meta": meta,
+            "fast_path": True,
+        }
 
     async def _compiled_recordings_listing(
         self, prompt: str, active, status_callback=None
