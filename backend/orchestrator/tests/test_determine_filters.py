@@ -266,3 +266,26 @@ def test_backend_capabilities_shape():
     assert "watched" in BACKEND_CAPABILITIES["sagetv_recordings"]
     assert "watched" not in BACKEND_CAPABILITIES["channels_upcoming"]
     assert "transcript_query" in BACKEND_CAPABILITIES["transcript_search"]
+
+
+@pytest.mark.parametrize(
+    "prompt,expected",
+    [
+        ("what are all the press your luck episodes I have", "press your luck"),
+        ("how many NCIS episodes do I have", "NCIS"),
+        ("do I have any Columbo episodes", "Columbo"),
+        ("all the Jeopardy recordings I have", "Jeopardy"),
+    ],
+)
+def test_inventory_phrasings_extract_clean_title(prompt, expected):
+    f = extract_filters(prompt)
+    assert f.title == expected
+    # These are metadata/title lookups, not dialogue searches.
+    assert f.transcript_query is None
+
+
+def test_inventory_preamble_preserves_leading_the():
+    # "The Voice"/"The Office" must not lose their leading article.
+    assert extract_filters("show me The Voice recordings").title == "The Voice"
+    assert extract_filters("recordings of The Office").title == "The Office"
+
