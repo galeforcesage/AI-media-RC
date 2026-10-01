@@ -202,7 +202,7 @@ BACKEND_CAPABILITIES: dict[str, set[str]] = {
         "watched", "limit",
     },
     "sagetv_upcoming": {
-        "recorded_between", "limit",
+        "title", "channel", "recorded_between", "limit",
     },
     "channels_upcoming": {
         "title", "channel", "recorded_between", "limit",
@@ -826,6 +826,18 @@ def extract_filters(prompt: str) -> DetermineFilters:
     if re.search(r"\barchived\b|\bsaved\s+to\s+(?:disk|library)\b", working, re.I):
         f["archived"] = True
 
+    # 12b) Future/scheduling-intent title ("is Shark Tank scheduled",
+    #      "will Survivor record next week", "did NCIS record last night").
+    #      Runs before the generic title cue so a scheduling question still
+    #      binds its subject as the title filter.
+    if "title" not in f and "episode_title" not in f:
+        fm = _FUTURE_TITLE_RE.search(working)
+        if fm:
+            cand = _clean_title_candidate(fm.group(1))
+            if cand:
+                f["title"] = cand
+                consume(fm)
+
     # 13) Title vs episode_title.
     if "title" not in f and "episode_title" not in f:
         title = _extract_title(working)
@@ -890,31 +902,52 @@ def _strip_inventory_preamble(cand: str) -> str:
     return cand
 
 
+_TITLE_REJECT = frozenset({
+    "the", "my", "me", "a", "an", "all", "any", "some", "list",
+    "what", "whats", "what's", "which", "who", "whose", "where",
+    "when", "why", "how", "do", "does", "did", "have", "has",
+    "i", "we", "you", "it", "that", "this", "show", "shows",
+    "recording", "recordings", "episode", "episodes",
+})
+
+
+def _clean_title_candidate(cand: str | None) -> str | None:
+    """Normalize a raw title capture and reject bare interrogatives/fillers."""
+    if cand:
+        cand = _clean_entity(cand)
+    if cand:
+        cand = _strip_inventory_preamble(cand)
+    if not cand or cand.lower() in _TITLE_REJECT:
+        return None
+    # Drop a leading stray verb like "find"/"list"/"get".
+    cand = re.sub(
+        r"^(?:find|list|get|see|view|display)\s+", "", cand, flags=re.I
+    ).strip()
+    cand = _clean_entity(cand)
+    return cand or None
+
+
+# Future/scheduling-intent title cue: a proper-noun subject that precedes a
+# scheduling verb, e.g. "is Shark Tank scheduled", "will Survivor record next
+# week", "did NCIS record last night". Case-sensitive on purpose so generic
+# phrasings ("what shows are going to record ...") don't capture a title.
+_FT_PROPER = r"[A-Z0-9][\w'\u2019.&:-]*"
+_FUTURE_TITLE_RE = re.compile(
+    r"\b(?:is|are|will|was|were|does|do|did|"
+    r"when\s+(?:is|are|will|does|do|did))\s+"
+    rf"({_FT_PROPER}(?:\s+(?:and|of|the|&)\s+{_FT_PROPER}|\s+{_FT_PROPER})*)\s+"
+    r"(?:scheduled|going\s+to\s+record|gonna\s+record|about\s+to\s+record|"
+    r"set\s+to\s+record|record(?:ing|s|ed)?|air(?:ing|s|ed)?)\b"
+)
+
+
 def _extract_title(working: str) -> str | None:
     for rx in _TITLE_CUE_RE:
         m = rx.search(working)
         if m:
-            cand = _clean_entity(m.group(1))
+            cand = _clean_title_candidate(m.group(1))
             if cand:
-                cand = _strip_inventory_preamble(cand)
-            # Reject leftover command verbs / determiners / interrogatives
-            # that a greedy "<X> recordings/episodes" cue can capture when the
-            # real constraint is elsewhere (e.g. "what recordings do I have
-            # with the character X" → cand "what").
-            if cand and cand.lower() not in (
-                "the", "my", "me", "a", "an", "all", "any", "some", "list",
-                "what", "whats", "what's", "which", "who", "whose", "where",
-                "when", "why", "how", "do", "does", "did", "have", "has",
-                "i", "we", "you", "it", "that", "this", "show", "shows",
-                "recording", "recordings", "episode", "episodes",
-            ):
-                # Drop a leading stray verb like "find"/"list"/"get".
-                cand = re.sub(
-                    r"^(?:find|list|get|see|view|display)\s+", "", cand, flags=re.I
-                ).strip()
-                cand = _clean_entity(cand)
-                if cand:
-                    return cand
+                return cand
     return None
 
 

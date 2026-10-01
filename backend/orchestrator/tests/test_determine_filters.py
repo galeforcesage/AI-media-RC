@@ -353,3 +353,43 @@ def test_compile_upcoming_respects_active_systems():
     assert {c.target for c in res.calls} == {"channels_upcoming"}
 
 
+@pytest.mark.parametrize(
+    "prompt,expected",
+    [
+        ("is Shark Tank scheduled to record next week", "Shark Tank"),
+        ("will Survivor record next week", "Survivor"),
+        ("did NCIS record last night", "NCIS"),
+        ("is Law and Order scheduled tomorrow", "Law and Order"),
+        ("when does Jeopardy record", "Jeopardy"),
+    ],
+)
+def test_future_intent_title_is_extracted(prompt, expected):
+    f = extract_filters(prompt)
+    assert f.title == expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "what shows are going to record over the next 7 days",
+        "what is scheduled tonight",
+        "what did I record yesterday",
+    ],
+)
+def test_generic_future_query_captures_no_title(prompt):
+    # A generic scheduling question must not bind a bogus title.
+    assert extract_filters(prompt).title is None
+
+
+def test_compile_upcoming_title_filters_both_backends():
+    # SageTV upcoming now honors a title filter too, so a titled scheduling
+    # query must constrain both backends rather than dumping SageTV's library.
+    f = extract_filters("is Shark Tank scheduled to record next week")
+    res = compile_filters(f, upcoming=True, now=datetime(2026, 9, 30))
+    assert {c.target for c in res.calls} == {
+        "sagetv_upcoming", "channels_upcoming"
+    }
+    for call in res.calls:
+        assert call.args.get("title") == "Shark Tank"
+
+
