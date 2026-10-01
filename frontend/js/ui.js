@@ -298,15 +298,18 @@ const UI = (() => {
     const picker = el['device-picker'];
     picker.innerHTML = '<option value="">Select device...</option>';
 
-    // Show registered session-manager devices (online first; SageTV offline flagged)
+    // Only surface devices we can actually reach. SageTV contexts carry a
+    // reconciled `online` flag; other systems have no liveness signal so are
+    // treated as reachable. The current selection stays visible even if it
+    // just went offline, so the picker still reflects what's selected.
     if (devices && devices.length > 0) {
-      const isOfflineSage = d => d.system === 'sagetv' && !d.online;
-      const sorted = [...devices].sort((a, b) => (isOfflineSage(a) ? 1 : 0) - (isOfflineSage(b) ? 1 : 0));
-      sorted.forEach(d => {
+      const reachable = d => d.system !== 'sagetv' || !!d.online;
+      const shown = devices.filter(d => reachable(d) || d.device_id === selectedId);
+      shown.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.device_id;
         const base = d.friendly_name || d.device_id;
-        opt.textContent = isOfflineSage(d) ? `${base} (offline)` : base;
+        opt.textContent = reachable(d) ? base : `${base} (offline)`;
         if (d.device_id === selectedId) opt.selected = true;
         picker.appendChild(opt);
       });

@@ -41,8 +41,37 @@ object BridgeConfig {
     fun setEnabled(ctx: Context, enabled: Boolean) =
         prefs(ctx).edit().putBoolean(KEY_ENABLED, enabled).apply()
 
-    fun getDeviceName(ctx: Context): String =
-        prefs(ctx).getString(KEY_DEVICE_NAME, android.os.Build.MODEL) ?: android.os.Build.MODEL
+    fun getDeviceName(ctx: Context): String {
+        val stored = prefs(ctx).getString(KEY_DEVICE_NAME, "") ?: ""
+        return if (stored.isNotBlank()) stored else systemDeviceName(ctx)
+    }
+
+    /**
+     * Best-effort human-readable name for this device: the user-assigned name
+     * from Settings > About > Device name, then the Bluetooth name, falling
+     * back to a readable manufacturer + model. Avoids opaque model codes so
+     * the server's device list shows something people recognize.
+     */
+    fun systemDeviceName(ctx: Context): String {
+        val resolver = ctx.contentResolver
+        val sources = listOf<() -> String?>(
+            { android.provider.Settings.Global.getString(resolver, "device_name") },
+            { android.provider.Settings.Secure.getString(resolver, "bluetooth_name") },
+            { android.provider.Settings.System.getString(resolver, "device_name") },
+        )
+        for (get in sources) {
+            val v = try { get() } catch (_: Exception) { null }
+            if (!v.isNullOrBlank()) return v.trim()
+        }
+        val mfr = (android.os.Build.MANUFACTURER ?: "").trim()
+            .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        val model = (android.os.Build.MODEL ?: "").trim()
+        return when {
+            model.isBlank() -> if (mfr.isBlank()) "Android device" else mfr
+            mfr.isBlank() || model.startsWith(mfr, ignoreCase = true) -> model
+            else -> "$mfr $model"
+        }
+    }
 
     fun setDeviceName(ctx: Context, name: String) =
         prefs(ctx).edit().putString(KEY_DEVICE_NAME, name).apply()
