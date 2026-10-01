@@ -1204,6 +1204,7 @@
       if (!r) return;
       it.recordingId = r.recording_id || '';
       it.system = r.system || '';
+      it.upcoming = !!r.upcoming;
       it.channel = r.channel || '';
       it.startTime = (r.start_time != null) ? r.start_time : null;
       it.snippet = r.snippet || '';

@@ -229,7 +229,9 @@ const UI = (() => {
 
       const metaBits = [];
       if (it.dateStr) metaBits.push(esc(it.dateStr));
-      if (it.channel) metaBits.push(`(${esc(it.channel)})`);
+      if (it.channel && !(it.dateStr && it.dateStr.includes(it.channel))) {
+        metaBits.push(`(${esc(it.channel)})`);
+      }
       if (contentSearch && it.startTime != null) metaBits.push(`at ${esc(formatTime(it.startTime))}`);
       let metaHtml = metaBits.length ? `<span class="ec-meta">${metaBits.join(' · ')}</span>` : '';
       if (it.watched) {
@@ -243,9 +245,17 @@ const UI = (() => {
       const snip = (contentSearch && rawSnip)
         ? `<span class="ec-snippet">${esc(rawSnip.substring(0, 120))}…</span>` : '';
 
+      // Future/scheduled recordings have nothing to play yet — show which DVR
+      // owns the upcoming recording in place of the play button.
+      const dvrLabel = it.system === 'sagetv' ? 'SageTV'
+        : it.system === 'channelsdvr' ? 'Channels' : '';
+      const trailing = it.upcoming
+        ? (dvrLabel ? `<span class="ec-dvr-tag" title="Scheduled on ${esc(dvrLabel)}">${esc(dvrLabel)}</span>` : '')
+        : `<button class="ec-play-btn" title="Play on device">▶</button>`;
+
       card.innerHTML =
         `<div class="ec-text">${titleHtml}${metaHtml}${snip}</div>` +
-        `<button class="ec-play-btn" title="Play on device">▶</button>`;
+        trailing;
 
       bubble.appendChild(card);
     });

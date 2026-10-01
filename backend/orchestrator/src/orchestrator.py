@@ -2000,6 +2000,7 @@ class Orchestrator:
                 "start_time": _r.get("start_time") or None,
                 "system": _r.get("system"),
                 "recording_id": _r.get("id") or "",
+                "upcoming": True,
             })
 
         _win = (

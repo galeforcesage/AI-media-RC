@@ -381,6 +381,17 @@ body {
 }
 .ec-play-btn:hover { opacity: 0.8; }
 .ec-play-btn.loading { opacity: 0.4; pointer-events: none; }
+.ec-dvr-tag {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 .ec-title { font-weight: 600; }
 .ec-meta { font-size: 0.8rem; color: var(--text-muted); }
 .ec-snippet { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
