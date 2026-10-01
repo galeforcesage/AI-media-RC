@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import subprocess
 import time
 import uuid
@@ -43,6 +44,23 @@ logger = logging.getLogger(__name__)
 
 # How long to wait for a device to respond to a command
 _COMMAND_TIMEOUT = 10.0
+
+
+def _primary_lan_ip() -> str:
+    """Best-effort primary LAN IPv4 of this host.
+
+    Opens a UDP socket toward a public address — no packets are sent, but the
+    OS picks the egress interface, whose source address is the routable LAN IP
+    (e.g. 192.168.0.75). This avoids advertising a docker/veth address.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return ""
+    finally:
+        s.close()
 
 # How often to re-scan Bonjour for direct devices (seconds)
 _DISCOVERY_INTERVAL = 60
@@ -242,12 +260,18 @@ class BridgeManager:
     and direct (Apple TV) connections.
     """
 
+    # mDNS/Bonjour service type the Bridge APK browses for to auto-discover
+    # this server. Keep in sync with the APK's NsdManager service type.
+    MDNS_SERVICE_TYPE = "_airemote-bridge._tcp"
+    MDNS_SERVICE_NAME = "AI Media Remote Bridge"
+
     def __init__(self, auth_token: str = ""):
         self._auth_token = auth_token
         self._devices: Dict[str, ChannelsDevice] = {}
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._discovery_task: Optional[asyncio.Task] = None
+        self._mdns_proc: Optional[asyncio.subprocess.Process] = None
 
     @property
     def connected_devices(self) -> Dict[str, Dict]:
@@ -270,12 +294,17 @@ class BridgeManager:
         await site.start()
         logger.info("Bridge WebSocket listener on %s:%d", host, port)
 
+        # Advertise this endpoint over mDNS so the Bridge APK can auto-discover
+        # it (no manual host/port entry needed).
+        await self._start_mdns_advert(port)
+
         # Start periodic Bonjour discovery for direct devices (Apple TV)
         self._discovery_task = asyncio.ensure_future(self._discovery_loop())
 
     async def stop(self) -> None:
         if self._discovery_task:
             self._discovery_task.cancel()
+        await self._stop_mdns_advert()
         for dev in list(self._devices.values()):
             if isinstance(dev, BridgeDevice):
                 dev.resolve_pending_with_error()
@@ -285,6 +314,82 @@ class BridgeManager:
         self._devices.clear()
         if self._runner:
             await self._runner.cleanup()
+
+    # -----------------------------------------------------------------
+    # mDNS advertisement — lets the Bridge APK auto-discover this server
+    # -----------------------------------------------------------------
+
+    async def _start_mdns_advert(self, port: int) -> None:
+        """Publish an ``_airemote-bridge._tcp`` mDNS record for this endpoint.
+
+        Uses ``avahi-publish-service`` (already a dependency for Bonjour
+        discovery). The process stays alive for as long as the record should be
+        advertised, so we keep its handle and terminate it in :meth:`stop`.
+        Missing avahi is non-fatal — manual configuration still works.
+        """
+        txt = [
+            "path=/bridge",     # WebSocket path the APK connects to
+            "role=channels",    # which DVR bridge this is
+            "ver=1",
+        ]
+        lan_ip = _primary_lan_ip()
+        if lan_ip:
+            # Authoritative address for the APK — avahi otherwise publishes the
+            # host's record on every interface (docker/veth), so the client
+            # can't tell which one is the routable LAN IP.
+            txt.append(f"addr={lan_ip}")
+
+        # The watchdog hard-kills this process on restart, orphaning any prior
+        # avahi-publish child (it keeps advertising a stale record). Reap those
+        # first so exactly one current record is published.
+        try:
+            reaper = await asyncio.create_subprocess_exec(
+                "pkill", "-f", f"avahi-publish-service .* {self.MDNS_SERVICE_TYPE}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(reaper.wait(), timeout=5.0)
+        except Exception:
+            logger.debug("stale mDNS reaper skipped", exc_info=True)
+
+        try:
+            self._mdns_proc = await asyncio.create_subprocess_exec(
+                "avahi-publish-service",
+                self.MDNS_SERVICE_NAME,
+                self.MDNS_SERVICE_TYPE,
+                str(port),
+                *txt,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            logger.info(
+                "mDNS advertising %s (%s) on port %d",
+                self.MDNS_SERVICE_NAME, self.MDNS_SERVICE_TYPE, port,
+            )
+        except FileNotFoundError:
+            logger.warning(
+                "avahi-publish-service not found — Bridge APK auto-discovery "
+                "disabled; configure the server address manually."
+            )
+            self._mdns_proc = None
+        except Exception:
+            logger.exception("Failed to start mDNS advertisement")
+            self._mdns_proc = None
+
+    async def _stop_mdns_advert(self) -> None:
+        proc = self._mdns_proc
+        self._mdns_proc = None
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            except Exception:
+                logger.debug("mDNS advert cleanup error", exc_info=True)
 
     # -----------------------------------------------------------------
     # Bonjour discovery loop for Apple TV / direct devices
