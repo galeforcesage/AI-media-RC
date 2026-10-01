@@ -766,6 +766,18 @@ class Orchestrator:
             return prompt
 
         # ── 2) General NL date parsing via dateparser ────────────
+        # Explicit calendar dates (10/1, Oct 11, 2026-10-05, and ranges like
+        # "between 10/1 and 10/8" / "from Oct 1 to Oct 11") are resolved
+        # deterministically downstream with a current-year default. dateparser
+        # tends to drift a bare-year date into the wrong year, so leave such
+        # prompts unannotated and let the compiler handle them.
+        try:
+            from services.determine_filters import _DATE_ATOM_RE as _atom_re
+            if _atom_re.search(prompt):
+                return prompt
+        except Exception:
+            pass
+
         # Choose direction based on whether the prompt looks backward.
         prefer = "past" if self._PAST_HINT_RE.search(prompt) else "future"
         settings = {**self._DP_BASE, "PREFER_DATES_FROM": prefer}
@@ -1832,6 +1844,26 @@ class Orchestrator:
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         p = prompt.lower()
 
+        # An explicit calendar window ("between 10/1 and 10/8", "from Oct 1 to
+        # Oct 11", "on 10/5") wins over the relative horizons below. Resolve it
+        # straight from the date atoms in the prompt (earliest..latest) so the
+        # phrasing ("between/from/to/on") and span-capture quirks don't matter.
+        try:
+            from services.determine_filters import (
+                _DATE_ATOM_RE as _atom_re,
+                _parse_loose_date as _pld,
+            )
+            _atoms = _atom_re.findall(prompt)
+            if _atoms:
+                _days = [d for d in (_pld(a, now) for a in _atoms) if d]
+                if _days:
+                    return (
+                        min(_days).strftime("%Y-%m-%d"),
+                        max(_days).strftime("%Y-%m-%d"),
+                    )
+        except Exception:
+            logger.debug("explicit future window parse failed", exc_info=True)
+
         m = re.search(r"(?:next|coming)\s+(\d+)\s+days?", p)
         if m:
             n = int(m.group(1))
@@ -2074,6 +2106,37 @@ class Orchestrator:
 
         if not _rec_calls:
             return None
+
+        # A concrete window that reaches into the future is a scheduling
+        # question ("what records between 10/1 and 10/8"), not a past search.
+        # Redirect to the upcoming/scheduled tools when the window has no past
+        # days (starts today or later) and extends beyond today — the
+        # past-recordings tools would otherwise return nothing. A window that
+        # straddles today (starts in the past) stays on the past path so its
+        # already-recorded portion is still reported.
+        if _has_window:
+            _today = _dt.now().strftime("%Y-%m-%d")
+            _starts = [
+                c.args.get("start_date")
+                for c in _rec_calls
+                if c.args.get("start_date")
+            ]
+            _ends = [
+                c.args.get("end_date")
+                for c in _rec_calls
+                if c.args.get("end_date")
+            ]
+            _future = (
+                bool(_starts)
+                and min(_starts) >= _today
+                and max(_ends or _starts) > _today
+            )
+            if _future:
+                _up = await self._compiled_upcoming_listing(
+                    prompt, active, status_callback
+                )
+                if _up is not None:
+                    return _up
 
         if status_callback:
             await status_callback("Fetching DVR recordings")
