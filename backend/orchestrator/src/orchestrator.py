@@ -621,6 +621,15 @@ class Orchestrator:
     _LAST_N_MONTHS_RE = re.compile(
         r"\b(?:last|past)\s+(\d+)\s+months?\b", re.IGNORECASE
     )
+    # Forward horizons ("next/coming/upcoming 5 days", "next 2 weeks").
+    # Resolved to a today..today+N range so the whole window survives, rather
+    # than letting dateparser collapse them to a single day.
+    _NEXT_N_DAYS_RE = re.compile(
+        r"\b(?:next|coming|upcoming|following)\s+(\d+)\s+days?\b", re.IGNORECASE
+    )
+    _NEXT_N_WEEKS_RE = re.compile(
+        r"\b(?:next|coming|upcoming|following)\s+(\d+)\s+weeks?\b", re.IGNORECASE
+    )
 
     # dateparser settings — base config shared by all parses.
     _DP_BASE = {
@@ -655,6 +664,24 @@ class Orchestrator:
         now = datetime.now()
 
         # ── 1) Deterministic week ranges ─────────────────────────
+        m = self._NEXT_N_DAYS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            s = now.strftime("%Y-%m-%d")
+            e = (now + timedelta(days=n)).strftime("%Y-%m-%d")
+            prompt = self._NEXT_N_DAYS_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
+        m = self._NEXT_N_WEEKS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            s = now.strftime("%Y-%m-%d")
+            e = (now + timedelta(days=7 * n)).strftime("%Y-%m-%d")
+            prompt = self._NEXT_N_WEEKS_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
         m = self._LAST_N_DAYS_RE.search(prompt)
         if m:
             n = int(m.group(1))
