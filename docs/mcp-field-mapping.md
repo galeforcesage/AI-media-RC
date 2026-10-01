@@ -147,9 +147,11 @@ Source: SageX API `GetScheduledRecordings` → `sagetv_get_upcoming_recordings()
 | `Airing.Show.ShowEpisode` | ✅ `episode_title` | Episode name |
 | `Show.ShowSeasonNumber` + `ShowEpisodeNumber` | ✅ `season_episode` | Formatted "S01E05" |
 | `Airing.Channel.ChannelName` | ✅ `channel` | Channel name |
+| `Airing.AiringStartTime` | ✅ `air_date` | Short display date ("Mon Oct 7") |
 | `Airing.AiringStartTime` | ✅ `start_time` | Human-readable date |
 
-**5 fields per upcoming** — compact by default.
+**6 fields per upcoming** — compact by default. Supports `title`, `channel`,
+`start_date`, and `end_date` filters (all substring, case-insensitive).
 
 ---
 
@@ -190,7 +192,7 @@ request precisely what it needs instead of fetching everything.
 |------|:-----:|:-------:|:----------:|:--------:|:-------:|:--------:|:---------------:|:-----:|
 | `sagetv_search_recordings` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `sagetv_get_recordings` | | | | | | | | ✅ |
-| `sagetv_get_upcoming_recordings` | | | | | | | | |
+| `sagetv_get_upcoming_recordings` | ✅ | ✅ | ✅ | ✅ | | | | |
 | `sagetv_get_recent_recordings` | | | | | | | | ✅ |
 | `sagetv_search_shows` | query | | | | | | | |
 
