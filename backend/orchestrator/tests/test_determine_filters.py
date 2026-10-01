@@ -22,6 +22,7 @@ from services.determine_filters import (  # noqa: E402
     extract_filters,
     map_date_filter,
     resolve_date_range,
+    resolve_recorded_between,
     validate_capabilities,
 )
 
@@ -400,4 +401,46 @@ def test_compile_upcoming_title_filters_both_backends():
     for call in res.calls:
         assert call.args.get("title") == "Shark Tank"
 
+
+_NOW_2026 = datetime(2026, 9, 30, 20, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "prompt,start,end",
+    [
+        # No year listed → assume the current year (2026), not a stale one.
+        ("what shows record between 10/1 and 10/8", "2026-10-01", "2026-10-08"),
+        ("what did I record from 9/20 to 9/26", "2026-09-20", "2026-09-26"),
+        ("list recordings on 10/1", "2026-10-01", "2026-10-01"),
+        ("what recorded between Oct 1 and Oct 8", "2026-10-01", "2026-10-08"),
+        # An explicit year is still honored.
+        ("recordings between 10/1/2025 and 10/8/2025", "2025-10-01", "2025-10-08"),
+    ],
+)
+def test_numeric_date_range_defaults_to_current_year(prompt, start, end):
+    f = extract_filters(prompt)
+    assert f.recorded_between is not None
+    rng = resolve_recorded_between(f.recorded_between, now=_NOW_2026)
+    assert rng.start_utc.strftime("%Y-%m-%d") == start
+    assert rng.end_utc.strftime("%Y-%m-%d") == end
+
+
+def test_on_numeric_date_is_date_not_channel():
+    # "on 10/1" must be read as a date, never a channel number.
+    f = extract_filters("list recordings on 10/1")
+    assert f.channel is None
+    assert f.recorded_between is not None
+
+
+def test_numeric_range_compiles_both_backends():
+    # A concrete numeric window must query both DVRs, not just one.
+    f = extract_filters("what shows record between 10/1 and 10/8")
+    res = compile_filters(f, now=_NOW_2026)
+    rec = {c.target for c in res.calls
+           if c.target in ("sagetv_recordings", "channels_recordings")}
+    assert rec == {"sagetv_recordings", "channels_recordings"}
+    for call in res.calls:
+        if call.target in ("sagetv_recordings", "channels_recordings"):
+            assert call.args.get("start_date") == "2026-10-01"
+            assert call.args.get("end_date") == "2026-10-08"
 

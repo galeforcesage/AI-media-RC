@@ -284,6 +284,64 @@ _MONTHS = {
     "november": 11, "december": 12,
 }
 
+# Month names + common abbreviations, for loose numeric/worded date parsing.
+_MONTH_WORDS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12,
+    "december": 12,
+}
+
+# A single explicit calendar date: slash (M/D[/YY[YY]]), ISO (YYYY-MM-DD), or
+# a month name/abbrev followed by a day. The ``(?!\d)`` after the day keeps a
+# bare "October 2024" (month + year) from being misread as a day. Used both to
+# detect temporal spans in the prompt and to split explicit ranges.
+_DATE_ATOM = (
+    r"(?:\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+"
+    r"\d{1,2}(?:st|nd|rd|th)?(?!\d)(?:,?\s*\d{2,4})?)"
+)
+_DATE_ATOM_RE = re.compile(_DATE_ATOM, re.I)
+
+
+def _norm_year(raw: str | None, ref: datetime) -> int:
+    """Resolve a (possibly missing/2-digit) year, defaulting to ref.year."""
+    if not raw:
+        return ref.year
+    y = int(raw)
+    return y + 2000 if y < 100 else y
+
+
+def _parse_loose_date(token: str, ref: datetime) -> datetime | None:
+    """Parse one slash/ISO/worded date; a missing year assumes ref.year."""
+    t = token.strip().lower().strip(".,")
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        y, mo, d = (int(x) for x in m.groups())
+    else:
+        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", t)
+        if m:
+            mo, d = int(m.group(1)), int(m.group(2))
+            y = _norm_year(m.group(3), ref)
+        else:
+            m = re.fullmatch(
+                r"([a-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{2,4}))?", t
+            )
+            if not m:
+                return None
+            mo = _MONTH_WORDS.get(m.group(1))
+            if not mo:
+                return None
+            d = int(m.group(2))
+            y = _norm_year(m.group(3), ref)
+    try:
+        return datetime(y, mo, d)
+    except ValueError:
+        return None
+
+
 # Rolling "week" phrases → last 7 days (checked before calendar phrases).
 _ROLLING_WEEK_RE = re.compile(r"\b(?:last|past)\s+week\b", re.I)
 _PREVIOUS_WEEK_RE = re.compile(r"\bprevious\s+week\b", re.I)
@@ -358,6 +416,18 @@ def resolve_date_range(
         else:
             nxt = start.replace(month=start.month + 1)
         return start, nxt - timedelta(seconds=1)
+
+    # Explicit calendar dates (slash/ISO/worded), incl. ranges like
+    # "between 10/1 and 10/8" or "from Oct 1 to Oct 8". A missing year is
+    # assumed to be the current year (resolved against ``ref``). Multiple
+    # atoms → span from the earliest to the latest; a lone date → that day.
+    _atoms = _DATE_ATOM_RE.findall(exp)
+    if _atoms:
+        _parsed = [d for d in (_parse_loose_date(a, ref) for a in _atoms) if d]
+        if _parsed:
+            start, _ = _day_bounds(min(_parsed))
+            _, end = _day_bounds(max(_parsed))
+            return start, end
 
     # Absolute ISO date(s): "2026-09-29" or "2026-09-20 to 2026-09-26".
     iso = re.findall(r"\d{4}-\d{2}-\d{2}", exp)
@@ -650,6 +720,10 @@ _TEMPORAL_PATTERNS = [
     r"tonight",
     r"recently",
     r"lately",
+    rf"between\s+{_DATE_ATOM}\s+(?:and|to|through|thru|until|till|[-\u2013\u2014])\s+{_DATE_ATOM}",
+    rf"from\s+{_DATE_ATOM}\s+(?:to|through|thru|until|till|[-\u2013\u2014])\s+{_DATE_ATOM}",
+    rf"{_DATE_ATOM}\s*(?:to|through|thru|until|till|[-\u2013\u2014])\s*{_DATE_ATOM}",
+    _DATE_ATOM,
     r"\d{4}-\d{2}-\d{2}(?:\s+to\s+\d{4}-\d{2}-\d{2})?",
 ]
 _TEMPORAL_RE = re.compile("|".join(f"(?:{p})" for p in _TEMPORAL_PATTERNS), re.I)
@@ -787,6 +861,17 @@ def extract_filters(prompt: str) -> DetermineFilters:
                 consume(gm)
                 break
 
+    # 7b) Temporal expression (captured raw; resolved deterministically).
+    #     Run before channel so an explicit date in "on 10/1" is claimed as a
+    #     date rather than mistaken for a channel number.
+    m = _TEMPORAL_RE.search(working)
+    if m and "original_air_date" not in f:
+        f["recorded_between"] = DateRange(expression=_tidy(m.group(0)))
+        consume(m)
+    elif m and "original_air_date" in f:
+        # A year already routed to original_air_date; drop temporal noise.
+        consume(m)
+
     # 8) Channel ("on <Channel>" / "channel <X>").
     m = re.search(r"\bchannel\s+([A-Za-z0-9][\w.-]*)\b", working, re.I)
     if not m:
@@ -804,15 +889,6 @@ def extract_filters(prompt: str) -> DetermineFilters:
     )
     if m:
         f["episode_title"] = _clean_entity(m.group(1))
-        consume(m)
-
-    # 10) Temporal expression (captured raw; resolved deterministically).
-    m = _TEMPORAL_RE.search(working)
-    if m and "original_air_date" not in f:
-        f["recorded_between"] = DateRange(expression=_tidy(m.group(0)))
-        consume(m)
-    elif m and "original_air_date" in f:
-        # A year already routed to original_air_date; drop temporal noise.
         consume(m)
 
     # 11) Watched state.
