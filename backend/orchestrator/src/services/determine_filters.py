@@ -910,6 +910,18 @@ _TITLE_REJECT = frozenset({
     "recording", "recordings", "episode", "episodes",
 })
 
+# Tokens that can never, on their own, constitute a real show title. Used to
+# reject an all-filler capture (e.g. "going to", "it") so a case-insensitive
+# scheduling cue doesn't bind a bogus title from a generic phrasing like
+# "what shows are going to record over the next 7 days".
+_TITLE_FILLER = _TITLE_REJECT | frozenset({
+    "is", "are", "was", "were", "will", "going", "gonna", "to", "about",
+    "set", "record", "records", "recorded", "scheduled", "schedule",
+    "air", "airs", "airing", "aired", "over", "next", "coming", "about",
+    "tonight", "today", "tomorrow", "anything", "something", "everything",
+    "on", "for", "of", "and", "at", "in", "going to", "gonna",
+})
+
 
 def _clean_title_candidate(cand: str | None) -> str | None:
     """Normalize a raw title capture and reject bare interrogatives/fillers."""
@@ -924,20 +936,27 @@ def _clean_title_candidate(cand: str | None) -> str | None:
         r"^(?:find|list|get|see|view|display)\s+", "", cand, flags=re.I
     ).strip()
     cand = _clean_entity(cand)
-    return cand or None
+    if not cand:
+        return None
+    # Reject a capture made entirely of filler/stopwords (e.g. "going to").
+    _toks = [t for t in re.split(r"\s+", cand.lower()) if t]
+    if _toks and all(t in _TITLE_FILLER for t in _toks):
+        return None
+    return cand
 
 
-# Future/scheduling-intent title cue: a proper-noun subject that precedes a
-# scheduling verb, e.g. "is Shark Tank scheduled", "will Survivor record next
-# week", "did NCIS record last night". Case-sensitive on purpose so generic
-# phrasings ("what shows are going to record ...") don't capture a title.
-_FT_PROPER = r"[A-Z0-9][\w'\u2019.&:-]*"
+# Future/scheduling-intent title cue: the subject that precedes a scheduling
+# verb, e.g. "is Shark Tank scheduled", "will survivor record next week",
+# "did NCIS record last night". Case-insensitive; an all-filler capture (e.g.
+# "what shows are going to record ...") is rejected by _clean_title_candidate.
+_FT_WORD = r"[A-Za-z0-9][\w'\u2019.&:-]*"
 _FUTURE_TITLE_RE = re.compile(
     r"\b(?:is|are|will|was|were|does|do|did|"
     r"when\s+(?:is|are|will|does|do|did))\s+"
-    rf"({_FT_PROPER}(?:\s+(?:and|of|the|&)\s+{_FT_PROPER}|\s+{_FT_PROPER})*)\s+"
+    rf"({_FT_WORD}(?:\s+(?:and|of|the|&)\s+{_FT_WORD}|\s+{_FT_WORD})*?)\s+"
     r"(?:scheduled|going\s+to\s+record|gonna\s+record|about\s+to\s+record|"
-    r"set\s+to\s+record|record(?:ing|s|ed)?|air(?:ing|s|ed)?)\b"
+    r"set\s+to\s+record|record(?:ing|s|ed)?|air(?:ing|s|ed)?)\b",
+    re.I,
 )
 
 

@@ -361,6 +361,11 @@ def test_compile_upcoming_respects_active_systems():
         ("did NCIS record last night", "NCIS"),
         ("is Law and Order scheduled tomorrow", "Law and Order"),
         ("when does Jeopardy record", "Jeopardy"),
+        # Case-insensitive: lowercase subjects must bind just the same.
+        ("is shark tank scheduled to record next week", "shark tank"),
+        ("will survivor record next week", "survivor"),
+        ("did ncis record last night", "ncis"),
+        ("is law and order scheduled tomorrow", "law and order"),
     ],
 )
 def test_future_intent_title_is_extracted(prompt, expected):
@@ -374,6 +379,9 @@ def test_future_intent_title_is_extracted(prompt, expected):
         "what shows are going to record over the next 7 days",
         "what is scheduled tonight",
         "what did I record yesterday",
+        "did anything record yesterday",
+        "will it record tonight",
+        "is anything scheduled",
     ],
 )
 def test_generic_future_query_captures_no_title(prompt):
