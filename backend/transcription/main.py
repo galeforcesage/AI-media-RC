@@ -51,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--whisper-threads", type=int, default=_quarter, help=f"CPU threads for Whisper inference (default: {_quarter}, 25%% of cores)")
     p.add_argument("--ffmpeg-threads", type=int, default=_ffmpeg, help=f"CPU threads for ffmpeg extraction (default: {_ffmpeg})")
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--gpu-idle-timeout", type=float, default=600.0,
+                   help="Release Whisper/diarization models after this many seconds "
+                        "with an empty queue, freeing VRAM (0 disables; default: 600)")
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
     p.add_argument("--no-live", action="store_true", help="Disable live/incremental transcription during recording")
@@ -154,6 +157,7 @@ async def run(args: argparse.Namespace) -> None:
             extractor=extractor,
             engine=engine,
             concurrency=args.concurrency,
+            gpu_idle_timeout=args.gpu_idle_timeout,
         )
         # Wire enrichment pipeline with configurable MCP endpoints
         worker.enrichment = MetadataEnrichmentPipeline(

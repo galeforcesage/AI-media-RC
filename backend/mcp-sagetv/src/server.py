@@ -22,6 +22,25 @@ from .tools import TOOL_REGISTRY, Safety
 logger = logging.getLogger(__name__)
 
 
+# Tools that act on a live SageTV UI context (placeshifter / extender / client).
+# These MUST be rejected when the target context is not currently connected, so
+# the remote cannot keep "controlling" a client that has exited SageTV.
+CONTROL_TOOLS: Set[str] = {
+    # transport / playback
+    "sagetv_pause_playback", "sagetv_resume_playback", "sagetv_toggle_playback",
+    "sagetv_stop_playback", "sagetv_skip_forward", "sagetv_skip_back",
+    "sagetv_seek_relative", "sagetv_seek_absolute", "sagetv_set_volume",
+    "sagetv_mute", "sagetv_unmute", "sagetv_tune_channel", "sagetv_commercial_skip",
+    # remote-button navigation
+    "sagetv_open_recordings", "sagetv_open_guide", "sagetv_open_home",
+    "sagetv_open_live_tv", "sagetv_channel_up", "sagetv_channel_down",
+    "sagetv_nav_up", "sagetv_nav_down", "sagetv_nav_left", "sagetv_nav_right",
+    "sagetv_nav_select", "sagetv_nav_back", "sagetv_nav_options",
+    "sagetv_page_up", "sagetv_page_down", "sagetv_toggle_cc",
+    "sagetv_close", "sagetv_power_off",
+}
+
+
 class SageTVMCPServer:
     """MCP server for SageTV — exposes tools, resources, and prompts."""
 
@@ -44,6 +63,10 @@ class SageTVMCPServer:
         self._consecutive_failures: int = 0
         self._FAILURE_THRESHOLD: int = 2  # mark offline after N failures
         self._RECOVERY_CHECK_INTERVAL: float = 30.0  # seconds between recovery probes
+        # Live UI-context cache — gates control commands on client presence
+        self._ctx_cache: Optional[Set[str]] = None
+        self._ctx_cache_ts: float = 0.0
+        self._CTX_CACHE_TTL: float = 2.0  # seconds
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -216,6 +239,29 @@ class SageTVMCPServer:
                 "isError": True,
             }
 
+        # ---- Liveness gate: control tools require a connected client ----
+        # When the target SageTV UI context (placeshifter/extender) is no longer
+        # connected, reject the command so the remote can't act on a client that
+        # has exited. Fail closed if the context list can't be determined.
+        if tool_name in CONTROL_TOOLS:
+            ctx = str(arguments.get("session_id", "") or "")
+            live = await self._live_contexts()
+            offline = (live is None) or (ctx and ctx not in live) or (not ctx and not live)
+            if offline:
+                if ctx:
+                    msg = ("The selected SageTV client is not connected. Remote "
+                           "control is unavailable until it reconnects.")
+                else:
+                    msg = "No SageTV client is connected, so there is nothing to control."
+                return {
+                    "content": [{"type": "text", "text": json.dumps({
+                        "success": False,
+                        "error": "client_offline",
+                        "message": msg,
+                    })}],
+                    "isError": False,
+                }
+
         # Safety gate
         if entry.get("safety") in (Safety.CONFIRM, Safety.DANGEROUS, Safety.OWNER):
             confirmed = arguments.pop("_confirmed", False)
@@ -273,7 +319,31 @@ class SageTVMCPServer:
                 "isError": True,
             }
 
-    async def _handle_list_resources(self, params: Dict) -> Dict:
+    async def _live_contexts(self) -> Optional[Set[str]]:
+        """Return the set of currently-connected SageTV UI context IDs.
+
+        Result is cached briefly so rapid button presses don't hammer sagex.
+        Returns None when the context list can't be determined, which callers
+        treat as "offline" (fail closed) for control gating.
+        """
+        now = time.time()
+        if self._ctx_cache is not None and (now - self._ctx_cache_ts) < self._CTX_CACHE_TTL:
+            return self._ctx_cache
+        try:
+            names = await self.sagex.call("GetUIContextNames")
+        except Exception as exc:
+            logger.warning("GetUIContextNames failed during liveness check: %s", exc)
+            return None
+        if names is None:
+            names = []
+        if isinstance(names, str):
+            names = [names]
+        live = {str(n) for n in names if n}
+        self._ctx_cache = live
+        self._ctx_cache_ts = now
+        return live
+
+    async def _handle_list_resources(self, params: Dict) -> Dict: 
         return {"resources": [
             {"uri": "sagetv://media/recordings", "name": "Recordings", "mimeType": "application/json"},
             {"uri": "sagetv://media/videos", "name": "Imported Videos", "mimeType": "application/json"},

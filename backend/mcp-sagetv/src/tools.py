@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import enum
 import logging
+import os
 import re
 from typing import Any, Callable, Coroutine, Dict
 
@@ -55,6 +56,16 @@ def _epoch_ms_to_readable(epoch_ms: int) -> str:
         return dt.strftime("%Y-%m-%d %I:%M %p")
     except (ValueError, OSError, TypeError):
         return ""
+
+
+def _epoch_ms_year(epoch_ms: int) -> int | None:
+    """Return the calendar year for an epoch-ms timestamp, or None."""
+    try:
+        if not epoch_ms:
+            return None
+        return datetime.datetime.fromtimestamp(int(epoch_ms) / 1000.0).year
+    except (ValueError, OSError, TypeError):
+        return None
 
 
 def _date_str_to_epoch_ms(date_str: str, end_of_day: bool = False) -> int:
@@ -136,12 +147,17 @@ def _slim_recording(mf: Dict) -> Dict:
         "season_episode": se,
         "channel": channel.get("ChannelName", ""),
         "recorded": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
+        "record_date": int(start_ms) // 1000 if start_ms else None,
         "duration_min": round((mf.get("FileDuration", 0) or 0) / 60000, 1),
         "description": show.get("ShowDescription", ""),
         "genres": show.get("ShowCategory", ""),
         "image": show.get("ShowImage", ""),
         "cast": show.get("PeopleListInShow", []),
         "content_rating": show.get("ShowParentalRating", ""),
+        "original_air_epoch": (
+            int(show.get("OriginalAiringDate")) // 1000
+            if show.get("OriginalAiringDate") else None
+        ),
         "watched": bool(airing.get("IsWatched", False)),
     }
     # Status: SageTV files are always on disk (no trash concept).
@@ -310,6 +326,8 @@ async def sagetv_get_recordings(client: SageXClient, args: Dict) -> Dict:
 async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dict:
     start_date_str = args.get("start_date", "")
     end_date_str = args.get("end_date", "")
+    title_filter = str(args.get("title", "")).strip().lower()
+    channel_filter = str(args.get("channel", "")).strip().lower()
     data = await client.call("GetScheduledRecordings")
     if not data or not isinstance(data, list):
         return _ok(data=[], message="No upcoming recordings")
@@ -343,6 +361,22 @@ async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dic
             if range_end and air_dt > range_end:
                 continue
 
+        show_title = show.get("ShowTitle", "") or ""
+        episode_title = show.get("ShowEpisode", "") or ""
+        chan_name = channel.get("ChannelName", "") or ""
+        chan_number = str(channel.get("ChannelNumber", "") or "")
+
+        # Apply title filter (substring over title + episode title).
+        if title_filter:
+            _hay = f"{show_title} {episode_title}".lower()
+            if title_filter not in _hay:
+                continue
+        # Apply channel filter (substring over channel name or number).
+        if channel_filter:
+            if (channel_filter not in chan_name.lower()
+                    and channel_filter not in chan_number.lower()):
+                continue
+
         season = show.get("ShowSeasonNumber")
         episode = show.get("ShowEpisodeNumber")
         se = f"S{season:02d}E{episode:02d}" if isinstance(season, int) and isinstance(episode, int) else ""
@@ -356,10 +390,10 @@ async def sagetv_get_upcoming_recordings(client: SageXClient, args: Dict) -> Dic
             except Exception:
                 pass
         slimmed.append({
-            "title": show.get("ShowTitle", ""),
-            "episode_title": show.get("ShowEpisode", ""),
+            "title": show_title,
+            "episode_title": episode_title,
             "season_episode": se,
-            "channel": channel.get("ChannelName", ""),
+            "channel": chan_name,
             "air_date": air_date_str,
             "start_time": _epoch_ms_to_readable(int(start_ms)) if start_ms else "",
         })
@@ -820,14 +854,48 @@ async def sagetv_get_commercial_segments(client: SageXClient, args: Dict) -> Dic
 # ENTITY LOOKUP TOOLS
 # ==================================================================
 
+async def _find_mediafile_by_basename(client: SageXClient, file_path: str) -> Any:
+    """Resolve a raw SageTV MediaFile by matching its on-disk filename.
+
+    Channels-DVR-imported files are named ``{Title}-{ChannelsID}-{Segment}.mpg``
+    where the middle number is the *Channels DVR* recording ID, NOT the SageTV
+    MediaFileID. Looking such a file up by the embedded number fails, so we fall
+    back to scanning the full library and matching on the SegmentFiles basename.
+    """
+    if not file_path:
+        return None
+    stem = os.path.basename(str(file_path))
+    stem_noext = os.path.splitext(stem)[0]
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
+    items = data if isinstance(data, list) else []
+    for mf in items:
+        segs = mf.get("SegmentFiles") or []
+        if isinstance(segs, str):
+            segs = [segs]
+        for sp in segs:
+            b = os.path.basename(str(sp))
+            if b == stem or os.path.splitext(b)[0] == stem_noext:
+                return mf
+    return None
+
+
 async def sagetv_get_recording(client: SageXClient, args: Dict) -> Dict:
-    """Get a single recording by MediaFile ID — fully hydrated with Airing + Show."""
-    media_file_id = str(args.get("media_file_id", ""))
-    if not media_file_id:
-        return _fail("missing_media_file_id", "MediaFile ID is required")
-    mf = await client.call("GetMediaFileForID", [media_file_id])
+    """Get a single recording — fully hydrated with Airing + Show.
+
+    Resolves by MediaFile ID when given; falls back to matching an on-disk
+    filename (``file_path``) so Channels-DVR-imported files — whose filename
+    embeds the Channels ID rather than the SageTV MediaFileID — still resolve.
+    """
+    media_file_id = str(args.get("media_file_id", "") or "")
+    file_path = str(args.get("file_path", "") or args.get("filename", "") or "")
+    mf = None
+    if media_file_id:
+        mf = await client.call("GetMediaFileForID", [media_file_id])
+    if not mf and file_path:
+        mf = await _find_mediafile_by_basename(client, file_path)
     if not mf:
-        return _fail("not_found", f"MediaFile {media_file_id} not found")
+        return _fail("not_found",
+                     f"MediaFile not found (id={media_file_id!r} file={file_path!r})")
     return _ok(data=mf, message="Recording retrieved")
 
 
@@ -914,6 +982,15 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     watched = args.get("watched")
     archived = args.get("archived")
     recording_state = args.get("recording_state")
+    character = args.get("character", "")
+    original_air_year = args.get("original_air_year")
+    if original_air_year is not None:
+        try:
+            original_air_year = int(original_air_year)
+        except (TypeError, ValueError):
+            original_air_year = None
+        if original_air_year == 0:
+            original_air_year = None
     limit = int(args.get("limit", 50))
 
     # ── Sanitize LLM-provided args ──
@@ -927,7 +1004,7 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
     if watched is False:
         watched = None
 
-    data = await client.call("GetMediaFiles", ["T"])
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
     if not data or not isinstance(data, list):
         return _ok(data=[], message="No recordings found")
 
@@ -968,6 +1045,20 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
             if genre.lower() not in rec_cat.lower():
                 continue
 
+        if character:
+            # PeopleAndCharacterListInShow entries are "Actor Name -- Character".
+            pac = show.get("PeopleAndCharacterListInShow") or []
+            roles = []
+            for entry in pac:
+                if isinstance(entry, str) and "--" in entry:
+                    roles.append(entry.split("--", 1)[1].strip().lower())
+            if not any(character.lower() in r for r in roles):
+                continue
+
+        if original_air_year is not None:
+            if _epoch_ms_year(show.get("OriginalAiringDate")) != original_air_year:
+                continue
+
         if season is not None:
             rec_season = show.get("ShowSeasonNumber", 0)
             if int(season) != int(rec_season):
@@ -1004,8 +1095,18 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
                 continue
 
         results.append(mf)
-        if len(results) >= limit:
-            break
+
+    # Full library is import-ordered (oldest first); sort matches by real
+    # recording start time so the newest recordings surface, then cap.
+    def _raw_start(mf: Dict) -> int:
+        air = mf.get("Airing") or {}
+        try:
+            return int(mf.get("FileStartTime") or air.get("AiringStartTime") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    results.sort(key=_raw_start, reverse=True)
+    results = results[:limit]
 
     slimmed = _slim_recordings(results)
     n_avail = sum(1 for r in slimmed if r.get("status") == "available")
@@ -1021,13 +1122,45 @@ async def sagetv_search_recordings(client: SageXClient, args: Dict) -> Dict:
 
 
 async def sagetv_get_recent_recordings(client: SageXClient, args: Dict) -> Dict:
-    """Get the most recently completed recordings."""
-    limit = int(args.get("limit", 20))
-    data = await client.call("GetMediaFiles", ["T"], size=limit)
-    if not data:
-        return _ok(data=[], message="No recent recordings")
+    """Get the most recently completed recordings.
+
+    SageTV's GetMediaFiles returns files in ASCENDING import order, so a bounded
+    fetch (size=N) returns the OLDEST N files, not the newest. To answer "what
+    recorded recently" we must pull the full library and sort by the real
+    recording start time (FileStartTime). A `days` window then filters to the
+    last N days by that real time so the result is truthful.
+    """
+    days = args.get("days")
+    try:
+        days = int(days) if days not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        days = None
+    if days is not None and days <= 0:
+        days = None
+    limit = int(args.get("limit", 50 if days else 20))
+    # Pull the whole library (size caps at the real total) so the newest
+    # recordings — which sit at the tail of the import-ordered list — are seen.
+    data = await client.call("GetMediaFiles", ["T"], size=100000)
     items = data if isinstance(data, list) else []
-    return _ok(data=_slim_recordings(items), message=f"{len(items)} recent recordings")
+    if not items:
+        return _ok(data=[], message="No recent recordings")
+
+    def _raw_start(mf: Dict) -> int:
+        air = mf.get("Airing") or {}
+        try:
+            return int(mf.get("FileStartTime") or air.get("AiringStartTime") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    items.sort(key=_raw_start, reverse=True)
+    if days is not None:
+        import time as _time
+        cutoff_ms = (int(_time.time()) - days * 86400) * 1000
+        items = [mf for mf in items if _raw_start(mf) >= cutoff_ms]
+    items = items[:limit]
+    slim = _slim_recordings(items)
+    suffix = f" in the last {days} days" if days is not None else ""
+    return _ok(data=slim, message=f"{len(slim)} recent recordings{suffix}")
 
 
 async def sagetv_get_active_recordings(client: SageXClient, args: Dict) -> Dict:
@@ -1208,10 +1341,12 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_get_recordings,
     },
     "sagetv_get_upcoming_recordings": {
-        "description": "List upcoming scheduled recordings, optionally filtered by date range.",
+        "description": "List upcoming scheduled recordings, optionally filtered by date range, title, and channel.",
         "input_schema": {"type": "object", "properties": {
             "start_date": {"type": "string", "description": "Range start YYYY-MM-DD"},
             "end_date": {"type": "string", "description": "Range end YYYY-MM-DD"},
+            "title": {"type": "string", "description": "Filter by show title (substring, case-insensitive)"},
+            "channel": {"type": "string", "description": "Filter by channel name or number (substring, case-insensitive)"},
         }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_upcoming_recordings,
@@ -1469,10 +1604,11 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
     # ---- Entity Lookup ----
     "sagetv_get_recording": {
-        "description": "Get a single recording by MediaFile ID, fully hydrated with Airing + Show + Channel data. Returns: mediaFileId, filePath, fileSize, startTime, endTime, duration, isRecording, isComplete, isWatched, isArchived, recordingQuality, container, resolution, airingId, showId, channelId, and user properties.",
+        "description": "Get a single recording by MediaFile ID (or by on-disk file_path when the ID is unknown), fully hydrated with Airing + Show + Channel data. Returns: mediaFileId, filePath, fileSize, startTime, endTime, duration, isRecording, isComplete, isWatched, isArchived, recordingQuality, container, resolution, airingId, showId, channelId, and user properties.",
         "input_schema": {"type": "object", "properties": {
             "media_file_id": {"type": "string", "description": "The MediaFile ID"},
-        }, "required": ["media_file_id"]},
+            "file_path": {"type": "string", "description": "On-disk recording path or filename; used to resolve the MediaFile when media_file_id is unknown or wrong (e.g. Channels-DVR-imported files)."},
+        }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_recording,
     },
@@ -1509,11 +1645,12 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_list_genres,
     },
     "sagetv_search_recordings": {
-        "description": "Search recordings with filters: title, episode_title, actor, genre, channel, season, episode, date range, watched, archived, recording state.",
+        "description": "Search recordings with filters: title, episode_title, actor, character, genre, channel, season, episode, date range, original_air_year, watched, archived, recording state.",
         "input_schema": {"type": "object", "properties": {
             "title": {"type": "string", "description": "Show name substring filter (case-insensitive). Use the SHOW NAME only."},
             "episode_title": {"type": "string", "description": "Episode title/name substring filter (case-insensitive)."},
             "actor": {"type": "string", "description": "Actor/cast member name substring filter (case-insensitive)."},
+            "character": {"type": "string", "description": "Character/role name substring filter (case-insensitive), matched against the character side of the cast list."},
             "genre": {"type": "string", "description": "Genre/category substring filter (e.g. 'drama', 'comedy'). Use sagetv_list_genres to see valid values."},
             "channel": {"type": "string", "description": "Channel number or name filter"},
             "season": {"type": "integer", "description": "Season number filter (e.g. 3 for S03)"},
@@ -1522,6 +1659,7 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD). Preferred over end_time."},
             "start_time": {"type": "integer", "description": "Minimum start time (epoch ms). Use start_date instead."},
             "end_time": {"type": "integer", "description": "Maximum end time (epoch ms). Use end_date instead."},
+            "original_air_year": {"type": "integer", "description": "Original-air-date year filter (e.g. 2019). Matches the episode's first-aired year, not the recording date."},
             "watched": {"type": "boolean", "description": "Filter by watched status"},
             "archived": {"type": "boolean", "description": "Filter by archived/library status"},
             "recording_state": {"type": "string", "enum": ["recording", "complete"], "description": "Filter by recording state"},
@@ -1531,9 +1669,10 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "handler": sagetv_search_recordings,
     },
     "sagetv_get_recent_recordings": {
-        "description": "Get the most recently completed recordings.",
+        "description": "Get the most recently completed recordings. Pass 'days' to restrict to recordings whose air/record date is within the last N days (filtered by real recording time, not import order).",
         "input_schema": {"type": "object", "properties": {
-            "limit": {"type": "integer", "description": "Max results (default 20)"},
+            "limit": {"type": "integer", "description": "Max results (default 20, or 50 when days is set)"},
+            "days": {"type": "integer", "description": "Only include recordings from the last N days (by actual record date)"},
         }},
         "safety": Safety.SAFE,
         "handler": sagetv_get_recent_recordings,

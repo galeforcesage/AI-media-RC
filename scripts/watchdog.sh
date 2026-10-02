@@ -161,7 +161,11 @@ run_watchdog() {
                     echo "[$(date '+%F %T')] HEALTH CHECK FAILED: $svc port $port not listening after $health_fails checks — killing pid $child" >> "$wlog"
                     emit_alert "$svc" "warning" "health_check_failed" "port $port not listening after $health_fails checks; killing pid $child"
                     kill "$child" 2>/dev/null
-                    sleep 2
+                    # Grace period for graceful shutdown (GPU lease release)
+                    for _ in $(seq 1 10); do
+                        kill -0 "$child" 2>/dev/null || break
+                        sleep 0.5
+                    done
                     kill -9 "$child" 2>/dev/null
                     wait "$child" 2>/dev/null
                     exit_code=1  # treat as crash
@@ -276,15 +280,28 @@ stop_service() {
         rm -f "$PIDFILE_DIR/${svc}-watchdog.pid"
     fi
 
-    # Then kill the service
+    # Then send SIGTERM and give the service time to shut down gracefully —
+    # this lets the orchestrator release any held GPU lease before exit.
     if [[ -f "$PIDFILE_DIR/${svc}.pid" ]]; then
         local spid
         spid=$(cat "$PIDFILE_DIR/${svc}.pid")
-        kill "$spid" 2>/dev/null && echo "  $svc: service (pid $spid) stopped"
+        if kill "$spid" 2>/dev/null; then
+            echo "  $svc: service (pid $spid) sent SIGTERM, waiting for graceful shutdown"
+            # Wait up to ~10s for a clean shutdown (GPU lease release, etc.)
+            for _ in $(seq 1 20); do
+                kill -0 "$spid" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "$spid" 2>/dev/null; then
+                kill -9 "$spid" 2>/dev/null && echo "  $svc: service (pid $spid) force-killed after grace period"
+            else
+                echo "  $svc: service stopped cleanly"
+            fi
+        fi
         rm -f "$PIDFILE_DIR/${svc}.pid"
     fi
 
-    # Belt-and-suspenders: kill anything on the port
+    # Belt-and-suspenders: kill anything still bound to the port
     fuser -k "$port/tcp" 2>/dev/null || true
 }
 

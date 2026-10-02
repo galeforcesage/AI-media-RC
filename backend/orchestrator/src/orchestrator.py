@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 from utils.logger import get_logger
 from registry.commands import CommandRegistry
 from services.llm import LLMService
+from services.lease import load_lease_manager
 from services.whisper import WhisperService
 from services.tts import TTSService
 from services.llm_pipeline import LLMPipeline
@@ -36,6 +37,7 @@ from services.openclaw_planner import OpenClawPlanner
 from services.planner_registry import PlannerRegistry
 from services.semantic_index import SemanticIndex
 from services.entity_context import EntityContextStore
+from services.conversation_memory import ConversationMemory
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
@@ -56,6 +58,15 @@ class Orchestrator:
         self.registry = CommandRegistry()
 
         # Core AI services
+        # Optional GPU-lease manager. A private plugin (named by the
+        # GPU_ROUTER_PLUGIN env var) can share the GPU with other apps via
+        # short leases; when no plugin is configured this is a no-op that uses
+        # the static base_url/model below. Either way the LLM fails open.
+        self.gpu_router = load_lease_manager(
+            config.get("gpu_router", {}),
+            fallback_base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
+            fallback_model=config.get("llm", {}).get("model", "hermes3:8b"),
+        )
         self.llm = LLMService(
             model_path=config.get("llm", {}).get("model_path", "models/llm"),
             base_url=config.get("llm", {}).get("base_url", "http://127.0.0.1:11434"),
@@ -65,6 +76,7 @@ class Orchestrator:
             num_predict=config.get("llm", {}).get("num_predict", 512),
             num_ctx=config.get("llm", {}).get("num_ctx", 4096),
             max_concurrent=config.get("llm", {}).get("max_concurrent", 1),
+            lease_manager=self.gpu_router,
         )
         self.whisper = WhisperService(
             model_path=config.get("whisper", {}).get("model_path", "models/whisper"),
@@ -127,6 +139,12 @@ class Orchestrator:
             ttl=config.get("entity_ttl", 600.0),
         )
 
+        # Per-session short-term Q&A memory (follow-up questions).
+        self.conversation_memory = ConversationMemory(
+            max_turns=config.get("conversation_max_turns", 4),
+            ttl=config.get("conversation_ttl", 1800.0),
+        )
+
         # Transcription queue
         self.transcription_queue = TranscriptionQueue(
             worker=self.whisper.transcribe,
@@ -154,18 +172,93 @@ class Orchestrator:
         # Session manager URL for device → session_id resolution
         self._session_url = config.get("session_manager_url", "http://127.0.0.1:8769")
 
-    def _resolve_planner_name(self, metadata: Dict[str, Any] | None = None) -> str:
-        """Resolve planner name from request metadata, then config defaults."""
+    # Heuristics for the "auto" router: multi-step / reasoning-heavy queries
+    # are sent to OpenClaw; everything else stays on the fast local AgentLoop.
+    # Kept intentionally conservative so the vast majority of remote commands
+    # never pay the OpenClaw latency tax.
+    _COMPLEX_PATTERNS = [
+        re.compile(p, re.IGNORECASE)
+        for p in (
+            r"\bkeep only\b",
+            r"\bdelete\b.*\b(keep|only|except)\b",
+            r"\bbuild (me )?a\b",
+            r"\bmake (me )?a\b.*\b(playlist|list|schedule|lineup)\b",
+            r"\bplaylist\b",
+            r"\bline ?up\b",
+            r"\bsuggest\b",
+            r"\brecommend\b",
+            r"\bwhat should (i|we)\b",
+            r"\bcompare\b",
+            r"\borgani[sz]e\b",
+            r"\bclean ?up\b",
+            r"\bfind (every|all)\b.*\b(and|then|only|keep|delete)\b",
+            r"\band then\b",
+            r"\bmarathon\b",
+            r"\bfor (my |the )?(family|kids|tonight|us)\b",
+            r"\bplan (me |us |out )?\b",
+            r"\bfigure out\b",
+        )
+    ]
+
+    def _classify_planner(self, prompt: str | None) -> str:
+        """Route complex/multi-step queries to OpenClaw, simple ones local.
+
+        Only ever returns "openclaw" when OpenClaw is enabled in config;
+        otherwise (and for any simple query) returns "agentloop".
+        """
+        openclaw_enabled = bool(
+            self.config.get("agent", {}).get("openclaw", {}).get("enabled", False)
+        )
+        if not openclaw_enabled:
+            return "agentloop"
+
+        text = (prompt or "").strip().lower()
+        if not text:
+            return "agentloop"
+
+        for pat in self._COMPLEX_PATTERNS:
+            if pat.search(text):
+                logger.info(
+                    "Auto-router: complex query -> openclaw (matched /%s/)",
+                    pat.pattern,
+                )
+                return "openclaw"
+
+        # Secondary signal: several action clauses chained together usually
+        # implies a multi-step task even without a keyword match.
+        connectors = len(re.findall(r"\b(and|then|also|plus|after that)\b", text))
+        if connectors >= 2 and len(text.split()) >= 12:
+            logger.info("Auto-router: multi-clause query -> openclaw")
+            return "openclaw"
+
+        return "agentloop"
+
+    def _resolve_planner_name(
+        self, metadata: Dict[str, Any] | None = None, prompt: str | None = None
+    ) -> str:
+        """Resolve planner name from request metadata, then config defaults.
+
+        A resolved value of "auto" (from either request metadata or config)
+        triggers heuristic intent-routing via :meth:`_classify_planner`.
+        """
         requested = None
         if isinstance(metadata, dict):
             requested = metadata.get("planner")
         if isinstance(requested, str) and requested.strip():
-            return requested.strip().lower()
-        return str(self.config.get("agent", {}).get("planner", "agentloop")).strip().lower()
+            name = requested.strip().lower()
+        else:
+            name = str(
+                self.config.get("agent", {}).get("planner", "agentloop")
+            ).strip().lower()
+        if name == "auto":
+            return self._classify_planner(prompt)
+        return name
 
-    def _get_planner(self, metadata: Dict[str, Any] | None = None):
+    def _get_planner(
+        self, metadata: Dict[str, Any] | None = None, prompt: str | None = None
+    ):
         """Get planner instance with fallback to agentloop if unknown."""
-        planner_name = self._resolve_planner_name(metadata)
+        planner_name = self._resolve_planner_name(metadata, prompt)
         try:
             planner = self._planner_registry.get(planner_name)
             if planner_name != "agentloop":
@@ -373,6 +466,17 @@ class Orchestrator:
         r"what(?:'s| is)\s+(?:on\s+now|playing|airing))\b",
         re.IGNORECASE,
     )
+    # Upcoming / scheduled-recording intent (future DVR jobs, not past files).
+    _UPCOMING_RE = re.compile(
+        r"\b(?:going\s+to|gonna|about\s+to|will|set\s+to)\s+record\b"
+        r"|\bupcoming\b|\bscheduled?\b|\bschedule\b"
+        r"|\brecord(?:ing|s)?\s+(?:today|tonight|tomorrow|this\s+week|"
+        r"next\b|over\s+the\s+next|in\s+the\s+next|coming)\b"
+        r"|\b(?:over\s+the\s+|in\s+the\s+)?(?:next|coming)\s+\d+\s+(?:days?|weeks?)\b"
+        r"|\bwhat\s+records\b"
+        r"|\bwhat(?:'s| is)\s+(?:on\s+)?(?:tonight|coming\s+up)\b",
+        re.IGNORECASE,
+    )
 
     def _classify_temporal(self, prompt: str) -> str:
         """Classify query temporal intent: 'past', 'future', 'present', or 'both'."""
@@ -487,8 +591,16 @@ class Orchestrator:
 
     # Week-range patterns handled deterministically (dateparser returns
     # single dates for these, but MCP tools need start..end ranges).
+    # "previous week" = the prior Sunday-Saturday calendar week.
     _WEEK_RANGE_RE = re.compile(
-        r"\b(last|past|this\s+past|previous)\s+week\b", re.IGNORECASE
+        r"\bprevious\s+week\b", re.IGNORECASE
+    )
+    # "last week", "past week", "this past week", "over/in/during the last
+    # week", etc. all contain "last week" or "past week" and mean the rolling
+    # last 7 days up to today (the week just gone, including the most recent
+    # days) — NOT the prior calendar week. Checked before _WEEK_RANGE_RE.
+    _ROLLING_WEEK_RE = re.compile(
+        r"\b(?:last|past)\s+week\b", re.IGNORECASE
     )
     _THIS_WEEK_RE = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
     _NEXT_WEEK_RE = re.compile(r"\bnext\s+week\b", re.IGNORECASE)
@@ -508,6 +620,15 @@ class Orchestrator:
     )
     _LAST_N_MONTHS_RE = re.compile(
         r"\b(?:last|past)\s+(\d+)\s+months?\b", re.IGNORECASE
+    )
+    # Forward horizons ("next/coming/upcoming 5 days", "next 2 weeks").
+    # Resolved to a today..today+N range so the whole window survives, rather
+    # than letting dateparser collapse them to a single day.
+    _NEXT_N_DAYS_RE = re.compile(
+        r"\b(?:next|coming|upcoming|following)\s+(\d+)\s+days?\b", re.IGNORECASE
+    )
+    _NEXT_N_WEEKS_RE = re.compile(
+        r"\b(?:next|coming|upcoming|following)\s+(\d+)\s+weeks?\b", re.IGNORECASE
     )
 
     # dateparser settings — base config shared by all parses.
@@ -543,6 +664,24 @@ class Orchestrator:
         now = datetime.now()
 
         # ── 1) Deterministic week ranges ─────────────────────────
+        m = self._NEXT_N_DAYS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            s = now.strftime("%Y-%m-%d")
+            e = (now + timedelta(days=n)).strftime("%Y-%m-%d")
+            prompt = self._NEXT_N_DAYS_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
+        m = self._NEXT_N_WEEKS_RE.search(prompt)
+        if m:
+            n = int(m.group(1))
+            s = now.strftime("%Y-%m-%d")
+            e = (now + timedelta(days=7 * n)).strftime("%Y-%m-%d")
+            prompt = self._NEXT_N_WEEKS_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
+
         m = self._LAST_N_DAYS_RE.search(prompt)
         if m:
             n = int(m.group(1))
@@ -551,6 +690,14 @@ class Orchestrator:
             prompt = self._LAST_N_DAYS_RE.sub(
                 f"{m.group(0)} ({s} to {e})", prompt, count=1)
             return prompt  # range phrases are exclusive — skip NL parse
+
+        m = self._ROLLING_WEEK_RE.search(prompt)
+        if m:
+            s = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            e = now.strftime("%Y-%m-%d")
+            prompt = self._ROLLING_WEEK_RE.sub(
+                f"{m.group(0)} ({s} to {e})", prompt, count=1)
+            return prompt
 
         m = self._WEEK_RANGE_RE.search(prompt)
         if m:
@@ -646,6 +793,18 @@ class Orchestrator:
             return prompt
 
         # ── 2) General NL date parsing via dateparser ────────────
+        # Explicit calendar dates (10/1, Oct 11, 2026-10-05, and ranges like
+        # "between 10/1 and 10/8" / "from Oct 1 to Oct 11") are resolved
+        # deterministically downstream with a current-year default. dateparser
+        # tends to drift a bare-year date into the wrong year, so leave such
+        # prompts unannotated and let the compiler handle them.
+        try:
+            from services.determine_filters import _DATE_ATOM_RE as _atom_re
+            if _atom_re.search(prompt):
+                return prompt
+        except Exception:
+            pass
+
         # Choose direction based on whether the prompt looks backward.
         prefer = "past" if self._PAST_HINT_RE.search(prompt) else "future"
         settings = {**self._DP_BASE, "PREFER_DATES_FROM": prefer}
@@ -701,12 +860,38 @@ class Orchestrator:
 
         return prompt
 
+    @staticmethod
+    def _looks_like_followup(prompt: str) -> bool:
+        """Heuristic: does this question refer back to a prior turn?
+
+        Conservative -- requires a back-reference phrase, and treats any
+        explicit date or quoted show/episode title as a fresh question.
+        """
+        if not prompt:
+            return False
+        import re as _re
+        if _re.search(r"\(\d{4}-\d{2}-\d{2}", prompt):
+            return False
+        if '"' in prompt or '\u201c' in prompt or '\u201d' in prompt:
+            return False
+        p = prompt.lower()
+        markers = (
+            "that episode", "that show", "that one", "that contest",
+            "that game", "the other", "same episode", "same show",
+            "on that", "in that", "the first team", "the second team",
+            "the first game", "the second game", "the winner",
+            "who won", "what did they", "did they", "earlier",
+            "previously", "you said", "you mentioned",
+        )
+        return any(m in p for m in markers)
+
     async def run_query(
         self,
         prompt: str,
         synthesize: bool = True,
         metadata: Dict[str, Any] | None = None,
         systems: list[str] | None = None,
+        session_id: str | None = None,
         status_callback=None,
         token_callback=None,
     ) -> Dict[str, Any]:
@@ -743,6 +928,11 @@ class Orchestrator:
                 return {"status": "error", "llm_response": f"Command failed: {exc}", "transcript_results": []}
 
         try:
+            # Active systems for this query (respects AI-focus scope). Defined
+            # here so the whole normal path can use it — the fast-path above
+            # returns early with its own local copy.
+            active = systems or ["sagetv", "channelsdvr"]
+
             # Classify temporal intent to skip irrelevant pre-fetches
             temporal = self._classify_temporal(prompt)
             logger.info("Temporal intent: %s", temporal)
@@ -812,6 +1002,98 @@ class Orchestrator:
                 _is_meta_transcript = False
             if _has_inline_transcript:
                 _is_meta_transcript = False
+
+            # Detect plain recordings-listing/inventory queries ("what did I
+            # record", "what's on my DVR", "list recordings from last week").
+            # These are NOT content questions, so the single-recording
+            # transcript content pre-fetch below must NOT hijack them into a
+            # one-show answer. For these we skip the pre-fetch entirely and let
+            # the agent enumerate every recording via the DVR search tools
+            # (the authoritative source), instead of collapsing to the one
+            # recording whose transcript best matches the question text.
+            _recordings_listing_re = re.compile(
+                r"\bwhat\b[^?]*\b(?:record(?:ed|ings?)?|dvr|taped?|captured?)\b"
+                r"|\b(?:list|show\s+me)\b[^?]*\b(?:record(?:ed|ings?)?|dvr)\b"
+                r"|\bwhat(?:'s| is| are| do\s+i\s+have)\b[^?]*\brecord(?:ed|ings?)?\b"
+                r"|\bwhat\s+did\s+i\s+record\b"
+                r"|\b(?:anything|something|any(?:thing)?\s+(?:shows?|programs?|recordings?))\b"
+                r"[^?]*\b(?:record(?:ed|ing|ings)?|dvr|taped?|captur\w*)\b"
+                r"|\bdid\s+(?:anything|something|we|i|it|my\s+dvr|the\s+dvr|anything\s+else)\b"
+                r"[^?]*\brecord\w*"
+                # DVR-inventory phrasings that omit the word "record": "what
+                # <show> episodes do I have", "all the X episodes I have",
+                # "do I have any X episodes", "how many X episodes do I have".
+                r"|\b(?:episodes?|shows?|recordings?|programs?)\b[^?]*"
+                r"\b(?:do\s+i\s+have|have\s+i\s+got|i\s+have|i've\s+got|i\s+got)\b"
+                r"|\bdo\s+i\s+have\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                # Phase-2 metadata cues that imply a DVR inventory search:
+                # original-air-date ("... that originally aired in 1974") and
+                # an explicit character/role ("... with the character Columbo").
+                r"|\b(?:originally\s+aired|first\s+aired|original\s+air\s+date)\b"
+                r"|\b(?:the\s+)?character\s+(?:named\s+|called\s+)?[A-Z]",
+                re.I,
+            )
+            _content_marker_re = re.compile(
+                r"\b(?:how\s+did|what\s+happened|who\s+won|what\s+was\s+said|"
+                r"about|summar(?:y|ize|ise)|recap|ending|ended|\bend\b)\b",
+                re.I,
+            )
+            _is_upcoming_listing = (
+                bool(self._UPCOMING_RE.search(prompt))
+                and not self._PAST_RE.search(prompt)
+                and not _content_marker_re.search(prompt)
+                and not _summary_title
+                and not _has_inline_transcript
+                and not _is_meta_transcript
+            )
+            _is_recordings_listing = (
+                bool(_recordings_listing_re.search(prompt))
+                and not _is_upcoming_listing
+                and not _content_marker_re.search(prompt)
+                and not _summary_title
+                and not _has_inline_transcript
+                and not _is_meta_transcript
+            )
+
+            # ── Authoritative recordings search/listing (compiler-driven) ──
+            # The local model is unreliable at BOTH picking the filtered DVR
+            # search tool and honoring the resolved filters, so it tends to
+            # call the unfiltered listing tool and dump the entire library.
+            # When a recordings-listing/search intent carries a concrete
+            # constraint (date window and/or title/actor/genre/channel/…),
+            # answer authoritatively by compiling the normalized filters into
+            # the backend search tools instead of trusting the model.
+            _listing_win = re.search(
+                r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
+            )
+            if _is_upcoming_listing:
+                try:
+                    _up = await self._compiled_upcoming_listing(
+                        prompt, active, status_callback
+                    )
+                except Exception:
+                    logger.warning(
+                        "compiled upcoming listing failed, falling back",
+                        exc_info=True,
+                    )
+                    _up = None
+                if _up is not None:
+                    return _up
+
+            if _is_recordings_listing:
+                try:
+                    _det = await self._compiled_recordings_listing(
+                        prompt, active, status_callback
+                    )
+                except Exception:
+                    logger.warning(
+                        "compiled recordings listing failed, falling back",
+                        exc_info=True,
+                    )
+                    _det = None
+                if _det is not None:
+                    return _det
 
             if _has_inline_transcript:
                 if status_callback:
@@ -1132,7 +1414,10 @@ class Orchestrator:
             # ── FTS pre-fetch path (date-scoped content search) ──
             transcript_context = ""
             transcript_hits = []
-            if temporal not in ("future", "present"):
+            transcript_display: list = []
+            episodes_used: list = []
+            recordings_used: list = []
+            if temporal not in ("future", "present") and not _is_recordings_listing:
                 try:
                     if status_callback:
                         await status_callback("Searching transcripts")
@@ -1163,6 +1448,22 @@ class Orchestrator:
                         except Exception:
                             _date_filters = {}
 
+                    # Enrich with structured filters (actor/genre/channel) that
+                    # the deterministic extractor recognises, so a dialogue
+                    # search for e.g. "where did Columbo mention the watch" is
+                    # scoped server-side rather than relying on fuzzy text alone.
+                    try:
+                        from services.determine_filters import extract_filters as _extract_tf
+                        _tf = _extract_tf(prompt)
+                        if _tf.actor:
+                            _date_filters["actor"] = _tf.actor
+                        if _tf.genre:
+                            _date_filters["genre"] = _tf.genre
+                        if _tf.channel:
+                            _date_filters["channel"] = _tf.channel
+                    except Exception:
+                        logger.debug("transcript filter enrichment skipped", exc_info=True)
+
                     transcript_results = await self.search.transcript_search(
                         prompt, filters=_date_filters or None
                     )
@@ -1170,12 +1471,20 @@ class Orchestrator:
                         data = transcript_results.get("data", transcript_results)
                         transcript_hits = data.get("results", [])
                     if transcript_hits:
+                        def _start_of(_r):
+                            try:
+                                return float(_r.get("start_time", 0) or 0)
+                            except Exception:
+                                return 0.0
+                        # Read the show in sequence (ending last) rather than in
+                        # bm25 rank order, which scrambles chronology.
+                        _ordered = sorted(transcript_hits[:8], key=_start_of)
                         lines = []
-                        for r in transcript_hits[:2]:
+                        for r in _ordered:
                             title = r.get("title", "Unknown")
                             ep = r.get("episode_title", "")
-                            start = r.get("start_time", 0)
-                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:150]
+                            start = _start_of(r)
+                            snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")[:240]
                             mins = int(start // 60)
                             secs = int(start % 60)
                             time_str = f"{mins}:{secs:02d}"
@@ -1192,7 +1501,55 @@ class Orchestrator:
                                 lines.append(f'From "{title}" - "{ep}"{date_str} at {time_str}: {snippet}')
                             else:
                                 lines.append(f'From "{title}"{date_str} at {time_str}: {snippet}')
+
+                        # When the top matches concentrate on a single recording,
+                        # fetch its full transcript so the model sees the opening
+                        # and, crucially, the ending. Scattered keyword snippets
+                        # cannot answer "how did it end / did it finish" questions.
+                        _top_ids = [r.get("recording_id") for r in transcript_hits[:5]
+                                    if r.get("recording_id")]
+                        if _top_ids and len(set(_top_ids)) == 1:
+                            try:
+                                _full = await self.search.transcript_get(_top_ids[0])
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                                if len(_ttext) > 400:
+                                    lines.append(
+                                        "[Opening of the recording]: " + _ttext[:600]
+                                    )
+                                    lines.append(
+                                        "[Final minutes of the recording - how it actually ended]: ..."
+                                        + _ttext[-1800:]
+                                    )
+                            except Exception:
+                                logger.warning("Full-transcript fetch failed; using excerpts only")
                         transcript_context = "\n".join(lines)
+                        # Surface only the episode(s) actually used for
+                        # context -- one card per recording, not every
+                        # keyword chunk. When context concentrated on a
+                        # single recording, show just that one.
+                        _single = bool(_top_ids) and len(set(_top_ids)) == 1
+                        _seen = set()
+                        for _r in transcript_hits:
+                            _rid = _r.get("recording_id")
+                            if _single and _rid != _top_ids[0]:
+                                continue
+                            _k = _rid or (_r.get("title"), _r.get("episode_title"))
+                            if _k in _seen:
+                                continue
+                            _seen.add(_k)
+                            transcript_display.append(_r)
+                            _t = _r.get("title", "Unknown")
+                            _ep = _r.get("episode_title", "")
+                            episodes_used.append(f"{_t} - {_ep}" if _ep else _t)
+                            recordings_used.append({
+                                "id": _rid,
+                                "title": _t,
+                                "episode_title": _ep,
+                                "record_date": _r.get("record_date") or _r.get("air_date"),
+                            })
+                            if len(transcript_display) >= (1 if _single else 3):
+                                break
                     elif _date_label:
                         # Negative result is informative — surface it so the LLM
                         # doesn't hallucinate transcripts for the requested date.
@@ -1201,6 +1558,54 @@ class Orchestrator:
                         )
                 except Exception:
                     logger.warning("Transcript pre-fetch failed, continuing without")
+
+            # Follow-up reuse: when the question refers back to a prior
+            # episode ("that episode", "the other team") and carries no new
+            # date, prefer the recording we answered about last turn rather
+            # than fuzzy FTS matches that surface unrelated shows.
+            try:
+                if self._looks_like_followup(prompt):
+                    _last = self.conversation_memory.last_recordings(session_id)
+                    if _last:
+                        _rec = _last[0]
+                        _rid = _rec.get("id") or ""
+                        _ttext = ""
+                        _fd = {}
+                        if _rid:
+                            try:
+                                _full = await self.search.transcript_get(_rid)
+                                _fd = _full.get("data", _full) if isinstance(_full, dict) else {}
+                                _ttext = (_fd.get("transcript") or "").strip()
+                            except Exception:
+                                logger.warning("follow-up transcript_get failed")
+                        _title = _rec.get("title") or _fd.get("title") or "Unknown"
+                        _ep = _rec.get("episode_title") or _fd.get("episode_title") or ""
+                        if _ttext:
+                            _parts = [
+                                'Continuing about "' + _title + '"'
+                                + (' - "' + _ep + '"' if _ep else '') + ':',
+                                "[Opening of the recording]: " + _ttext[:900],
+                                "[Final minutes of the recording - how it "
+                                "actually ended]: ..." + _ttext[-1800:],
+                            ]
+                            transcript_context = "\n".join(_parts)
+                        transcript_display = [{
+                            "recording_id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                            "snippet": "",
+                            "start_time": 0,
+                        }]
+                        episodes_used = [f"{_title} - {_ep}" if _ep else _title]
+                        recordings_used = [{
+                            "id": _rid,
+                            "title": _title,
+                            "episode_title": _ep,
+                            "record_date": _rec.get("record_date"),
+                        }]
+            except Exception:
+                logger.warning("follow-up reuse failed, continuing")
 
             # Pre-fetch semantic context from the vector index (sub-second)
             # Pre-fetch semantic context (skip for future-only — no past media to match)
@@ -1217,9 +1622,16 @@ class Orchestrator:
                 except Exception:
                     logger.warning("Semantic pre-fetch failed, continuing without")
 
+            # Compact memory of earlier turns for follow-up questions.
+            conversation_context = ""
+            try:
+                conversation_context = self.conversation_memory.format_for_prompt(session_id)
+            except Exception:
+                conversation_context = ""
+
             # Run the selected planner (AgentLoop by default).
-            primary_name = self._resolve_planner_name(metadata)
-            planner = self._get_planner(metadata)
+            primary_name = self._resolve_planner_name(metadata, prompt)
+            planner = self._get_planner(metadata, prompt)
             agent_result = await planner.run(
                 prompt,
                 transcript_context=transcript_context,
@@ -1228,6 +1640,7 @@ class Orchestrator:
                 temporal=temporal,
                 domains=domains,
                 entity_store=self.entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -1277,15 +1690,562 @@ class Orchestrator:
                     if tts_result.get("status") == "ok":
                         llm_result["audio_path"] = tts_result["audio_path"]
 
-            # Attach transcript hits for the frontend
-            llm_result["transcript_results"] = transcript_hits
+            # Attach transcript hits for the frontend (deduped to the
+            # episode(s) actually used to answer).
+            llm_result["transcript_results"] = transcript_display or transcript_hits
+
+            # A plain recordings-listing query ("what recorded on 32.1 last
+            # week") is a DVR question, not a transcript question. The frontend
+            # still wants per-row channel/date/watched so it can show "(32.1)"
+            # and play the show. Source that straight from the authoritative DVR
+            # recordings tool — no transcript index involved — and ship it in a
+            # dedicated episode_meta side-channel (transcript_results stays for
+            # actual content answers).
+            if _is_recordings_listing:
+                try:
+                    _rows = await self._listing_episode_rows(prompt, active)
+                    if _rows:
+                        llm_result["episode_meta"] = _rows
+                except Exception:
+                    logger.warning(
+                        "recordings-listing enrichment failed", exc_info=True
+                    )
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
+
+            # Record this turn so follow-up questions have context.
+            try:
+                _resp = llm_result.get("llm_response", "")
+                if _resp:
+                    self.conversation_memory.add_turn(
+                        session_id, prompt, _resp, recordings_used
+                    )
+            except Exception:
+                logger.warning("conversation memory update failed")
 
             return llm_result
         except Exception as exc:
             logger.exception("run_query failed")
             return {"error": str(exc)}
+
+    async def _listing_episode_rows(self, prompt: str, active: list) -> list:
+        """Build flat per-recording rows for a recordings-listing query.
+
+        Sourced from the DVR recordings tools for whichever systems are ACTIVE
+        (respecting the AI-focus scope) - this is a DVR/inventory question, not
+        a transcript question. Never query a system the user has focused out,
+        so a SageTV-only session never leaks Channels DVR recordings (and vice
+        versa). No transcript index, no single-show narrowing. The frontend
+        merges these onto the numbered list by show+episode to show the channel
+        and play the show on the right system.
+        """
+        from datetime import datetime as _dt
+
+        _active = set(active or ["sagetv", "channelsdvr"])
+
+        # Resolve the date window from the rewritten prompt "(YYYY-MM-DD to ...)".
+        _qd = re.search(
+            r"\((\d{4}-\d{2}-\d{2})(?:\s+to\s+(\d{4}-\d{2}-\d{2}))?\)", prompt
+        )
+        _start = _end = None
+        if _qd:
+            try:
+                _s = _dt.strptime(_qd.group(1), "%Y-%m-%d")
+                _e = _dt.strptime(_qd.group(2) or _qd.group(1), "%Y-%m-%d")
+                _start = int(_s.timestamp())
+                _end = int(_e.timestamp()) + 86399
+            except Exception:
+                _start = _end = None
+
+        rows: list = []
+
+        # Channels DVR — has epoch record_date + broadcast channel.
+        if "channelsdvr" in _active and hasattr(self, "_channels"):
+            try:
+                _rec = await self._channels.call_tool(
+                    "channels_get_recordings", {}
+                )
+                _list = _rec.get("data", _rec) if isinstance(_rec, dict) else _rec
+                for _r in (_list or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    _rd = _r.get("record_date") or _r.get("original_air_epoch")
+                    try:
+                        _rdi = int(float(_rd)) if _rd is not None else None
+                    except Exception:
+                        _rdi = None
+                    if _start is not None and _rdi is not None and not (
+                        _start <= _rdi <= _end
+                    ):
+                        continue
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": _rdi,
+                        "watched": _r.get("watched"),
+                        "system": "channelsdvr",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: Channels DVR fetch failed",
+                    exc_info=True,
+                )
+
+        # SageTV — no epoch record_date/broadcast channel; the agent's numbered
+        # list supplies the date. Include what the SageTV tool returns.
+        if "sagetv" in _active and hasattr(self, "_sagetv"):
+            try:
+                _srec = await self._sagetv.call_tool(
+                    "sagetv_get_recent_recordings", {"days": 30}
+                )
+                _slist = (
+                    _srec.get("data", _srec) if isinstance(_srec, dict) else _srec
+                )
+                for _r in (_slist or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    try:
+                        _srd = _r.get("record_date")
+                        _srdi = int(float(_srd)) if _srd is not None else None
+                    except Exception:
+                        _srdi = None
+                    rows.append({
+                        "display_title": _r.get("title") or "",
+                        "title": _r.get("title") or "",
+                        "episode_title": _r.get("episode_title") or None,
+                        "se_label": _r.get("season_episode") or None,
+                        "channel": _r.get("channel") or "",
+                        "record_date": _srdi,
+                        "watched": _r.get("watched"),
+                        "system": "sagetv",
+                        "recording_id": _r.get("id") or "",
+                    })
+            except Exception:
+                logger.warning(
+                    "recordings-listing: SageTV fetch failed", exc_info=True
+                )
+
+        return rows
+
+    @staticmethod
+    def _describe_filters(f) -> str:
+        """Human-readable label for the constraints in a DetermineFilters."""
+        parts: list = []
+        if f.title:
+            parts.append(f"matching '{f.title}'")
+        if f.episode_title:
+            parts.append(f"episode '{f.episode_title}'")
+        if f.actor:
+            parts.append(f"with {f.actor}")
+        if f.genre:
+            parts.append(f"in {f.genre}")
+        if f.channel:
+            parts.append(f"on {f.channel}")
+        if f.season is not None:
+            parts.append(f"season {f.season}")
+        if f.episode is not None:
+            parts.append(f"episode {f.episode}")
+        if getattr(f.watched, "value", "any") == "watched":
+            parts.append("(watched)")
+        label = (" " + " ".join(parts)) if parts else ""
+        dr = f.recorded_between
+        if dr and dr.start_utc and dr.end_utc:
+            s = dr.start_utc.strftime("%Y-%m-%d")
+            e = dr.end_utc.strftime("%Y-%m-%d")
+            label += f" on {s}" if s == e else f" from {s} to {e}"
+        return label
+
+    def _resolve_future_window(self, prompt: str):
+        """Resolve a forward-looking date window (YYYY-MM-DD, YYYY-MM-DD).
+
+        Upcoming/scheduled queries look ahead, so unlike ``resolve_date_range``
+        (which resolves backward) this anchors on *today* and extends into the
+        future. Falls back to a today..today+7 horizon when no explicit window
+        is present.
+        """
+        now = datetime.now()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        p = prompt.lower()
+
+        # An explicit calendar window ("between 10/1 and 10/8", "from Oct 1 to
+        # Oct 11", "on 10/5") wins over the relative horizons below. Resolve it
+        # straight from the date atoms in the prompt (earliest..latest) so the
+        # phrasing ("between/from/to/on") and span-capture quirks don't matter.
+        try:
+            from services.determine_filters import (
+                _DATE_ATOM_RE as _atom_re,
+                _parse_loose_date as _pld,
+            )
+            _atoms = _atom_re.findall(prompt)
+            if _atoms:
+                _days = [d for d in (_pld(a, now) for a in _atoms) if d]
+                if _days:
+                    return (
+                        min(_days).strftime("%Y-%m-%d"),
+                        max(_days).strftime("%Y-%m-%d"),
+                    )
+        except Exception:
+            logger.debug("explicit future window parse failed", exc_info=True)
+
+        m = re.search(r"(?:next|coming)\s+(\d+)\s+days?", p)
+        if m:
+            n = int(m.group(1))
+            return (
+                today.strftime("%Y-%m-%d"),
+                (today + timedelta(days=n)).strftime("%Y-%m-%d"),
+            )
+        m = re.search(r"(?:next|coming)\s+(\d+)\s+weeks?", p)
+        if m:
+            n = int(m.group(1))
+            return (
+                today.strftime("%Y-%m-%d"),
+                (today + timedelta(days=7 * n)).strftime("%Y-%m-%d"),
+            )
+        if re.search(r"\btonight\b|\btoday\b", p):
+            return today.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+        if re.search(r"\btomorrow\b", p):
+            d = today + timedelta(days=1)
+            return d.strftime("%Y-%m-%d"), d.strftime("%Y-%m-%d")
+        if re.search(r"\bthis\s+week\b", p):
+            # Remaining days of the current week (through Saturday).
+            days_to_sat = (5 - today.weekday()) % 7
+            end = today + timedelta(days=days_to_sat)
+            return today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        if re.search(r"\bnext\s+week\b", p):
+            # Next calendar week (upcoming Sunday..Saturday).
+            start = today + timedelta(days=((6 - today.weekday()) % 7) + 1)
+            end = start + timedelta(days=6)
+            return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+        # Default forward horizon.
+        return (
+            today.strftime("%Y-%m-%d"),
+            (today + timedelta(days=7)).strftime("%Y-%m-%d"),
+        )
+
+    async def _compiled_upcoming_listing(
+        self, prompt: str, active, status_callback=None
+    ):
+        """Authoritatively answer an upcoming/scheduled-recording query.
+
+        Routes future intent ("what's going to record over the next 7 days",
+        "what's scheduled tonight") to the DVR *upcoming* tools rather than the
+        past-recordings search. Compiles title/channel/limit from the request
+        and injects a forward date window resolved from the prompt.
+
+        Returns a run_query-shaped dict, or ``None`` to fall back to the model.
+        """
+        from services.determine_filters import extract_filters, compile_filters
+
+        f = extract_filters(prompt)
+        res = compile_filters(f, active_systems=active, upcoming=True)
+        _up_calls = [
+            c for c in res.calls
+            if c.target in ("sagetv_upcoming", "channels_upcoming")
+        ]
+        if not _up_calls:
+            return None
+
+        start_date, end_date = self._resolve_future_window(prompt)
+
+        if status_callback:
+            await status_callback("Checking scheduled recordings")
+
+        recs: list = []
+        for call in _up_calls:
+            is_sage = call.target.startswith("sagetv")
+            client = self._sagetv if is_sage else self._channels
+            system = "sagetv" if is_sage else "channelsdvr"
+            if not hasattr(self, "_sagetv"):
+                continue
+            args = dict(call.args)
+            if start_date:
+                args["start_date"] = start_date
+            if end_date:
+                args["end_date"] = end_date
+            # The upcoming tools take an explicit window, not a compiled
+            # recorded_between; drop any stale date keys the compiler emitted.
+            args.pop("recorded_between", None)
+            try:
+                _r = await client.call_tool(call.tool, args)
+            except Exception:
+                logger.warning(
+                    "compiled upcoming: %s failed", call.tool, exc_info=True
+                )
+                continue
+            _data = _r.get("data", _r) if isinstance(_r, dict) else _r
+            # SageTV returns data as a flat list; Channels wraps it as
+            # {"scheduled": [...], "skipped": [...]}. Normalise both.
+            rows: list = []
+            if isinstance(_data, dict):
+                rows = list(_data.get("scheduled", []) or [])
+                rows += list(_data.get("skipped", []) or [])
+                if not rows:
+                    rows = list(
+                        _data.get("results", _data.get("recordings", [])) or []
+                    )
+            elif isinstance(_data, list):
+                rows = _data
+            for _row in rows:
+                if isinstance(_row, dict):
+                    rr = dict(_row)
+                    rr["system"] = system
+                    recs.append(rr)
+
+        def _st_key(r):
+            st = str(r.get("start_time") or "")
+            try:
+                return datetime.strptime(st[:19], "%Y-%m-%d %I:%M %p")
+            except Exception:
+                return datetime.max
+
+        recs.sort(key=_st_key)
+        _label = self._describe_filters(f)
+
+        if not recs:
+            _win = (
+                f" between {start_date} and {end_date}"
+                if start_date and end_date else ""
+            )
+            return {
+                "status": "ok",
+                "llm_response": f"No upcoming recordings found{_label}{_win}.",
+                "iterations": 1,
+                "transcript_results": [],
+                "episode_meta": [],
+                "fast_path": True,
+            }
+
+        lines: list = []
+        meta: list = []
+        for _i, _r in enumerate(recs, 1):
+            _title = _r.get("title") or "(untitled)"
+            _ep = _r.get("episode_title")
+            _se = _r.get("season_episode")
+            if not _se:
+                _s = _r.get("season")
+                _e = _r.get("episode")
+                if _s and _e:
+                    try:
+                        _se = f"S{int(_s):02d}E{int(_e):02d}"
+                    except Exception:
+                        _se = None
+            _chan = _r.get("channel") or ""
+            _when = _r.get("start_time") or _r.get("air_date") or ""
+            _bits = [f'{_i}. "{_title}"']
+            if _ep:
+                _bits.append(f'"{_ep}"')
+            if _se:
+                _bits.append(_se)
+            _line = " ".join(_bits)
+            _suffix = []
+            if _when:
+                _suffix.append(str(_when))
+            if _chan:
+                _suffix.append(f"({_chan})")
+            if _suffix:
+                _line += " \u2014 " + " ".join(_suffix)
+            lines.append(_line)
+            meta.append({
+                "display_title": _title,
+                "title": _title,
+                "episode_title": _ep or None,
+                "se_label": _se or None,
+                "channel": _chan,
+                "air_date": _r.get("air_date") or None,
+                "start_time": _r.get("start_time") or None,
+                "system": _r.get("system"),
+                "recording_id": _r.get("id") or "",
+                "upcoming": True,
+            })
+
+        _win = (
+            f" between {start_date} and {end_date}"
+            if start_date and end_date else ""
+        )
+        _header = f"You have {len(recs)} upcoming recording(s){_label}{_win}:"
+        return {
+            "status": "ok",
+            "llm_response": _header + "\n" + "\n".join(lines),
+            "iterations": 1,
+            "transcript_results": [],
+            "episode_meta": meta,
+            "fast_path": True,
+        }
+
+    async def _compiled_recordings_listing(
+        self, prompt: str, active, status_callback=None
+    ):
+        """Authoritatively answer a recordings search/listing query.
+
+        Compiles the natural-language request into a normalized, validated
+        ``DetermineFilters`` and executes the backend DVR search tools with the
+        exact parameters they support (title, actor, genre, channel, season,
+        episode, recording date window, watched). This replaces the old
+        date-only deterministic path and no longer trusts the local model to
+        pick the filtered tool or honor the filters.
+
+        Returns a run_query-shaped dict, or ``None`` to fall back to the model
+        (e.g. an unbounded "what did I record" with no constraint at all, or a
+        query whose only constraint is a not-yet-supported filter).
+        """
+        from datetime import datetime as _dt
+        from services.agent import _format_recording_line
+        from services.determine_filters import extract_filters, compile_filters
+
+        f = extract_filters(prompt)
+        res = compile_filters(f, active_systems=active)
+
+        # A not-yet-filterable request (character / original air date) with no
+        # other honorable constraint → answer with an honest capability note
+        # instead of silently ignoring it.
+        _honorable = f.requested_fields() - f.unsupported_requests() - {"limit"}
+        if res.unsupported and not _honorable:
+            return {
+                "status": "ok",
+                "llm_response": res.clarification_reason
+                or "That filter isn't supported yet.",
+                "iterations": 1,
+                "transcript_results": [],
+                "episode_meta": [],
+                "fast_path": True,
+            }
+
+        _rec_calls = [
+            c for c in res.calls
+            if c.target in ("sagetv_recordings", "channels_recordings")
+        ]
+
+        # Require at least one concrete constraint; an unbounded library dump
+        # is worse than letting the agent clarify. The raw IR only stores the
+        # date *expression* ("yesterday", "last week") - it is resolved to a
+        # concrete window inside compile_filters - so look at the compiled call
+        # arguments to decide whether a date window is actually in play.
+        _has_window = any(
+            ("start_date" in c.args or "end_date" in c.args)
+            for c in _rec_calls
+        )
+        if not _has_window and not (_honorable - {"recorded_between"}):
+            return None
+
+        if not _rec_calls:
+            return None
+
+        # A concrete window that reaches into the future is a scheduling
+        # question ("what records between 10/1 and 10/8"), not a past search.
+        # Redirect to the upcoming/scheduled tools when the window has no past
+        # days (starts today or later) and extends beyond today — the
+        # past-recordings tools would otherwise return nothing. A window that
+        # straddles today (starts in the past) stays on the past path so its
+        # already-recorded portion is still reported.
+        if _has_window:
+            _today = _dt.now().strftime("%Y-%m-%d")
+            _starts = [
+                c.args.get("start_date")
+                for c in _rec_calls
+                if c.args.get("start_date")
+            ]
+            _ends = [
+                c.args.get("end_date")
+                for c in _rec_calls
+                if c.args.get("end_date")
+            ]
+            _future = (
+                bool(_starts)
+                and min(_starts) >= _today
+                and max(_ends or _starts) > _today
+            )
+            if _future:
+                _up = await self._compiled_upcoming_listing(
+                    prompt, active, status_callback
+                )
+                if _up is not None:
+                    return _up
+
+        if status_callback:
+            await status_callback("Fetching DVR recordings")
+
+        recs: list = []
+        for call in _rec_calls:
+            is_sage = call.target.startswith("sagetv")
+            client = self._sagetv if is_sage else self._channels
+            system = "sagetv" if is_sage else "channelsdvr"
+            if not hasattr(self, "_sagetv"):
+                continue
+            try:
+                _r = await client.call_tool(call.tool, call.args)
+            except Exception:
+                logger.warning(
+                    "compiled listing: %s failed", call.tool, exc_info=True
+                )
+                continue
+            _data = _r.get("data", _r) if isinstance(_r, dict) else _r
+            # SageTV returns data as a list; Channels wraps it as
+            # {"results": [...]}. Normalise both to a flat list.
+            if isinstance(_data, dict):
+                _data = _data.get("results", _data.get("recordings", []))
+            for _row in (_data or []):
+                if isinstance(_row, dict):
+                    rr = dict(_row)
+                    rr["system"] = system
+                    recs.append(rr)
+
+        def _rd_key(r) -> int:
+            v = r.get("record_date")
+            try:
+                return int(float(v))
+            except Exception:
+                return 0
+
+        recs.sort(key=_rd_key, reverse=True)
+        _label = self._describe_filters(f)
+
+        if not recs:
+            return {
+                "status": "ok",
+                "llm_response": f"No recordings found{_label}.",
+                "iterations": 1,
+                "transcript_results": [],
+                "episode_meta": [],
+                "fast_path": True,
+            }
+
+        lines: list = []
+        meta: list = []
+        for _i, _r in enumerate(recs, 1):
+            _line_rec = dict(_r)
+            if not _line_rec.get("air_date"):
+                _ad = _r.get("recorded")
+                if not _ad:
+                    _rk = _rd_key(_r)
+                    if _rk:
+                        _ad = _dt.fromtimestamp(_rk).strftime("%Y-%m-%d")
+                _line_rec["air_date"] = _ad or ""
+            lines.append(_format_recording_line(_i, _line_rec))
+            meta.append({
+                "display_title": _r.get("title") or "",
+                "title": _r.get("title") or "",
+                "episode_title": _r.get("episode_title") or None,
+                "se_label": _r.get("season_episode") or None,
+                "channel": _r.get("channel") or "",
+                "record_date": _rd_key(_r) or None,
+                "watched": _r.get("watched"),
+                "system": _r.get("system"),
+                "recording_id": _r.get("id") or "",
+            })
+
+        _header = f"You have {len(recs)} recording(s){_label}:"
+        return {
+            "status": "ok",
+            "llm_response": _header + "\n" + "\n".join(lines),
+            "iterations": 1,
+            "transcript_results": [],
+            "episode_meta": meta,
+            "fast_path": True,
+        }
 
     async def run_query_voice(self, audio_path: str) -> Dict[str, Any]:
         """Run a voice query: audio → transcription → LLM → TTS."""

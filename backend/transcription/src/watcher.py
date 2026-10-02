@@ -30,6 +30,46 @@ MEDIA_EXTENSIONS = {".mpg", ".ts", ".mkv", ".mp4", ".avi"}
 SKIP_PATH_FRAGMENTS = {"/Streaming/", "\\Streaming\\"}
 # Filename patterns to skip (HLS chunk files etc)
 SKIP_FILENAME_RE = re.compile(r"^stream\d+\.[a-z0-9]+$", re.IGNORECASE)
+# Intermediate files produced by other tools mid-job (chunk_00001.mkv etc)
+SKIP_CHUNK_FILENAME_RE = re.compile(r"^chunk[_-]?\d+\.[a-z0-9]+$", re.IGNORECASE)
+# Directory names holding another tool's in-progress work rather than finished
+# recordings. These get created, filled and deleted while we are still polling,
+# so anything queued from them is usually gone by the time a worker picks it up.
+# Matching is deliberately case-sensitive: tool-generated directories are
+# lowercase ("campusquest-chunks", "uwwpsa.work"), while media folders are
+# title-cased ("Scratch (2001)"). Wrongly ignoring a recording loses its
+# transcript silently, whereas wrongly accepting scratch costs one fast failure,
+# so err toward accepting.
+SKIP_DIR_NAMES = {"scratch", "tmp", "temp", "incomplete", "partial"}
+SKIP_DIR_SUFFIX_RE = re.compile(
+    r"[-_.](?:chunks?|scratch|work|working|assemble|tmp|temp|incomplete|partial)$"
+)
+
+
+def is_ignored_media_path(entry: Path, watch_dir: str) -> bool:
+    """True if this path is a scratch/intermediate artefact rather than a recording."""
+    path_str = str(entry)
+    if any(fragment in path_str for fragment in SKIP_PATH_FRAGMENTS):
+        return True
+    if SKIP_FILENAME_RE.match(entry.name) or SKIP_CHUNK_FILENAME_RE.match(entry.name):
+        return True
+
+    try:
+        relative = entry.relative_to(watch_dir)
+    except ValueError:
+        relative = entry
+    # Only directories are inspected — a recording's own filename may legitimately
+    # contain any of these words.
+    for part in relative.parts[:-1]:
+        if part.startswith("."):
+            return True
+        if part in SKIP_DIR_NAMES:
+            return True
+        if SKIP_DIR_SUFFIX_RE.search(part):
+            return True
+    return False
+
+
 # Debounce: wait this long after last modification before processing
 DEBOUNCE_SECONDS = 30
 # Poll interval
@@ -94,6 +134,8 @@ class FileWatcher:
                 continue
             if entry.suffix.lower() not in MEDIA_EXTENSIONS:
                 continue
+            if is_ignored_media_path(entry, self.watch_dir):
+                continue
             try:
                 stat = entry.stat()
                 if stat.st_mtime < cutoff:
@@ -120,11 +162,8 @@ class FileWatcher:
 
             path_str = str(entry)
 
-            # Skip streaming cache and temp directories
-            if any(frag in path_str for frag in SKIP_PATH_FRAGMENTS):
-                continue
-            # Skip HLS chunk filenames (streamNNNN.ts etc)
-            if SKIP_FILENAME_RE.match(entry.name):
+            # Skip streaming caches, HLS chunks and other tools' scratch dirs
+            if is_ignored_media_path(entry, self.watch_dir):
                 continue
 
             current_files.add(path_str)

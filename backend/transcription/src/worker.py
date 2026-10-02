@@ -14,15 +14,30 @@ import time
 from typing import Any, Dict, Optional
 
 from .enrichment import MetadataEnrichmentPipeline
-from .extractor import AudioExtractor
+from .extractor import AudioExtractor, PermanentExtractionError
 from .models import TranscriptMetadata, TranscriptionJob
 from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .whisper_engine import WhisperEngine
 from . import diarization
 from . import cc_extractor
+from .gpu import gpu_free_mb, release_cuda_memory
 
 logger = logging.getLogger(__name__)
+
+# This GPU is shared with a live TV transcoder, Ollama and other tenants, so a
+# job that barges in when the card is nearly full will OOM (and, before the
+# claim-on-dequeue fix, could take a recording's only attempt with it). Wait for
+# real headroom instead.
+#
+# Measured on an RTX 5080: Whisper large-v3 needs ~4 GB and diarization peaks at
+# ~4.3 GB, and diarization's peak is flat with input duration. 4500 MiB covers
+# either step with a little slack.
+GPU_MIN_FREE_MB = float(os.environ.get("GPU_MIN_FREE_MB", "4500"))
+# Bounded so a permanently busy GPU degrades to "try anyway" rather than
+# stalling the queue forever; an OOM from that attempt is already retryable.
+GPU_WAIT_TIMEOUT = float(os.environ.get("GPU_WAIT_TIMEOUT", "900"))
+GPU_WAIT_POLL = float(os.environ.get("GPU_WAIT_POLL", "15"))
 
 
 class TranscriptionWorker:
@@ -36,6 +51,7 @@ class TranscriptionWorker:
         engine: WhisperEngine,
         concurrency: int = 1,
         poll_interval: float = 10.0,
+        gpu_idle_timeout: float = 600.0,
     ):
         self.queue = queue
         self.store = store
@@ -44,9 +60,12 @@ class TranscriptionWorker:
         self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
+        self.gpu_idle_timeout = gpu_idle_timeout
         self._running = False
         self._active_jobs = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._last_job_end = time.monotonic()
+        self._reaper_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
@@ -58,13 +77,29 @@ class TranscriptionWorker:
 
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
-        logger.info("Transcription worker started (concurrency=%d)", self.concurrency)
+
+        # Jobs left in 'extracting'/'processing' by a previous run are never
+        # touched again, and enqueue() won't re-add their recording, so recover
+        # them before starting rather than stranding those recordings forever.
+        try:
+            recovered = self.queue.reset_stale_jobs()
+            if recovered:
+                logger.warning("Recovered %d job(s) abandoned by a previous run", recovered)
+        except Exception:
+            logger.exception("Stale job recovery failed")
+
+        logger.info("Transcription worker started (concurrency=%d, gpu_idle_timeout=%ss)",
+                    self.concurrency, self.gpu_idle_timeout)
+
+        if self.gpu_idle_timeout > 0:
+            self._reaper_task = asyncio.create_task(self._idle_reaper())
 
         while self._running:
             try:
                 job = self.queue.dequeue()
                 if job:
                     await self._semaphore.acquire()
+                    self._active_jobs += 1
                     asyncio.create_task(self._process_with_semaphore(job))
                 else:
                     await asyncio.sleep(self.poll_interval)
@@ -72,13 +107,104 @@ class TranscriptionWorker:
                 logger.exception("Worker loop error")
                 await asyncio.sleep(self.poll_interval)
 
+    async def _idle_reaper(self) -> None:
+        """Release Whisper/diarization models when the queue has been idle.
+
+        Models are reloaded automatically on the next job. This trades a few
+        seconds of reload latency for several GB of VRAM that would otherwise
+        sit pinned 24/7 between recordings.
+        """
+        interval = max(15.0, min(self.gpu_idle_timeout / 4, 60.0))
+        while self._running:
+            await asyncio.sleep(interval)
+            if self._active_jobs > 0:
+                continue
+            if not (self.engine.loaded or diarization.is_loaded()):
+                continue
+            idle_for = time.monotonic() - self._last_job_end
+            if idle_for < self.gpu_idle_timeout:
+                continue
+            # Only *pending* work should hold the models: the worker loop will
+            # pick it up within poll_interval. Deliberately not checking the
+            # 'extracting'/'processing' counts here — those are rows some worker
+            # claimed, and a job this process is really running is already
+            # covered by _active_jobs above. Rows abandoned by an earlier run
+            # stay in those states forever, and treating them as live work
+            # pinned several GB of VRAM indefinitely.
+            try:
+                if self.queue.stats().get("pending"):
+                    continue
+            except Exception:
+                logger.debug("Queue stats unavailable during idle check", exc_info=True)
+            logger.info("Idle for %.0fs — releasing GPU models", idle_for)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, self.engine.unload)
+                await loop.run_in_executor(None, diarization.unload)
+            except Exception:
+                logger.exception("Failed to release GPU models")
+
+    async def _await_vram(self, label: str, need_mb: float = GPU_MIN_FREE_MB) -> None:
+        """Block until the GPU has ``need_mb`` free, or the wait times out.
+
+        Other tenants on this card (a live TV transcoder, Ollama, OCR
+        containers) come and go, so starting a memory-hungry step the moment a
+        job arrives can OOM even though the same job would succeed a minute
+        later. Nothing here is latency-sensitive — every job is queued or
+        batched — so waiting is nearly free, while an OOM costs the whole step.
+
+        On timeout this logs and returns rather than raising: a permanently busy
+        GPU must not stall the queue forever, and if the attempt does OOM the
+        existing handler already marks the job for retry.
+        """
+        if GPU_WAIT_TIMEOUT <= 0 or need_mb <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        # Hand back our own cached-but-unused blocks first, so we wait on a true
+        # shortage rather than on memory we are already holding.
+        await loop.run_in_executor(None, release_cuda_memory)
+
+        deadline = time.monotonic() + GPU_WAIT_TIMEOUT
+        waited_from: Optional[float] = None
+        while True:
+            free = await loop.run_in_executor(None, gpu_free_mb)
+            if free is None:
+                return  # No nvidia-smi / no GPU: nothing useful to gate on.
+            if free >= need_mb:
+                if waited_from is not None:
+                    logger.info(
+                        "GPU freed up after %.0fs — starting %s (%.0f MiB free)",
+                        time.monotonic() - waited_from, label, free,
+                    )
+                return
+            if waited_from is None:
+                waited_from = time.monotonic()
+                logger.info(
+                    "Waiting for VRAM before %s: %.0f MiB free, need %.0f MiB",
+                    label, free, need_mb,
+                )
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "GPU still busy after %.0fs (%.0f MiB free, need %.0f MiB) — "
+                    "attempting %s anyway", GPU_WAIT_TIMEOUT, free, need_mb, label,
+                )
+                return
+            await asyncio.sleep(GPU_WAIT_POLL)
+
     def stop(self) -> None:
         self._running = False
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            self._reaper_task = None
+        self.engine.unload()
+        diarization.unload()
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
             await self._process(job)
         finally:
+            self._active_jobs -= 1
+            self._last_job_end = time.monotonic()
             self._semaphore.release()
 
     async def _process(self, job: TranscriptionJob) -> None:
@@ -119,6 +245,12 @@ class TranscriptionWorker:
                 job.file_path, job.recording_id, start_seconds=start_seconds,
             )
             self.queue.update_status(job.job_id, "processing", temp_audio_path=audio_path)
+        except PermanentExtractionError as e:
+            # Retrying re-reads the whole source file for a guaranteed failure,
+            # so fail straight to error and leave a readable reason behind.
+            logger.error("Extraction permanently failed for %s: %s", job.job_id, e)
+            self.queue.update_status(job.job_id, "error", error=f"Extraction: {e}")
+            return
         except Exception as e:
             logger.error("Extraction failed for %s: %s", job.job_id, e)
             self.queue.mark_for_retry(job.job_id, f"Extraction: {e}")
@@ -160,6 +292,11 @@ class TranscriptionWorker:
                         transcription_mode = "mixed"
 
         # Step 2: Transcribe according to chosen mode
+        # Whisper is the first VRAM-hungry step. Skipped when the model is
+        # already resident, since that memory is ours already and we would be
+        # waiting for headroom we do not actually need.
+        if transcription_mode != "cc" and self.engine.uses_gpu and not self.engine.loaded:
+            await self._await_vram("transcription")
         if transcription_mode == "cc":
             # Use CC segments verbatim, strip any speaker prefixes for clean text.
             segments = []
@@ -253,6 +390,17 @@ class TranscriptionWorker:
         # Skip diarization for non-final incremental jobs (will run on complete file)
         diarization_turns = []
         if diarization.is_available() and not (is_incremental and not is_final):
+            # All Whisper work for this job is done by now, and diarization is
+            # the memory-hungry step. Holding both resident peaks around 6.5 GB
+            # of VRAM; dropping Whisper first keeps the peak near 4 GB so a live
+            # TV transcoder sharing this GPU has headroom. Nothing here is
+            # latency-sensitive (every job is queued or batched) and transcribe()
+            # reloads on demand, so the reload cost lands on batch throughput
+            # rather than on anything a viewer sees.
+            await loop.run_in_executor(None, self.engine.unload)
+            # Whisper's VRAM has just gone back to the driver, so this is the
+            # cleanest point to check we actually have room for diarization.
+            await self._await_vram("diarization")
             try:
                 diarization_turns = await loop.run_in_executor(
                     None, diarization.diarize, audio_path
@@ -290,11 +438,31 @@ class TranscriptionWorker:
 
         # Step 6: Enrich (only for complete or final incremental jobs)
         if self.enrichment and not (is_incremental and not is_final):
+            # For incremental recordings, `segments` only covers the final
+            # increment. Chunking that alone indexes just the last slice of the
+            # recording, leaving the cross-search chunk index nearly empty (the
+            # cause of transcripts that were searchable by title but produced no
+            # recap content). The store now holds the full accumulated VTT, so
+            # rebuild the complete segment list from it before chunking.
+            enrich_segments = segments
+            if is_incremental:
+                try:
+                    saved = self.store.get(store_id)
+                    if saved and saved.vtt:
+                        full_segments = cc_extractor._parse_webvtt(saved.vtt)
+                        if len(full_segments) > len(enrich_segments):
+                            enrich_segments = full_segments
+                except Exception:
+                    logger.warning(
+                        "Failed to rebuild full segments from VTT for %s; "
+                        "chunking final increment only",
+                        store_id, exc_info=True,
+                    )
             try:
                 await self.enrichment.enrich({
                     "recording_id": store_id,
                     "system": job.system,
-                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in segments],
+                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in enrich_segments],
                     "diarization_turns": diarization_turns,
                     "transcript_text": full_text,
                     "word_count": len(full_text.split()),

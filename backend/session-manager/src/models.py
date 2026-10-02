@@ -34,6 +34,7 @@ class Device:
     paired_at: float = 0.0
     pairing_method: str = "manual"  # qr, api, manual
     is_default: bool = False
+    online: bool = False  # set by the reconciler when the client/context is live
 
     @staticmethod
     def generate_id(system: str, platform: str) -> str:
@@ -59,6 +60,7 @@ class Device:
             paired_at=d.get("paired_at", 0.0),
             pairing_method=d.get("pairing_method", "manual"),
             is_default=bool(d.get("is_default", False)),
+            online=bool(d.get("online", False)),
         )
 
     @property
