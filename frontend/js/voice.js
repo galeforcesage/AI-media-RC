@@ -66,12 +66,16 @@ const Voice = (() => {
             _updateInput();
             _resetSilenceTimer();
           } else if (msg.type === 'final') {
-            // Server sends the full final transcript — leave in input for user to review/send
+            // Server sends the full final transcript. Hand it to the app, which
+            // fires lone media commands (pause/play/…) immediately and otherwise
+            // leaves the text in the input for the user to review/send.
             committedText = msg.text || '';
             hypothesisText = '';
             _updateInput();
             clearTimeout(silenceTimer);
+            const finalText = committedText.trim();
             _cleanup();
+            if (finalText && onResult) onResult(finalText);
           }
         } catch (_) { /* ignore malformed */ }
       };

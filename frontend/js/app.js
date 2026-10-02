@@ -686,9 +686,34 @@
     }
   }
 
+  // Lone spoken media commands fire the matching remote button instantly,
+  // instead of waiting for the user to press Send. Keys are normalized
+  // (lowercased, punctuation stripped). Exit/Menu are SageTV remote buttons.
+  const VOICE_MEDIA_COMMANDS = {
+    'pause': 'pause',
+    'play': 'play',
+    'resume': 'play',
+    'fast forward': 'skip_forward',
+    'fastforward': 'skip_forward',
+    'forward': 'skip_forward',
+    'rewind': 'skip_back',
+    'exit': 'close',
+    'menu': 'nav_options',
+  };
+
   function handleVoiceResult(transcript) {
-    document.getElementById('text-input').value = transcript;
-    handleSend();
+    const norm = (transcript || '')
+      .toLowerCase().replace(/[^a-z ]+/g, '').replace(/\s+/g, ' ').trim();
+    const action = VOICE_MEDIA_COMMANDS[norm];
+    const input = document.getElementById('text-input');
+    if (action) {
+      // Single-word media command — issue it now, don't route through the LLM.
+      if (input) input.value = '';
+      sendPlayback(action);
+      return;
+    }
+    // Anything else: leave the dictated text in the input for review/send.
+    if (input) input.value = transcript;
   }
 
   function ensureShowDetailsButtons(container) {

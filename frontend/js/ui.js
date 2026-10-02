@@ -298,13 +298,14 @@ const UI = (() => {
     const picker = el['device-picker'];
     picker.innerHTML = '<option value="">Select device...</option>';
 
-    // Only surface devices we can actually reach. SageTV contexts carry a
-    // reconciled `online` flag; other systems have no liveness signal so are
-    // treated as reachable. The current selection stays visible even if it
-    // just went offline, so the picker still reflects what's selected.
+    // Only surface devices for the selected remote system, and only ones we can
+    // actually reach. SageTV contexts carry a reconciled `online` flag; the
+    // current selection stays visible even if it just went offline. Channels
+    // playback targets come from bridgeDevices below, not this list.
     if (devices && devices.length > 0) {
       const reachable = d => d.system !== 'sagetv' || !!d.online;
-      const shown = devices.filter(d => reachable(d) || d.device_id === selectedId);
+      const shown = devices.filter(
+        d => d.system === system && (reachable(d) || d.device_id === selectedId));
       shown.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.device_id;
