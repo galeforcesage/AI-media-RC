@@ -2,6 +2,8 @@
 Description=AI-media-RC Services (watchdog-managed)
 After=network-online.target ollama.service docker.service
 Wants=network-online.target ollama.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
@@ -10,9 +12,16 @@ User=MEDIA_USER
 Group=MEDIA_USER
 WorkingDirectory=/home/USER_HOME/AI-media-RC
 ExecStart=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh all
+ExecStartPost=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh wait-ready 120
 ExecStop=/bin/bash /home/USER_HOME/AI-media-RC/scripts/watchdog.sh stop
 # Give Ollama a moment to be fully ready before starting services
 ExecStartPre=/bin/sleep 5
+TimeoutStartSec=180
+TimeoutStopSec=90
+# Retry only a failed boot/startup, with a bounded rate. Runtime component
+# crashes are handled by watchdog.sh, which gives up after its crash threshold.
+Restart=on-failure
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
