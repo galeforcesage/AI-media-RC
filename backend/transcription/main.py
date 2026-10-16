@@ -102,19 +102,34 @@ async def run(args: argparse.Namespace) -> None:
         if args.channels_dir:
             channels_dirs = list(args.channels_dir)
 
-        # Auto-discover any directories not explicitly set
-        if not sagetv_dirs or not channels_dirs:
-            logging.getLogger(__name__).info("Auto-discovering recording directories from MCP servers...")
+        # MCP services may still be starting during a system reboot. A single
+        # failed discovery used to leave the transcription service healthy on
+        # port 8770 but with no SageTV watcher for the lifetime of the process.
+        # Retry only the missing systems, with a bounded startup delay.
+        for attempt in range(1, 7):
+            need_sagetv = not sagetv_dirs
+            need_channels = not channels_dirs
+            if not need_sagetv and not need_channels:
+                break
+
+            logging.getLogger(__name__).info(
+                "Auto-discovering recording directories from MCP servers "
+                "(attempt %d/6)...", attempt,
+            )
             discovered = await discover_all(
                 sagetv_host=sagetv_mcp_host,
                 sagetv_port=sagetv_mcp_port,
                 channels_host=channels_mcp_host,
                 channels_port=channels_mcp_port,
             )
-            if not sagetv_dirs:
+            if need_sagetv:
                 sagetv_dirs = discovered.get("sagetv", [])
-            if not channels_dirs:
+            if need_channels:
                 channels_dirs = discovered.get("channelsdvr", [])
+
+            if (need_sagetv and not sagetv_dirs) or (need_channels and not channels_dirs):
+                if attempt < 6:
+                    await asyncio.sleep(5)
 
         # Deletion callback — remove transcript data when media file disappears
         def on_file_deleted(recording_id: str):
