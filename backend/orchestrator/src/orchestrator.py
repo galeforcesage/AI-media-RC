@@ -41,6 +41,7 @@ from services.conversation_memory import ConversationMemory
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
+from services.recording_dedup import dedupe_cross_dvr_recordings
 
 logger = get_logger(__name__)
 
@@ -2200,6 +2201,7 @@ class Orchestrator:
             except Exception:
                 return 0
 
+        recs = dedupe_cross_dvr_recordings(recs)
         recs.sort(key=_rd_key, reverse=True)
         _label = self._describe_filters(f)
 
@@ -2234,6 +2236,12 @@ class Orchestrator:
                 "record_date": _rd_key(_r) or None,
                 "watched": _r.get("watched"),
                 "system": _r.get("system"),
+                "systems": _r.get("systems") or [_r.get("system")],
+                "dvr_label": (
+                    "SageTV + Channels"
+                    if len(_r.get("systems") or []) > 1
+                    else ""
+                ),
                 "recording_id": _r.get("id") or "",
             })
 

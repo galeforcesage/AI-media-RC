@@ -211,6 +211,7 @@ const UI = (() => {
       // Play button resolves by series title (same as the original cards).
       card.dataset.title = showName;
       card.dataset.system = it.system || '';
+      card.dataset.systems = (it.systems || []).join(',');
 
       // Two separate links, matching the numbered list the user had:
       //  • series name  → series metadata popup (no show-context)
@@ -232,6 +233,7 @@ const UI = (() => {
       if (it.channel && !(it.dateStr && it.dateStr.includes(it.channel))) {
         metaBits.push(`(${esc(it.channel)})`);
       }
+      if (it.dvrLabel) metaBits.push(esc(it.dvrLabel));
       if (contentSearch && it.startTime != null) metaBits.push(`at ${esc(formatTime(it.startTime))}`);
       let metaHtml = metaBits.length ? `<span class="ec-meta">${metaBits.join(' · ')}</span>` : '';
       if (it.watched) {

@@ -209,7 +209,12 @@
       const card = playBtn.closest('.episode-card');
       if (!card) return;
       const title = card.dataset.title;
-      const system = card.dataset.system || State.get().system;
+      const availableSystems = (card.dataset.systems || '')
+        .split(',').filter(Boolean);
+      const selectedSystem = State.get().system;
+      const system = availableSystems.includes(selectedSystem)
+        ? selectedSystem
+        : (card.dataset.system || selectedSystem);
       if (!title) return;
 
       const deviceId = State.get().deviceId;
@@ -1229,6 +1234,8 @@
       if (!r) return;
       it.recordingId = r.recording_id || '';
       it.system = r.system || '';
+      it.systems = Array.isArray(r.systems) ? r.systems : [];
+      it.dvrLabel = r.dvr_label || '';
       it.upcoming = !!r.upcoming;
       it.channel = r.channel || '';
       it.startTime = (r.start_time != null) ? r.start_time : null;
