@@ -116,31 +116,36 @@ class MetadataEnrichmentPipeline:
                 "speaker_map": speaker_map if speaker_map else None,
             }
 
-            # 5. Write JSON sidecar
-            sidecar_path = self.sidecar.write(
-                recording_id=recording_id,
-                system=system,
-                metadata=metadata,
-                transcript=transcript_data,
-                chunks=chunks,
-                summary=None,  # Summary generated asynchronously later
-            )
-
-            # 5b. Move sidecar alongside the original recording file.
-            #     This keeps sidecars co-located with recordings whether on
-            #     HDD (Channels DVR) or inside a Docker volume (SageTV).
-            #     The central sidecars/ dir is just a staging area.
+            # 5. Write JSON sidecar. Sidecar persistence is useful, but a
+            # filesystem/validation failure must not prevent the searchable
+            # transcript index from being updated.
+            sidecar_path = None
             source_file = job.get("file_path")
-            if sidecar_path and source_file:
-                try:
+            try:
+                sidecar_path = self.sidecar.write(
+                    recording_id=recording_id,
+                    system=system,
+                    metadata=metadata,
+                    transcript=transcript_data,
+                    chunks=chunks,
+                    summary=None,  # Summary generated asynchronously later
+                )
+
+                # 5b. Move sidecar alongside the original recording file.
+                #     The central sidecars/ dir is just a staging area.
+                if source_file:
                     recording_dir = os.path.dirname(source_file)
                     dest = os.path.join(recording_dir, os.path.basename(sidecar_path))
                     shutil.copy2(sidecar_path, dest)
                     os.unlink(sidecar_path)
+                    sidecar_path = dest
                     logger.info("Moved sidecar to recording dir: %s", dest)
-                except Exception:
-                    # Keep the staging copy if move fails
-                    logger.warning("Failed to move sidecar to recording dir", exc_info=True)
+            except Exception:
+                logger.warning(
+                    "Failed to persist transcript sidecar for %s; continuing with index",
+                    recording_id,
+                    exc_info=True,
+                )
 
             # 6. Insert into transcript index
             genre = metadata.get("genre", [])

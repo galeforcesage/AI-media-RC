@@ -217,7 +217,7 @@ class FileWatcher:
                 recording_id = Path(path_str).stem
                 logger.info("Watcher '%s' detected deletion: %s", self.name, recording_id)
                 try:
-                    self.on_file_deleted(recording_id)
+                    self.on_file_deleted(recording_id, path_str)
                 except Exception:
                     logger.exception("Error handling deletion for %s", recording_id)
                 del self._known_files[path_str]

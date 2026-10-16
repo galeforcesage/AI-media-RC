@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from pathlib import Path
 
 from src.extractor import AudioExtractor
 from src.queue import TranscriptionQueue
@@ -132,9 +133,23 @@ async def run(args: argparse.Namespace) -> None:
                     await asyncio.sleep(5)
 
         # Deletion callback — remove transcript data when media file disappears
-        def on_file_deleted(recording_id: str):
+        def on_file_deleted(recording_id: str, file_path: str = ""):
             store.delete(recording_id)
             server.index.delete_recording(recording_id)
+            sidecar_candidates = [server.sidecar.output_dir / f"{recording_id}.transcript.json"]
+            if file_path:
+                sidecar_candidates.append(
+                    Path(file_path).with_name(f"{recording_id}.transcript.json")
+                )
+            for sidecar_path in sidecar_candidates:
+                try:
+                    sidecar_path.unlink(missing_ok=True)
+                except OSError:
+                    logging.getLogger(__name__).warning(
+                        "Failed to delete transcript sidecar: %s",
+                        sidecar_path,
+                        exc_info=True,
+                    )
             logging.getLogger(__name__).info("Cleaned up transcript data for deleted file: %s", recording_id)
 
         # Start watchers for each discovered directory
