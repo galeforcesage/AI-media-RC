@@ -9,6 +9,7 @@ and playback context. Used by the orchestrator and HTML5 frontend.
 from __future__ import annotations
 import json
 import logging
+import re
 from typing import Any, Dict
 
 from .models import Device
@@ -16,6 +17,23 @@ from .registry import DeviceRegistry
 from .resolver import SessionResolver
 
 logger = logging.getLogger(__name__)
+
+# SageTV UI context IDs for network clients are bare 12-hex MAC addresses
+# (e.g. "f8e43b5b21a8"). Turn those into something a person can recognize.
+_MAC_CTX_RE = re.compile(r"^[0-9a-fA-F]{12}$")
+
+
+def friendly_sagetv_name(ctx_id: str) -> str:
+    """Human-readable default name for a SageTV context.
+
+    MAC-style context IDs become "SageTV Client AA:BB:CC:DD:EE:FF"; anything
+    else (full clients already report a hostname) is passed through unchanged.
+    """
+    cid = (ctx_id or "").strip()
+    if _MAC_CTX_RE.match(cid):
+        mac = ":".join(cid[i:i + 2] for i in range(0, 12, 2)).upper()
+        return f"SageTV Client {mac}"
+    return cid
 
 
 class SessionManagerAPI:
@@ -109,39 +127,32 @@ class SessionManagerAPI:
         return {"success": True, "device": device.to_dict()}
 
     async def discover_sagetv(self, body: Dict) -> Dict:
-        """Auto-discover SageTV UI contexts and register as devices."""
-        result = await self.resolver._mcp_rpc(
-            self.resolver._sagetv_host, self.resolver._sagetv_port,
-            "tools/call",
-            {"name": "sagetv_get_ui_contexts", "arguments": {}},
-        )
-        content = result.get("content", [])
-        if not content:
+        """On-demand SageTV discovery — delegates to the reconciler."""
+        return await self.reconcile_sagetv()
+
+    async def reconcile_sagetv(self) -> Dict:
+        """Reconcile SageTV context devices against currently-connected clients.
+
+        - Live contexts are upserted and marked online (last_seen refreshed).
+        - SageTV devices whose context is no longer live are marked offline.
+        - Rows, friendly names, and default flags are preserved.
+        If SageTV/MCP is unreachable, no offline sweep happens (avoids flapping).
+        """
+        ctx_ids = await self.resolver.fetch_sagetv_context_ids()
+        if ctx_ids is None:
             return {"success": False, "error": "Could not reach SageTV MCP"}
 
-        try:
-            data = json.loads(content[0].get("text", "{}"))
-        except (json.JSONDecodeError, IndexError):
-            return {"success": False, "error": "Invalid response from SageTV MCP"}
-
-        if not data.get("success"):
-            return {"success": False, "error": data.get("message", "MCP call failed")}
-
-        contexts = data.get("data", [])
         discovered = []
-        for ctx in contexts:
-            ctx_id = ctx.get("context_id", "")
-            if not ctx_id:
-                continue
+        online_device_ids = []
+        for ctx_id in ctx_ids:
             device_id = f"sagetv-ctx-{ctx_id}"
             existing = self.registry.get_device(device_id)
             if existing:
-                self.registry.touch_device(device_id)
-                discovered.append(existing.to_dict())
+                self.registry.set_online(device_id, True)
             else:
                 device = Device(
                     device_id=device_id,
-                    friendly_name=ctx_id,
+                    friendly_name=friendly_sagetv_name(ctx_id),
                     system="sagetv",
                     platform="placeshifter",
                     capabilities={
@@ -151,11 +162,40 @@ class SessionManagerAPI:
                         "supports_commercial_skip": True,
                     },
                     pairing_method="api",
+                    online=True,
                 )
-                self.registry.add_device(device)
-                discovered.append(device.to_dict())
+                try:
+                    self.registry.add_device(device)
+                except ValueError as exc:
+                    logger.warning("Could not register discovered device %s: %s", device_id, exc)
+                    continue
+            online_device_ids.append(device_id)
+            d = self.registry.get_device(device_id)
+            if d:
+                discovered.append(d.to_dict())
 
-        return {"success": True, "discovered": discovered, "count": len(discovered)}
+        swept = self.registry.mark_offline_except("sagetv", online_device_ids)
+
+        # One-time cleanup: upgrade any SageTV rows (including offline ones) that
+        # still use the raw MAC context ID as their name. User renames — where
+        # the name no longer equals the context ID — are left untouched.
+        for d in self.registry.list_devices(include_expired=True):
+            if d.system != "sagetv":
+                continue
+            ctx = (d.capabilities or {}).get("sagetv_context") or \
+                d.device_id.removeprefix("sagetv-ctx-")
+            if d.friendly_name == ctx:
+                nice = friendly_sagetv_name(ctx)
+                if nice != ctx:
+                    self.registry.update_device(d.device_id, {"friendly_name": nice})
+
+        return {
+            "success": True,
+            "discovered": discovered,
+            "count": len(discovered),
+            "online": online_device_ids,
+            "swept_offline": swept,
+        }
 
     # ------------------------------------------------------------------
     # Session endpoints

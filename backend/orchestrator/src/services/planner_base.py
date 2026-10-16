@@ -19,6 +19,7 @@ class PlannerBase(ABC):
         temporal: str = "",
         domains: list[str] | None = None,
         entity_store: Any | None = None,
+        conversation_context: str = "",
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:

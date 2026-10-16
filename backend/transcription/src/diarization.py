@@ -13,7 +13,64 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .gpu import release_cuda_memory, cuda_is_usable
+
 logger = logging.getLogger(__name__)
+
+# pyannote needs a meaningful amount of audio; anything shorter is noise.
+MIN_DIARIZATION_SECONDS = 0.5
+
+# Clustering tunables. Defaults are left at whatever the pretrained pipeline
+# ships with, because there is no labelled ground truth here to tune against
+# and the defaults are the only values validated by upstream.
+#
+# Measured on this box (60min broadcast drama w/ ads vs 40min ad-free reality
+# show), speakers found:
+#
+#   knob                       drama    reality   turns preserved
+#   default                      38        17        yes
+#   min_cluster_size=20          26        14        yes
+#   min_cluster_size=30          19        14        yes
+#   clustering threshold=0.85    24         2        NO (turns 889 -> 648)
+#
+# Raising the clustering threshold looks appealing on scripted drama and then
+# silently collapses multi-speaker content to two speakers, so prefer
+# min_cluster_size if these need tuning. Roughly a third of the drama's extra
+# speakers are real: one-off voices from commercials and guest parts that only
+# appear in a single narrow window.
+DIARIZATION_MIN_CLUSTER_SIZE = os.environ.get("DIARIZATION_MIN_CLUSTER_SIZE")
+DIARIZATION_CLUSTERING_THRESHOLD = os.environ.get("DIARIZATION_CLUSTERING_THRESHOLD")
+DIARIZATION_MAX_SPEAKERS = os.environ.get("DIARIZATION_MAX_SPEAKERS")
+
+
+def _apply_clustering_overrides(pipeline) -> None:
+    """Apply operator-supplied clustering overrides, if any."""
+    clustering = getattr(pipeline, "clustering", None)
+    if clustering is None:
+        return
+    for env_value, attr, cast in (
+        (DIARIZATION_MIN_CLUSTER_SIZE, "min_cluster_size", int),
+        (DIARIZATION_CLUSTERING_THRESHOLD, "threshold", float),
+    ):
+        if not env_value:
+            continue
+        try:
+            setattr(clustering, attr, cast(env_value))
+            logger.info("Diarization clustering.%s overridden to %s", attr, env_value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid %s value %r", attr, env_value)
+
+
+def _max_speakers() -> Optional[int]:
+    """Optional hard cap on distinct speakers, or None to let pyannote decide."""
+    if not DIARIZATION_MAX_SPEAKERS:
+        return None
+    try:
+        return int(DIARIZATION_MAX_SPEAKERS)
+    except ValueError:
+        logger.warning("Ignoring invalid DIARIZATION_MAX_SPEAKERS %r", DIARIZATION_MAX_SPEAKERS)
+        return None
+
 
 # Lazy-loaded pyannote pipeline
 _pipeline = None
@@ -42,6 +99,24 @@ def is_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def is_loaded() -> bool:
+    """True if the diarization pipeline is currently resident in memory."""
+    return _pipeline is not None
+
+
+def unload() -> None:
+    """Release the cached pyannote pipeline and any VRAM it holds.
+
+    The next call to ``diarize()`` transparently reloads it.
+    """
+    global _pipeline
+    if _pipeline is None:
+        return
+    logger.info("Unloading pyannote diarization pipeline to free memory")
+    _pipeline = None
+    release_cuda_memory()
 
 
 def _load_pipeline():
@@ -97,10 +172,39 @@ def _load_pipeline():
 
         logger.info("Loading pyannote speaker-diarization-3.1 pipeline...")
         start = time.time()
-        _pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=token,
-        )
+        # pyannote.audio 4.x renamed `use_auth_token` to `token`; 3.x only
+        # accepts the old name. Try the modern kwarg and fall back so this
+        # works against either major version.
+        try:
+            _pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=token,
+            )
+        except TypeError:
+            _pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=token,
+            )
+        # pyannote defaults to CPU. Move to GPU only when torch can genuinely
+        # run kernels here — see cuda_is_usable() for why is_available() alone
+        # is not enough.
+        if cuda_is_usable():
+            try:
+                import torch
+                # cuDNN autotuning trades memory for speed by trying algorithms
+                # with large workspaces. Measured on this pipeline: benchmark on
+                # peaks at 10.7 GB, off at 1.6 GB, for no speed win (8.2s vs
+                # 10.5s). 10.7 GB would not fit alongside Whisper and an LLM on
+                # a 16 GB card, so pin it off rather than trusting the global
+                # default to stay False.
+                torch.backends.cudnn.benchmark = False
+                _pipeline.to(torch.device("cuda"))
+                logger.info("Diarization pipeline moved to CUDA")
+            except Exception:
+                logger.exception("Could not move diarization pipeline to CUDA; staying on CPU")
+        else:
+            logger.info("Diarization pipeline running on CPU")
+        _apply_clustering_overrides(_pipeline)
         logger.info("Diarization pipeline loaded in %.1fs", time.time() - start)
         return _pipeline
 
@@ -110,24 +214,52 @@ def _load_pipeline():
         return None
 
 
-def _load_audio_as_waveform(audio_path: str) -> dict:
+def _load_audio_as_waveform(audio_path: str) -> Optional[dict]:
     """Load audio file as a waveform dict that pyannote can consume directly.
 
     This bypasses pyannote's built-in audio loading which requires torchcodec.
-    Returns: {"waveform": Tensor(channel, time), "sample_rate": int}
+    Returns {"waveform": Tensor(channel, time), "sample_rate": int}, or None if
+    the file holds too little audio to diarize.
+
+    pyannote rejects any waveform where ``shape[0] > shape[1]``, so a zero-length
+    file (left behind by a failed ffmpeg extraction) arrives as (1, 0) and blows
+    up with a confusing "must be provided as a (channel, time) torch Tensor".
+    Screen those out here instead.
     """
     import torch
     import soundfile as sf
     import numpy as np
 
     data, sample_rate = sf.read(audio_path, dtype="float32")
+    if data.size == 0:
+        logger.warning("Diarization skipped: %s contains no audio samples", audio_path)
+        return None
+
     # soundfile returns (samples,) for mono or (samples, channels) for stereo
     if data.ndim == 1:
         data = data[np.newaxis, :]  # (1, samples)
     else:
         data = data.T  # (channels, samples)
-    waveform = torch.from_numpy(data)
-    return {"waveform": waveform, "sample_rate": sample_rate}
+
+    n_channels, n_samples = data.shape
+    duration = n_samples / float(sample_rate or 1)
+    if duration < MIN_DIARIZATION_SECONDS:
+        logger.warning(
+            "Diarization skipped: %s is only %.2fs (minimum %.2fs)",
+            audio_path, duration, MIN_DIARIZATION_SECONDS,
+        )
+        return None
+    if n_channels > n_samples:
+        logger.warning(
+            "Diarization skipped: %s has more channels (%d) than samples (%d)",
+            audio_path, n_channels, n_samples,
+        )
+        return None
+
+    # .T yields a non-contiguous view; make it contiguous so torch doesn't have
+    # to copy it again downstream.
+    waveform = torch.from_numpy(np.ascontiguousarray(data))
+    return {"waveform": waveform, "sample_rate": int(sample_rate)}
 
 
 def diarize(audio_path: str) -> List[Dict[str, Any]]:
@@ -146,9 +278,22 @@ def diarize(audio_path: str) -> List[Dict[str, Any]]:
     start = time.time()
     # Load audio ourselves to bypass torchcodec AudioDecoder issue
     audio_input = _load_audio_as_waveform(audio_path)
-    result = pipeline(audio_input)
+    if audio_input is None:
+        return []
+    kwargs: Dict[str, Any] = {}
+    max_speakers = _max_speakers()
+    if max_speakers:
+        kwargs["max_speakers"] = max_speakers
+    result = pipeline(audio_input, **kwargs)
     elapsed = time.time() - start
     logger.info("Diarization complete in %.1fs", elapsed)
+
+    # pyannote's own weights are only ~30 MB, but a full-episode run leaves
+    # several GB of freed blocks sitting in torch's caching allocator, which
+    # nvidia-smi reports as in use. Hand them back now rather than at unload:
+    # otherwise a single job pins ~4 GB for the whole idle window, on top of
+    # whatever Whisper is holding.
+    release_cuda_memory()
 
     # Newer pyannote returns DiarizeOutput wrapper; extract Annotation
     annotation = getattr(result, "speaker_diarization", result)

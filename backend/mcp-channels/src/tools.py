@@ -370,6 +370,14 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
     start_date = args.get("start_date")
     end_date = args.get("end_date")
     watched = args.get("watched")  # None=any, true=watched only, false=unwatched only
+    original_air_year = args.get("original_air_year")
+    if original_air_year is not None:
+        try:
+            original_air_year = int(original_air_year)
+        except (TypeError, ValueError):
+            original_air_year = None
+        if original_air_year == 0:
+            original_air_year = None
     limit = int(args.get("limit", 50))
 
     # ── Sanitize LLM-provided args ──
@@ -442,6 +450,12 @@ async def _search_recordings(client, args: Dict, bridge=None) -> Dict:
         if episode is not None:
             rec_episode = airing.get("EpisodeNumber", 0)
             if int(episode) != int(rec_episode):
+                continue
+
+        if original_air_year is not None:
+            orig = str(airing.get("OriginalDate", ""))
+            if not (len(orig) >= 4 and orig[:4].isdigit()
+                    and int(orig[:4]) == original_air_year):
                 continue
 
         rec_time = airing.get("Time") or rec.get("CreatedAt") or 0
@@ -975,6 +989,7 @@ TOOL_REGISTRY = {
                 "episode": {"type": "integer", "description": "Episode number filter (e.g. 14 for E14)"},
                 "start_date": {"type": "string", "description": "Minimum date (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Maximum date (YYYY-MM-DD)"},
+                "original_air_year": {"type": "integer", "description": "Original-air-date year filter (e.g. 2019). Matches the episode's first-aired year, not the recording date."},
                 "watched": {"type": "boolean", "description": "Filter by watched status: true=watched only, false=unwatched only, omit=all"},
                 "limit": {"type": "integer", "description": "Max results (default 50)"},
             },

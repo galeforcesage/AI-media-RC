@@ -12,6 +12,7 @@ from utils.logger import get_logger
 from services.mcp_tool_registry import MCPToolRegistry
 from services.planner_base import PlannerBase
 from services.openclaw_runtime import OpenClawRuntime
+from services.openclaw_http import OpenClawHTTPRuntime
 
 logger = get_logger(__name__)
 
@@ -23,8 +24,13 @@ class OpenClawPlanner(PlannerBase):
         self._orch = orchestrator
         self._fallback = fallback_planner
         self._tool_registry = MCPToolRegistry(orchestrator)
-        self._runtime = OpenClawRuntime(
-            orchestrator.config.get("agent", {}).get("openclaw", {})
+        openclaw_cfg = orchestrator.config.get("agent", {}).get("openclaw", {})
+        self._runtime = OpenClawRuntime(openclaw_cfg)
+        # Preferred runtime: talk to a real OpenClaw Gateway over HTTP when a
+        # gateway_url is configured. Tool calls are executed inside the
+        # orchestrator via the fallback AgentLoop's guarded _execute_tool.
+        self._http_runtime = OpenClawHTTPRuntime(
+            orchestrator, openclaw_cfg, fallback_planner
         )
 
     async def run(
@@ -36,6 +42,7 @@ class OpenClawPlanner(PlannerBase):
         temporal: str = "",
         domains: list[str] | None = None,
         entity_store: Any | None = None,
+        conversation_context: str = "",
         status_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         token_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
@@ -57,6 +64,7 @@ class OpenClawPlanner(PlannerBase):
                 temporal=temporal,
                 domains=domains,
                 entity_store=entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
@@ -65,7 +73,14 @@ class OpenClawPlanner(PlannerBase):
             return result
 
         logger.info("OpenClaw planner selected (native stub mode)")
-        if status_callback:
+        # Only advertise "Planning with OpenClaw" when a runtime callable is
+        # actually configured and loadable. Otherwise the runtime is guaranteed
+        # to raise "not configured" below and fall back, so announcing it (and
+        # the later "falling back" line) is misleading noise on every query.
+        # Prefer the HTTP gateway runtime when configured; else the callable.
+        runtime = self._http_runtime if self._http_runtime.available() else self._runtime
+        runtime_available = runtime.available()
+        if status_callback and runtime_available:
             await status_callback("Planning with OpenClaw")
 
         tools, _schemas = await self._tool_registry.discover_openai_tools(
@@ -78,6 +93,7 @@ class OpenClawPlanner(PlannerBase):
             "query": user_query,
             "transcript_context": transcript_context,
             "semantic_context": semantic_context,
+            "conversation_context": conversation_context,
             "systems": systems or [],
             "temporal": temporal,
             "domains": domains or [],
@@ -86,7 +102,12 @@ class OpenClawPlanner(PlannerBase):
         }
 
         try:
-            runtime_result = await self._runtime.execute(payload, timeout_ms=timeout_ms)
+            if isinstance(runtime, OpenClawHTTPRuntime):
+                runtime_result = await runtime.execute(
+                    payload, timeout_ms=timeout_ms, status_callback=status_callback
+                )
+            else:
+                runtime_result = await runtime.execute(payload, timeout_ms=timeout_ms)
             runtime_result.setdefault("planner", "openclaw-native")
             runtime_result.setdefault("openai_tools_offered", len(tools))
             return runtime_result
@@ -102,7 +123,7 @@ class OpenClawPlanner(PlannerBase):
                     "openai_tools_offered": len(tools),
                 }
 
-            if status_callback:
+            if status_callback and runtime_available:
                 await status_callback("OpenClaw runtime unavailable, falling back")
 
             result = await self._fallback.run(
@@ -113,10 +134,12 @@ class OpenClawPlanner(PlannerBase):
                 temporal=temporal,
                 domains=domains,
                 entity_store=entity_store,
+                conversation_context=conversation_context,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
             if isinstance(result, dict):
                 result.setdefault("planner", "openclaw-fallback-runtime")
                 result.setdefault("openclaw_error", str(exc))
+                result.setdefault("openai_tools_offered", len(tools))
             return result

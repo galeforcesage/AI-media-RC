@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from pathlib import Path
 
 from src.extractor import AudioExtractor
 from src.queue import TranscriptionQueue
@@ -51,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--whisper-threads", type=int, default=_quarter, help=f"CPU threads for Whisper inference (default: {_quarter}, 25%% of cores)")
     p.add_argument("--ffmpeg-threads", type=int, default=_ffmpeg, help=f"CPU threads for ffmpeg extraction (default: {_ffmpeg})")
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--gpu-idle-timeout", type=float, default=600.0,
+                   help="Release Whisper/diarization models after this many seconds "
+                        "with an empty queue, freeing VRAM (0 disables; default: 600)")
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
     p.add_argument("--no-live", action="store_true", help="Disable live/incremental transcription during recording")
@@ -99,24 +103,53 @@ async def run(args: argparse.Namespace) -> None:
         if args.channels_dir:
             channels_dirs = list(args.channels_dir)
 
-        # Auto-discover any directories not explicitly set
-        if not sagetv_dirs or not channels_dirs:
-            logging.getLogger(__name__).info("Auto-discovering recording directories from MCP servers...")
+        # MCP services may still be starting during a system reboot. A single
+        # failed discovery used to leave the transcription service healthy on
+        # port 8770 but with no SageTV watcher for the lifetime of the process.
+        # Retry only the missing systems, with a bounded startup delay.
+        for attempt in range(1, 7):
+            need_sagetv = not sagetv_dirs
+            need_channels = not channels_dirs
+            if not need_sagetv and not need_channels:
+                break
+
+            logging.getLogger(__name__).info(
+                "Auto-discovering recording directories from MCP servers "
+                "(attempt %d/6)...", attempt,
+            )
             discovered = await discover_all(
                 sagetv_host=sagetv_mcp_host,
                 sagetv_port=sagetv_mcp_port,
                 channels_host=channels_mcp_host,
                 channels_port=channels_mcp_port,
             )
-            if not sagetv_dirs:
+            if need_sagetv:
                 sagetv_dirs = discovered.get("sagetv", [])
-            if not channels_dirs:
+            if need_channels:
                 channels_dirs = discovered.get("channelsdvr", [])
 
+            if (need_sagetv and not sagetv_dirs) or (need_channels and not channels_dirs):
+                if attempt < 6:
+                    await asyncio.sleep(5)
+
         # Deletion callback — remove transcript data when media file disappears
-        def on_file_deleted(recording_id: str):
+        def on_file_deleted(recording_id: str, file_path: str = ""):
             store.delete(recording_id)
             server.index.delete_recording(recording_id)
+            sidecar_candidates = [server.sidecar.output_dir / f"{recording_id}.transcript.json"]
+            if file_path:
+                sidecar_candidates.append(
+                    Path(file_path).with_name(f"{recording_id}.transcript.json")
+                )
+            for sidecar_path in sidecar_candidates:
+                try:
+                    sidecar_path.unlink(missing_ok=True)
+                except OSError:
+                    logging.getLogger(__name__).warning(
+                        "Failed to delete transcript sidecar: %s",
+                        sidecar_path,
+                        exc_info=True,
+                    )
             logging.getLogger(__name__).info("Cleaned up transcript data for deleted file: %s", recording_id)
 
         # Start watchers for each discovered directory
@@ -154,6 +187,7 @@ async def run(args: argparse.Namespace) -> None:
             extractor=extractor,
             engine=engine,
             concurrency=args.concurrency,
+            gpu_idle_timeout=args.gpu_idle_timeout,
         )
         # Wire enrichment pipeline with configurable MCP endpoints
         worker.enrichment = MetadataEnrichmentPipeline(

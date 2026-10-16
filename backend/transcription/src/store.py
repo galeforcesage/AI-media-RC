@@ -101,7 +101,7 @@ class MetadataStore:
             self._conn.execute(
                 "SELECT count(*) FROM transcripts_fts WHERE transcripts_fts MATCH 'test'"
             ).fetchone()
-        except Exception as e:
+        except sqlite3.DatabaseError as e:
             logger.warning("FTS5 index corrupt (%s), rebuilding...", e)
             try:
                 self._conn.execute(
@@ -109,7 +109,7 @@ class MetadataStore:
                 )
                 self._conn.commit()
                 logger.info("FTS5 index rebuilt successfully")
-            except Exception:
+            except sqlite3.DatabaseError:
                 logger.warning("FTS5 rebuild failed, dropping and recreating...")
                 self._conn.executescript("""
                     DROP TABLE IF EXISTS transcripts_fts;
@@ -195,19 +195,36 @@ class MetadataStore:
         terms = [t for t in re.findall(r"[A-Za-z0-9]+", query or "") if t]
         if not terms:
             return []
-        fts_query = " AND ".join(f'"{t}"' for t in terms)
-        try:
-            rows = self._conn.execute(
-                """SELECT t.* FROM transcripts t
+        # Try strict AND first, then fall back to OR so multi-word queries
+        # that share no single chunk still return the best-ranked matches.
+        and_query = " AND ".join(f'"{t}"' for t in terms)
+        or_query = " OR ".join(f'"{t}"' for t in terms)
+        _sql = """SELECT t.* FROM transcripts t
                    INNER JOIN transcripts_fts f ON t.recording_id = f.recording_id
                    WHERE transcripts_fts MATCH ?
                    ORDER BY rank
-                   LIMIT ?""",
-                (fts_query, limit),
-            ).fetchall()
+                   LIMIT ?"""
+        try:
+            rows = self._conn.execute(_sql, (and_query, limit)).fetchall()
+            if not rows and or_query != and_query:
+                rows = self._conn.execute(_sql, (or_query, limit)).fetchall()
         except sqlite3.OperationalError as exc:
-            logger.warning("FTS search failed for %r (sanitized=%r): %s", query, fts_query, exc)
+            logger.warning("FTS search failed for %r (sanitized=%r): %s", query, and_query, exc)
             return []
+        except sqlite3.DatabaseError as exc:
+            # SQLITE_CORRUPT ("database disk image is malformed") can surface on a
+            # long-lived connection whose FTS shadow state went bad even when the
+            # on-disk DB is healthy. Heal the FTS index once and retry so a single
+            # bad query doesn't take transcript search down until a restart.
+            logger.warning("FTS search hit DatabaseError for %r: %s — healing and retrying", query, exc)
+            try:
+                self._check_fts_integrity()
+                rows = self._conn.execute(_sql, (and_query, limit)).fetchall()
+                if not rows and or_query != and_query:
+                    rows = self._conn.execute(_sql, (or_query, limit)).fetchall()
+            except sqlite3.DatabaseError as exc2:
+                logger.error("FTS search still failing after heal for %r: %s", query, exc2)
+                return []
         return [self._row_to_meta(r) for r in rows]
 
     def list_recent(self, limit: int = 50) -> List[TranscriptMetadata]:

@@ -338,7 +338,12 @@ class TranscriptIndex:
         _tokens = [t for t in _re.findall(r"[A-Za-z0-9]+", query or "") if t]
         if not _tokens:
             return []
-        _fts_query = " AND ".join(f'"{t}"' for t in _tokens)
+        # FTS5 ANDs quoted terms by default, so a full natural-language
+        # question matches nothing. Try strict AND first, then fall back to OR
+        # (bm25-ranked) so multi-word questions still surface relevant chunks.
+        _and_query = " AND ".join(f'"{t}"' for t in _tokens)
+        _or_query = " OR ".join(f'"{t}"' for t in _tokens)
+        _fts_query = _and_query
         conditions = ["transcript_fts MATCH ?"]
         params: list = [_fts_query]
 
@@ -366,8 +371,15 @@ class TranscriptIndex:
             params.append(filters["system"])
 
         where = " AND ".join(conditions)
-        params.extend([limit, offset])
 
+        # Fetch a generous candidate pool (bm25-ranked chunks), then re-rank so
+        # that the recording which is genuinely *about* the query — i.e. the one
+        # with the most matching chunks — wins, instead of a single coincidental
+        # chunk in an unrelated show. Without this, a 4-word query like
+        # "cleveland browns chicago bears" could match one stray chunk in some
+        # sitcom and never surface the actual game (which matches "browns"/
+        # "bears" across ~200 chunks but rarely all four words in one 30s slice).
+        _CANDIDATE_CAP = max(limit * 25, 400)
         sql = f"""
             SELECT r.recording_id, r.title, r.episode_title, r.channel,
                    r.genre, r.system, r.record_date, r.air_date,
@@ -379,15 +391,39 @@ class TranscriptIndex:
             JOIN recordings r ON r.recording_id = tc.recording_id
             WHERE {where}
             ORDER BY rank
-            LIMIT ? OFFSET ?
+            LIMIT ?
         """
 
+        def _fetch(fts_query: str) -> list:
+            p = list(params)
+            p[0] = fts_query
+            p.append(_CANDIDATE_CAP)
+            return self._conn.execute(sql, p).fetchall()
+
         try:
-            rows = self._conn.execute(sql, params).fetchall()
-            return [dict(row) for row in rows]
+            rows = _fetch(_and_query)
+            # Fall back to OR when strict AND is too sparse to establish which
+            # recording the query is about (a single AND hit is usually a fluke).
+            if len(rows) < max(3, limit) and _or_query != _and_query:
+                or_rows = _fetch(_or_query)
+                if len(or_rows) > len(rows):
+                    rows = or_rows
         except sqlite3.OperationalError as e:
             logger.error("FTS search error: %s", e)
             return []
+
+        if not rows:
+            return []
+
+        # Re-rank: recordings with more matching chunks first (they are the real
+        # topical match), preserving bm25 chunk rank as the tiebreaker within a
+        # recording. `rank` is bm25 (more negative = better).
+        from collections import Counter
+        rec_hits = Counter(row["recording_id"] for row in rows)
+        indexed = list(enumerate(rows))
+        indexed.sort(key=lambda ir: (-rec_hits[ir[1]["recording_id"]], ir[1]["rank"], ir[0]))
+        ordered = [dict(row) for _, row in indexed]
+        return ordered[offset:offset + limit]
 
     def search_by_actor(self, actor_name: str, limit: int = 20) -> List[Dict[str, Any]]:
         rows = self._conn.execute(

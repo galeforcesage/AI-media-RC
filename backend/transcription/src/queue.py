@@ -85,11 +85,32 @@ class TranscriptionQueue:
         return job
 
     def dequeue(self) -> Optional[TranscriptionJob]:
-        """Get the next pending job (oldest first)."""
+        """Claim the next pending job (oldest first).
+
+        The claim has to happen here, not in the worker. The worker hands each
+        job to a background task and immediately polls again, so a row that was
+        only read stays 'pending' and gets handed out a second time before the
+        task has started. With concurrency 1 the duplicate simply waits on the
+        semaphore and then transcribes the same recording all over again, which
+        doubled GPU time per recording and made the queue appear to stall.
+        Flipping the row to 'extracting' as part of the claim closes that
+        window; a claim lost to another worker returns None.
+
+        Attempts are counted by the worker's own 'extracting' update, so this
+        deliberately does not increment them.
+        """
         row = self._conn.execute(
             "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
+            return None
+        claimed = self._conn.execute(
+            "UPDATE jobs SET status = 'extracting', updated_at = ?"
+            " WHERE job_id = ? AND status = 'pending'",
+            (time.time(), row["job_id"]),
+        )
+        self._conn.commit()
+        if claimed.rowcount == 0:
             return None
         return self._row_to_job(row)
 
@@ -173,6 +194,47 @@ class TranscriptionQueue:
             }
             for r in rows
         ]
+
+    def reset_stale_jobs(self, stale_seconds: int = 0) -> int:
+        """Return abandoned 'extracting'/'processing' jobs to the queue.
+
+        Those two states only make sense while a worker is actively holding the
+        job. If the process dies mid-extraction the row is never updated again,
+        which strands it permanently: enqueue() refuses to re-add a recording
+        that already has a non-terminal job, so the recording can never be
+        transcribed again. Jobs past max_attempts go to 'error' instead of
+        looping forever. Returns the number of rows changed.
+
+        This is called at worker startup, where by definition no worker holds
+        any job, so the default age cutoff is 0: every non-terminal row is
+        abandoned. An earlier version defaulted to 1800s, which quietly stranded
+        any job abandoned within 30 minutes of a restart until some later
+        restart happened to fall outside that window. Pass a positive
+        stale_seconds only if several workers ever share one database, where a
+        row may belong to a live peer.
+        """
+        cutoff = time.time() - stale_seconds
+        rows = self._conn.execute(
+            """SELECT job_id, attempts, max_attempts FROM jobs
+               WHERE status IN ('extracting', 'processing') AND updated_at < ?""",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0
+        now = time.time()
+        for r in rows:
+            exhausted = (r["attempts"] or 0) >= (r["max_attempts"] or 3)
+            self._conn.execute(
+                "UPDATE jobs SET status = ?, updated_at = ?, error = ? WHERE job_id = ?",
+                (
+                    "error" if exhausted else "pending",
+                    now,
+                    "Abandoned in progress; worker exited before finishing",
+                    r["job_id"],
+                ),
+            )
+        self._conn.commit()
+        return len(rows)
 
     def _row_to_job(self, row) -> TranscriptionJob:
         return TranscriptionJob(

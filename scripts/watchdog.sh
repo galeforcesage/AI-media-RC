@@ -9,12 +9,14 @@
 #   watchdog.sh <service-name>
 #   watchdog.sh all            # start all services with watchdogs
 #   watchdog.sh stop           # stop all watchdog-managed services
+#   watchdog.sh wait-ready [s] # verify all watchdogs and ports within timeout
 #
 # Services: orchestrator, mcp-sagetv, mcp-channels, mcp-linux, transcription, session-manager
 
 set -uo pipefail
 
-ROOT="/home/USER_HOME/AI-media-RC"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 ORCH_VENV="$ROOT/backend/orchestrator/.venv/bin/python"
 TRANS_VENV="$ROOT/backend/transcription/.venv/bin/python"
 
@@ -161,7 +163,11 @@ run_watchdog() {
                     echo "[$(date '+%F %T')] HEALTH CHECK FAILED: $svc port $port not listening after $health_fails checks — killing pid $child" >> "$wlog"
                     emit_alert "$svc" "warning" "health_check_failed" "port $port not listening after $health_fails checks; killing pid $child"
                     kill "$child" 2>/dev/null
-                    sleep 2
+                    # Grace period for graceful shutdown (GPU lease release)
+                    for _ in $(seq 1 10); do
+                        kill -0 "$child" 2>/dev/null || break
+                        sleep 0.5
+                    done
                     kill -9 "$child" 2>/dev/null
                     wait "$child" 2>/dev/null
                     exit_code=1  # treat as crash
@@ -276,15 +282,28 @@ stop_service() {
         rm -f "$PIDFILE_DIR/${svc}-watchdog.pid"
     fi
 
-    # Then kill the service
+    # Then send SIGTERM and give the service time to shut down gracefully —
+    # this lets the orchestrator release any held GPU lease before exit.
     if [[ -f "$PIDFILE_DIR/${svc}.pid" ]]; then
         local spid
         spid=$(cat "$PIDFILE_DIR/${svc}.pid")
-        kill "$spid" 2>/dev/null && echo "  $svc: service (pid $spid) stopped"
+        if kill "$spid" 2>/dev/null; then
+            echo "  $svc: service (pid $spid) sent SIGTERM, waiting for graceful shutdown"
+            # Wait up to ~10s for a clean shutdown (GPU lease release, etc.)
+            for _ in $(seq 1 20); do
+                kill -0 "$spid" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "$spid" 2>/dev/null; then
+                kill -9 "$spid" 2>/dev/null && echo "  $svc: service (pid $spid) force-killed after grace period"
+            else
+                echo "  $svc: service stopped cleanly"
+            fi
+        fi
         rm -f "$PIDFILE_DIR/${svc}.pid"
     fi
 
-    # Belt-and-suspenders: kill anything on the port
+    # Belt-and-suspenders: kill anything still bound to the port
     fuser -k "$port/tcp" 2>/dev/null || true
 }
 
@@ -313,6 +332,35 @@ status_all() {
     done
 }
 
+wait_ready() {
+    local timeout="${1:-120}"
+    local deadline=$(( $(date +%s) + timeout ))
+    local -a pending=()
+
+    echo "Waiting up to ${timeout}s for all AI-media-RC services..."
+    while (( $(date +%s) < deadline )); do
+        pending=()
+        for svc in "${ALL_SERVICES[@]}"; do
+            local port="${SVC_PORT[$svc]}"
+            if ! is_watchdog_running "$svc"; then
+                pending+=("$svc (watchdog not running)")
+            elif ! ss -tlnH "sport = :$port" 2>/dev/null | grep -q "$port"; then
+                pending+=("$svc (port $port not listening)")
+            fi
+        done
+
+        if (( ${#pending[@]} == 0 )); then
+            echo "All AI-media-RC services are ready."
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo "AI-media-RC startup timed out after ${timeout}s:" >&2
+    printf '  - %s\n' "${pending[@]}" >&2
+    return 1
+}
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -335,6 +383,9 @@ case "${1:-}" in
     status)
         status_all
         ;;
+    wait-ready)
+        wait_ready "${2:-120}"
+        ;;
     restart)
         svc="${2:-}"
         if [[ -z "$svc" ]]; then
@@ -356,7 +407,7 @@ case "${1:-}" in
         fi
         ;;
     "")
-        echo "Usage: $0 {all|stop|status|restart [service]|<service-name>}"
+        echo "Usage: $0 {all|stop|status|wait-ready [seconds]|restart [service]|<service-name>}"
         echo "Services: ${ALL_SERVICES[*]}"
         exit 1
         ;;

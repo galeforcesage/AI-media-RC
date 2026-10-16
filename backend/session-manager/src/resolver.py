@@ -183,6 +183,27 @@ class SessionResolver:
             logger.warning("MCP RPC to %s:%d failed: %s", host, port, exc)
             return {}
 
+    async def fetch_sagetv_context_ids(self) -> Optional[List[str]]:
+        """Return live SageTV UI context IDs, or None if the MCP is unreachable.
+
+        An empty list means SageTV is reachable but no clients are connected —
+        callers should then treat all SageTV context devices as offline.
+        """
+        result = await self._mcp_rpc(
+            self._sagetv_host, self._sagetv_port, "tools/call",
+            {"name": "sagetv_get_ui_contexts", "arguments": {}},
+        )
+        content = result.get("content", [])
+        if not content:
+            return None
+        try:
+            data = json.loads(content[0].get("text", "{}"))
+        except (json.JSONDecodeError, IndexError):
+            return None
+        if not data.get("success"):
+            return None
+        return [c.get("context_id", "") for c in data.get("data", []) if c.get("context_id")]
+
     async def _query_sagetv_sessions(self) -> List[Dict]:
         """Query SageTV MCP for active playback sessions."""
         result = await self._mcp_rpc(
