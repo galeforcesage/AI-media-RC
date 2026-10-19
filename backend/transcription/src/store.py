@@ -56,8 +56,40 @@ class MetadataStore:
             if "source" not in cols:
                 self._conn.execute("ALTER TABLE transcripts ADD COLUMN source TEXT DEFAULT 'stt'")
                 logger.info("transcripts: added 'source' column (default 'stt')")
+            if "transcript_state" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE transcripts ADD COLUMN transcript_state TEXT DEFAULT 'final'"
+                )
+                logger.info("transcripts: added 'transcript_state' column")
         except Exception:
             logger.exception("Failed to add 'source' column (non-fatal)")
+
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS transcript_segments (
+                recording_id TEXT NOT NULL,
+                segment_key TEXT NOT NULL,
+                start_time REAL NOT NULL,
+                end_time REAL NOT NULL,
+                cc_text TEXT DEFAULT '',
+                cc_timestamp REAL,
+                asr_text TEXT DEFAULT '',
+                asr_word_timestamps TEXT DEFAULT '[]',
+                asr_confidence REAL,
+                speaker_id TEXT,
+                resolved_text TEXT DEFAULT '',
+                resolved_source TEXT DEFAULT '',
+                resolution_confidence REAL DEFAULT 0,
+                commercial_probability REAL,
+                comskip_state TEXT DEFAULT '',
+                transcript_state TEXT NOT NULL DEFAULT 'live',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (recording_id, segment_key)
+            )
+        """)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_segments_recording_time "
+            "ON transcript_segments(recording_id, start_time)"
+        )
 
         # FTS5 virtual table for full-text search
         self._conn.execute("""
@@ -152,13 +184,15 @@ class MetadataStore:
         self._conn.execute(
             """INSERT OR REPLACE INTO transcripts
                (recording_id, system, title, episode, duration, word_count,
-                transcript, summary, keywords, topics, scenes, vtt, source, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                transcript, summary, keywords, topics, scenes, vtt, source,
+                transcript_state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (meta.recording_id, meta.system, meta.title, meta.episode,
              meta.duration, meta.word_count, meta.transcript, meta.summary,
              json.dumps(meta.keywords), json.dumps(meta.topics),
              json.dumps(meta.scenes), meta.vtt,
              getattr(meta, "source", "stt") or "stt",
+             getattr(meta, "transcript_state", "final") or "final",
              meta.created_at),
         )
         self._conn.commit()
@@ -175,6 +209,9 @@ class MetadataStore:
 
     def delete(self, recording_id: str) -> bool:
         """Delete a transcript by recording_id. Returns True if a row was removed."""
+        self._conn.execute(
+            "DELETE FROM transcript_segments WHERE recording_id = ?", (recording_id,)
+        )
         cursor = self._conn.execute(
             "DELETE FROM transcripts WHERE recording_id = ?", (recording_id,)
         )
@@ -246,7 +283,275 @@ class MetadataStore:
             "cc_only_count": source_counts.get("cc", 0),
             "stt_full_count": source_counts.get("stt", 0),
             "mixed_count": source_counts.get("mixed", 0),
+            "progressive_states": {
+                row["transcript_state"]: row["c"]
+                for row in self._conn.execute(
+                    "SELECT COALESCE(transcript_state, 'final') AS transcript_state, "
+                    "COUNT(*) AS c FROM transcripts GROUP BY transcript_state"
+                ).fetchall()
+            },
         }
+
+    def ingest_evidence(
+        self,
+        recording_id: str,
+        system: str,
+        segments: List[Dict],
+        evidence: str,
+        final: bool = False,
+    ) -> None:
+        """Idempotently upsert CC or ASR evidence and rematerialize the transcript."""
+        if evidence not in {"cc", "asr"}:
+            raise ValueError(f"Unsupported transcript evidence: {evidence}")
+        now = time.time()
+        for segment in segments:
+            start = round(float(segment.get("start", 0)), 2)
+            end = round(float(segment.get("end", start)), 2)
+            text = str(segment.get("text", "")).strip()
+            if not text or end <= start:
+                continue
+            speaker = segment.get("speaker")
+            if evidence == "cc":
+                from .cc_extractor import strip_speaker_prefix
+                text, hint = strip_speaker_prefix(text)
+                speaker = speaker or hint
+            key = f"{evidence}:{int(round(start * 1000))}"
+            if evidence == "asr":
+                candidates = self._conn.execute(
+                    """SELECT segment_key, start_time, end_time, asr_text
+                       FROM transcript_segments
+                       WHERE recording_id=? AND segment_key LIKE 'asr:%'
+                         AND start_time < ? AND end_time > ?""",
+                    (recording_id, end, start),
+                ).fetchall()
+                for candidate in candidates:
+                    overlap = min(end, candidate["end_time"]) - max(
+                        start, candidate["start_time"]
+                    )
+                    shorter = max(
+                        0.001,
+                        min(end - start, candidate["end_time"] - candidate["start_time"]),
+                    )
+                    similarity = __import__("difflib").SequenceMatcher(
+                        None, text.lower(), candidate["asr_text"].lower()
+                    ).ratio()
+                    if overlap / shorter >= 0.5 and similarity >= 0.6:
+                        key = candidate["segment_key"]
+                        break
+            state = "final" if final else "live"
+            if evidence == "cc":
+                self._conn.execute(
+                    """INSERT INTO transcript_segments
+                       (recording_id, segment_key, start_time, end_time, cc_text,
+                        cc_timestamp, speaker_id, transcript_state, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(recording_id, segment_key) DO UPDATE SET
+                         start_time=excluded.start_time, end_time=excluded.end_time,
+                         cc_text=excluded.cc_text, cc_timestamp=excluded.cc_timestamp,
+                         speaker_id=COALESCE(excluded.speaker_id, speaker_id),
+                         transcript_state=CASE
+                           WHEN transcript_state='final' THEN 'final'
+                           ELSE excluded.transcript_state END,
+                         updated_at=excluded.updated_at""",
+                    (recording_id, key, start, end, text, now, speaker, state, now),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO transcript_segments
+                       (recording_id, segment_key, start_time, end_time, asr_text,
+                        asr_word_timestamps, asr_confidence, speaker_id,
+                        transcript_state, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(recording_id, segment_key) DO UPDATE SET
+                         start_time=excluded.start_time, end_time=excluded.end_time,
+                         asr_text=excluded.asr_text,
+                         asr_word_timestamps=excluded.asr_word_timestamps,
+                         asr_confidence=excluded.asr_confidence,
+                         speaker_id=COALESCE(excluded.speaker_id, speaker_id),
+                         transcript_state=CASE
+                           WHEN transcript_state='final' THEN 'final'
+                           ELSE excluded.transcript_state END,
+                         updated_at=excluded.updated_at""",
+                    (
+                        recording_id, key, start, end, text,
+                        json.dumps(segment.get("words") or []),
+                        segment.get("confidence"), speaker, state, now,
+                    ),
+                )
+        self._reconcile_segments(recording_id, final=final)
+        self._materialize_progressive(recording_id, system)
+        self._conn.commit()
+
+    def _reconcile_segments(self, recording_id: str, final: bool = False) -> None:
+        from .progressive import resolve_text
+
+        rows = self._conn.execute(
+            "SELECT * FROM transcript_segments WHERE recording_id = ? "
+            "ORDER BY start_time, end_time",
+            (recording_id,),
+        ).fetchall()
+        cc_rows = [r for r in rows if r["segment_key"].startswith("cc:")]
+        asr_rows = [r for r in rows if r["segment_key"].startswith("asr:")]
+        matched_asr = set()
+
+        for cc in cc_rows:
+            best = None
+            best_overlap = 0.0
+            for asr in asr_rows:
+                overlap = min(cc["end_time"], asr["end_time"]) - max(
+                    cc["start_time"], asr["start_time"]
+                )
+                if overlap > best_overlap:
+                    best, best_overlap = asr, overlap
+            asr_text = best["asr_text"] if best is not None and best_overlap > 0 else ""
+            if best is not None and best_overlap > 0:
+                matched_asr.add(best["segment_key"])
+            text, source, confidence = resolve_text(cc["cc_text"], asr_text)
+            state = "final" if final or cc["transcript_state"] == "final" else (
+                "stable" if asr_text else "live"
+            )
+            self._conn.execute(
+                """UPDATE transcript_segments
+                   SET asr_text=CASE WHEN ? != '' THEN ? ELSE asr_text END,
+                       resolved_text=?, resolved_source=?,
+                       resolution_confidence=?, transcript_state=?, updated_at=?
+                   WHERE recording_id=? AND segment_key=?""",
+                (
+                    asr_text, asr_text, text, source, confidence, state, time.time(),
+                    recording_id, cc["segment_key"],
+                ),
+            )
+
+        for asr in asr_rows:
+            if asr["segment_key"] in matched_asr:
+                self._conn.execute(
+                    "UPDATE transcript_segments SET resolved_text='' "
+                    "WHERE recording_id=? AND segment_key=?",
+                    (recording_id, asr["segment_key"]),
+                )
+                continue
+            text, source, confidence = resolve_text("", asr["asr_text"])
+            state = "final" if final or asr["transcript_state"] == "final" else "live"
+            self._conn.execute(
+                """UPDATE transcript_segments
+                   SET resolved_text=?, resolved_source=?,
+                       resolution_confidence=?, transcript_state=?, updated_at=?
+                   WHERE recording_id=? AND segment_key=?""",
+                (
+                    text, source, confidence, state, time.time(),
+                    recording_id, asr["segment_key"],
+                ),
+            )
+
+    def finalize_recording(self, recording_id: str, system: str) -> None:
+        self._conn.execute(
+            "UPDATE transcript_segments SET transcript_state='final', updated_at=? "
+            "WHERE recording_id=?",
+            (time.time(), recording_id),
+        )
+        self._reconcile_segments(recording_id, final=True)
+        self._materialize_progressive(recording_id, system)
+        self._conn.commit()
+
+    def get_segments(self, recording_id: str) -> List[Dict]:
+        rows = self._conn.execute(
+            """SELECT segment_key, start_time AS start, end_time AS end,
+                      cc_text, asr_text, asr_word_timestamps, asr_confidence,
+                      speaker_id AS speaker, resolved_text AS text,
+                      resolved_source AS source,
+                      resolution_confidence AS confidence,
+                      commercial_probability, comskip_state,
+                      transcript_state AS state
+               FROM transcript_segments
+               WHERE recording_id=? AND resolved_text != ''
+               ORDER BY start_time, end_time""",
+            (recording_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            segment = dict(row)
+            try:
+                segment["asr_word_timestamps"] = json.loads(
+                    segment["asr_word_timestamps"] or "[]"
+                )
+            except (TypeError, json.JSONDecodeError):
+                segment["asr_word_timestamps"] = []
+            result.append(segment)
+        return result
+
+    def get_evidence_end(self, recording_id: str, evidence: str) -> float:
+        column = "cc_text" if evidence == "cc" else "asr_text"
+        row = self._conn.execute(
+            f"SELECT COALESCE(MAX(end_time), 0) FROM transcript_segments "
+            f"WHERE recording_id=? AND {column} != ''",
+            (recording_id,),
+        ).fetchone()
+        return float(row[0] or 0)
+
+    def get_transcript_state(self, recording_id: str) -> str:
+        row = self._conn.execute(
+            """SELECT CASE
+                 WHEN SUM(transcript_state='live') > 0 THEN 'live'
+                 WHEN SUM(transcript_state='stable') > 0 THEN 'stable'
+                 ELSE 'final' END
+               FROM transcript_segments
+               WHERE recording_id=? AND resolved_text != ''""",
+            (recording_id,),
+        ).fetchone()
+        return str(row[0] or "live")
+
+    def _materialize_progressive(self, recording_id: str, system: str) -> None:
+        segments = self.get_segments(recording_id)
+        if not segments:
+            return
+        transcript = " ".join(segment["text"] for segment in segments).strip()
+        duration = max(float(segment["end"]) for segment in segments)
+        state = self.get_transcript_state(recording_id)
+        vtt_lines = ["WEBVTT", ""]
+        for segment in segments:
+            vtt_lines.extend([
+                f"{self._vtt_time(segment['start'])} --> {self._vtt_time(segment['end'])}",
+                (
+                    f"<v {segment['speaker']}>{segment['text']}"
+                    if segment.get("speaker") else segment["text"]
+                ),
+                "",
+            ])
+        existing = self._conn.execute(
+            "SELECT * FROM transcripts WHERE recording_id=?", (recording_id,)
+        ).fetchone()
+        title = existing["title"] if existing else recording_id
+        episode = existing["episode"] if existing else ""
+        summary = existing["summary"] if existing else ""
+        keywords = existing["keywords"] if existing else "[]"
+        topics = existing["topics"] if existing else "[]"
+        scenes = existing["scenes"] if existing else "[]"
+        self._conn.execute(
+            """INSERT INTO transcripts
+               (recording_id, system, title, episode, duration, word_count,
+                transcript, summary, keywords, topics, scenes, vtt, source,
+                transcript_state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'progressive', ?, ?)
+               ON CONFLICT(recording_id) DO UPDATE SET
+                 system=excluded.system, duration=excluded.duration,
+                 word_count=excluded.word_count, transcript=excluded.transcript,
+                 vtt=excluded.vtt, source='progressive',
+                 transcript_state=excluded.transcript_state,
+                 created_at=excluded.created_at""",
+            (
+                recording_id, system, title, episode, duration,
+                len(transcript.split()), transcript, summary, keywords, topics,
+                scenes, "\n".join(vtt_lines), state, time.time(),
+            ),
+        )
+
+    @staticmethod
+    def _vtt_time(seconds: float) -> str:
+        total_ms = int(round(float(seconds) * 1000))
+        hours, rem = divmod(total_ms, 3_600_000)
+        minutes, rem = divmod(rem, 60_000)
+        secs, millis = divmod(rem, 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
     def _row_to_meta(self, row) -> TranscriptMetadata:
         return TranscriptMetadata(
@@ -263,5 +568,11 @@ class MetadataStore:
             scenes=json.loads(row["scenes"]) if row["scenes"] else [],
             vtt=row["vtt"],
             source=(row["source"] if "source" in row.keys() and row["source"] else "stt"),
+            transcript_state=(
+                row["transcript_state"]
+                if "transcript_state" in row.keys() and row["transcript_state"]
+                else "final"
+            ),
+            segments=self.get_segments(row["recording_id"]),
             created_at=row["created_at"],
         )

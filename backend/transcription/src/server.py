@@ -272,6 +272,7 @@ class TranscriptionServer:
                 "episode": r.episode,
                 "word_count": r.word_count,
                 "snippet": r.transcript[:200],
+                "transcript_state": r.transcript_state,
             }) for r in results]
             return self._tool_ok({"results": data, "count": len(data)})
 
@@ -354,6 +355,7 @@ class TranscriptionServer:
                 "episode": r.episode,
                 "word_count": r.word_count,
                 "created_at": r.created_at,
+                "transcript_state": r.transcript_state,
             }) for r in recent]
             stats = self.store.stats()
             return self._tool_ok({"total": stats["total_transcripts"],
@@ -411,7 +413,8 @@ class TranscriptionServer:
         if uri == "transcript://recent":
             metas = self.store.list_recent(20)
             data = [{"recording_id": m.recording_id, "title": m.title,
-                      "word_count": m.word_count, "duration": m.duration} for m in metas]
+                      "word_count": m.word_count, "duration": m.duration,
+                      "transcript_state": m.transcript_state} for m in metas]
             return self._res(uri, data)
 
         elif uri == "transcript://stats":
@@ -425,7 +428,8 @@ class TranscriptionServer:
             query = uri.split("transcript://search/", 1)[1]
             results = self.store.search(query)
             data = [{"recording_id": r.recording_id, "title": r.title,
-                      "snippet": r.transcript[:200]} for r in results]
+                      "snippet": r.transcript[:200],
+                      "transcript_state": r.transcript_state} for r in results]
             return self._res(uri, data)
 
         elif uri.startswith("transcript://") and "/" in uri.replace("transcript://", "", 1):
