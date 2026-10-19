@@ -7,6 +7,8 @@ session resolution, and authentication.
 """
 
 from __future__ import annotations
+import asyncio
+import contextlib
 import json
 import logging
 from typing import Any, Dict
@@ -247,6 +249,32 @@ def create_app(config: Dict[str, Any]) -> web.Application:
     async def on_shutdown(app_inst):
         registry.close()
 
+    # ------------------------------------------------------------------
+    # Background reconciler: keep SageTV device online-state current
+    # ------------------------------------------------------------------
+
+    reconcile_interval = float(config.get("reconcile_interval", 45))
+
+    async def _reconcile_loop():
+        while True:
+            try:
+                await api.reconcile_sagetv()
+            except Exception:
+                logger.exception("SageTV device reconcile failed")
+            await asyncio.sleep(reconcile_interval)
+
+    async def on_startup(app_inst):
+        app_inst["reconcile_task"] = asyncio.ensure_future(_reconcile_loop())
+
+    async def on_cleanup(app_inst):
+        task = app_inst.get("reconcile_task")
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
+    app.on_cleanup.append(on_cleanup)
 
     return app

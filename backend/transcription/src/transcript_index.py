@@ -64,6 +64,7 @@ class TranscriptIndex:
                 source_id       TEXT,
                 sidecar_path    TEXT,
                 transcribed_at  INTEGER,
+                transcript_state TEXT NOT NULL DEFAULT 'final',
                 created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -95,6 +96,7 @@ class TranscriptIndex:
                 text            TEXT NOT NULL,
                 speaker         TEXT,
                 confidence      REAL,
+                transcript_state TEXT NOT NULL DEFAULT 'final',
                 word_count      INTEGER,
                 created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -130,6 +132,22 @@ class TranscriptIndex:
                 generated_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
         """)
+        recording_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(recordings)").fetchall()
+        }
+        if "transcript_state" not in recording_cols:
+            self._conn.execute(
+                "ALTER TABLE recordings ADD COLUMN transcript_state TEXT DEFAULT 'final'"
+            )
+        chunk_cols = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(transcript_chunks)"
+            ).fetchall()
+        }
+        if "transcript_state" not in chunk_cols:
+            self._conn.execute(
+                "ALTER TABLE transcript_chunks ADD COLUMN transcript_state TEXT DEFAULT 'final'"
+            )
         self._conn.commit()
         logger.info("Transcript index tables created")
 
@@ -212,6 +230,88 @@ class TranscriptIndex:
                     ),
                 )
         logger.info("Indexed %d chunks for %s", len(chunks), recording_id)
+
+    def upsert_live_transcript(
+        self,
+        recording_id: str,
+        system: str,
+        file_path: str,
+        segments: List[Dict[str, Any]],
+        transcript_state: str,
+    ) -> None:
+        """Keep progressively reconciled text searchable before enrichment."""
+        if not segments:
+            return
+        duration = max(float(segment.get("end", 0)) for segment in segments)
+        file_size = None
+        try:
+            import os
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            pass
+        with self._transaction():
+            self._conn.execute(
+                """INSERT INTO recordings
+                   (recording_id, system, title, duration, file_path, file_size,
+                    transcribed_at, transcript_state, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now'), ?,
+                           strftime('%s','now'))
+                   ON CONFLICT(recording_id) DO UPDATE SET
+                     duration=excluded.duration, file_path=excluded.file_path,
+                     file_size=excluded.file_size,
+                     transcript_state=excluded.transcript_state,
+                     transcribed_at=excluded.transcribed_at,
+                     updated_at=excluded.updated_at""",
+                (
+                    recording_id, system, recording_id, duration, file_path,
+                    file_size, transcript_state,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM transcript_chunks WHERE recording_id=?", (recording_id,)
+            )
+            chunks: Dict[int, Dict[str, Any]] = {}
+            for segment in segments:
+                index = int(float(segment.get("start", 0)) // 30)
+                chunk = chunks.setdefault(index, {
+                    "start": float(segment.get("start", 0)),
+                    "end": float(segment.get("end", 0)),
+                    "texts": [],
+                    "speakers": [],
+                    "confidence": 1.0,
+                    "states": [],
+                })
+                chunk["start"] = min(chunk["start"], float(segment.get("start", 0)))
+                chunk["end"] = max(chunk["end"], float(segment.get("end", 0)))
+                chunk["texts"].append(str(segment.get("text", "")))
+                if segment.get("speaker"):
+                    chunk["speakers"].append(str(segment["speaker"]))
+                chunk["confidence"] = min(
+                    chunk["confidence"], float(segment.get("confidence") or 0.5)
+                )
+                chunk["states"].append(segment.get("state", transcript_state))
+            for chunk_index, chunk in sorted(chunks.items()):
+                state = (
+                    "live" if "live" in chunk["states"]
+                    else "stable" if "stable" in chunk["states"]
+                    else "final"
+                )
+                text = " ".join(chunk["texts"]).strip()
+                self._conn.execute(
+                    """INSERT INTO transcript_chunks
+                       (recording_id, chunk_index, start_time, end_time, text,
+                        speaker, confidence, transcript_state, word_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        recording_id, chunk_index, chunk["start"], chunk["end"],
+                        text, chunk["speakers"][0] if chunk["speakers"] else None,
+                        chunk["confidence"], state, len(text.split()),
+                    ),
+                )
+        logger.debug(
+            "Progressively indexed %d segments for %s (%s)",
+            len(segments), recording_id, transcript_state,
+        )
 
     def insert_summary(self, recording_id: str, summary: Dict[str, Any]) -> None:
         with self._transaction():
@@ -338,7 +438,12 @@ class TranscriptIndex:
         _tokens = [t for t in _re.findall(r"[A-Za-z0-9]+", query or "") if t]
         if not _tokens:
             return []
-        _fts_query = " AND ".join(f'"{t}"' for t in _tokens)
+        # FTS5 ANDs quoted terms by default, so a full natural-language
+        # question matches nothing. Try strict AND first, then fall back to OR
+        # (bm25-ranked) so multi-word questions still surface relevant chunks.
+        _and_query = " AND ".join(f'"{t}"' for t in _tokens)
+        _or_query = " OR ".join(f'"{t}"' for t in _tokens)
+        _fts_query = _and_query
         conditions = ["transcript_fts MATCH ?"]
         params: list = [_fts_query]
 
@@ -366,12 +471,20 @@ class TranscriptIndex:
             params.append(filters["system"])
 
         where = " AND ".join(conditions)
-        params.extend([limit, offset])
 
+        # Fetch a generous candidate pool (bm25-ranked chunks), then re-rank so
+        # that the recording which is genuinely *about* the query — i.e. the one
+        # with the most matching chunks — wins, instead of a single coincidental
+        # chunk in an unrelated show. Without this, a 4-word query like
+        # "cleveland browns chicago bears" could match one stray chunk in some
+        # sitcom and never surface the actual game (which matches "browns"/
+        # "bears" across ~200 chunks but rarely all four words in one 30s slice).
+        _CANDIDATE_CAP = max(limit * 25, 400)
         sql = f"""
             SELECT r.recording_id, r.title, r.episode_title, r.channel,
                    r.genre, r.system, r.record_date, r.air_date,
                    tc.chunk_index, tc.start_time, tc.end_time,
+                   tc.transcript_state, tc.confidence,
                    snippet(transcript_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
                    rank
             FROM transcript_fts
@@ -379,15 +492,45 @@ class TranscriptIndex:
             JOIN recordings r ON r.recording_id = tc.recording_id
             WHERE {where}
             ORDER BY rank
-            LIMIT ? OFFSET ?
+            LIMIT ?
         """
 
+        def _fetch(fts_query: str) -> list:
+            p = list(params)
+            p[0] = fts_query
+            p.append(_CANDIDATE_CAP)
+            return self._conn.execute(sql, p).fetchall()
+
         try:
-            rows = self._conn.execute(sql, params).fetchall()
-            return [dict(row) for row in rows]
+            rows = _fetch(_and_query)
+            # Fall back to OR when strict AND is too sparse to establish which
+            # recording the query is about (a single AND hit is usually a fluke).
+            if len(rows) < max(3, limit) and _or_query != _and_query:
+                or_rows = _fetch(_or_query)
+                if len(or_rows) > len(rows):
+                    rows = or_rows
         except sqlite3.OperationalError as e:
             logger.error("FTS search error: %s", e)
             return []
+
+        if not rows:
+            return []
+
+        # Re-rank: recordings with more matching chunks first (they are the real
+        # topical match), preserving bm25 chunk rank as the tiebreaker within a
+        # recording. `rank` is bm25 (more negative = better).
+        from collections import Counter
+        rec_hits = Counter(row["recording_id"] for row in rows)
+        indexed = list(enumerate(rows))
+        trust = {"final": 0, "stable": 1, "live": 2}
+        indexed.sort(key=lambda ir: (
+            -rec_hits[ir[1]["recording_id"]],
+            trust.get(ir[1]["transcript_state"], 2),
+            ir[1]["rank"],
+            ir[0],
+        ))
+        ordered = [dict(row) for _, row in indexed]
+        return ordered[offset:offset + limit]
 
     def search_by_actor(self, actor_name: str, limit: int = 20) -> List[Dict[str, Any]]:
         rows = self._conn.execute(

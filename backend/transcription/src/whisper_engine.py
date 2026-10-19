@@ -8,9 +8,12 @@ Outputs timestamped segments.
 
 from __future__ import annotations
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+from .gpu import release_cuda_memory
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,32 @@ class WhisperEngine:
         )
         logger.info("Whisper model loaded in %.1fs", time.time() - start)
 
+    def unload(self) -> None:
+        """Release the model and hand its VRAM back to the driver.
+
+        Safe to call at any time — ``transcribe()`` reloads on demand.
+        """
+        if self._model is None:
+            return
+        logger.info("Unloading Whisper model %s (device=%s) to free VRAM",
+                    self._model_name, self._device)
+        self._model = None
+        release_cuda_memory()
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def uses_gpu(self) -> bool:
+        """Whether this engine will run on the GPU.
+
+        Before the first load ``_device`` may still be "auto", so treat anything
+        that isn't an explicit "cpu" as GPU-bound; callers use this only to
+        decide whether a VRAM headroom check is worth doing.
+        """
+        return self._device != "cpu"
+
     def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.
 
@@ -131,6 +160,7 @@ class WhisperEngine:
             audio_path,
             language=language,
             beam_size=5,
+            word_timestamps=True,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
         )
@@ -143,6 +173,16 @@ class WhisperEngine:
                 "start": round(seg.start, 2),
                 "end": round(seg.end, 2),
                 "text": seg.text.strip(),
+                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                "words": [
+                    {
+                        "start": round(word.start, 2),
+                        "end": round(word.end, 2),
+                        "word": word.word.strip(),
+                        "confidence": round(float(word.probability), 3),
+                    }
+                    for word in (seg.words or [])
+                ],
             })
 
         elapsed = time.time() - start
@@ -176,6 +216,7 @@ class WhisperEngine:
                 audio_path,
                 language=language,
                 beam_size=5,
+                word_timestamps=True,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
             )
@@ -191,6 +232,16 @@ class WhisperEngine:
                 "start": round(seg.start + time_offset, 2),
                 "end": round(seg.end + time_offset, 2),
                 "text": text,
+                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                "words": [
+                    {
+                        "start": round(word.start + time_offset, 2),
+                        "end": round(word.end + time_offset, 2),
+                        "word": word.word.strip(),
+                        "confidence": round(float(word.probability), 3),
+                    }
+                    for word in (seg.words or [])
+                ],
             })
         return out
 

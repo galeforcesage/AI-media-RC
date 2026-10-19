@@ -63,7 +63,30 @@ read -rp "  Install speaker diarization? [y/N] " INSTALL_DIARIZATION
 if [[ "${INSTALL_DIARIZATION,,}" == "y" ]]; then
     echo ""
     echo "  Installing pyannote.audio (this may take a few minutes)..."
-    pip install pyannote.audio -q
+
+    # pyannote runs on PyTorch, and PyPI's default torch wheel only carries
+    # kernels up to sm_90. On a newer card (Blackwell / sm_120 and up) torch
+    # still reports cuda.is_available() == True but every op dies with
+    # "no kernel image is available for execution on the device", silently
+    # dragging diarization onto the CPU. Install a CUDA build that matches the
+    # card before pyannote pulls in the default one.
+    TORCH_INDEX=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')"
+        CAP_MAJOR="${CAP%%.*}"
+        if [[ "$CAP_MAJOR" =~ ^[0-9]+$ ]] && (( CAP_MAJOR >= 12 )); then
+            echo "  Detected GPU compute capability ${CAP}; using the CUDA 13 PyTorch build."
+            TORCH_INDEX="https://download.pytorch.org/whl/cu130"
+        fi
+    fi
+    if [[ -n "$TORCH_INDEX" ]]; then
+        pip install --index-url "$TORCH_INDEX" "torch==2.11.0+cu130" "torchaudio==2.11.0+cu130" -q
+    fi
+
+    # pyannote.audio 4.x reads audio through torchcodec. The 3.x line calls
+    # torchaudio.AudioMetaData, which torchaudio removed in 2.9, so 3.x cannot
+    # be used with the torch build above.
+    pip install "pyannote.audio>=4.0" -q
     echo "  pyannote.audio installed."
     echo ""
 

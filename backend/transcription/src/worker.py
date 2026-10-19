@@ -14,15 +14,31 @@ import time
 from typing import Any, Dict, Optional
 
 from .enrichment import MetadataEnrichmentPipeline
-from .extractor import AudioExtractor
-from .models import TranscriptMetadata, TranscriptionJob
+from .extractor import AudioExtractor, PermanentExtractionError
+from .models import TranscriptionJob
+from .progressive import caption_snapshot_is_usable
 from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .whisper_engine import WhisperEngine
 from . import diarization
 from . import cc_extractor
+from .gpu import gpu_free_mb, release_cuda_memory
 
 logger = logging.getLogger(__name__)
+
+# This GPU is shared with a live TV transcoder, Ollama and other tenants, so a
+# job that barges in when the card is nearly full will OOM (and, before the
+# claim-on-dequeue fix, could take a recording's only attempt with it). Wait for
+# real headroom instead.
+#
+# Measured on an RTX 5080: Whisper large-v3 needs ~4 GB and diarization peaks at
+# ~4.3 GB, and diarization's peak is flat with input duration. 4500 MiB covers
+# either step with a little slack.
+GPU_MIN_FREE_MB = float(os.environ.get("GPU_MIN_FREE_MB", "4500"))
+# Bounded so a permanently busy GPU degrades to "try anyway" rather than
+# stalling the queue forever; an OOM from that attempt is already retryable.
+GPU_WAIT_TIMEOUT = float(os.environ.get("GPU_WAIT_TIMEOUT", "900"))
+GPU_WAIT_POLL = float(os.environ.get("GPU_WAIT_POLL", "15"))
 
 
 class TranscriptionWorker:
@@ -36,6 +52,7 @@ class TranscriptionWorker:
         engine: WhisperEngine,
         concurrency: int = 1,
         poll_interval: float = 10.0,
+        gpu_idle_timeout: float = 600.0,
     ):
         self.queue = queue
         self.store = store
@@ -44,9 +61,12 @@ class TranscriptionWorker:
         self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
+        self.gpu_idle_timeout = gpu_idle_timeout
         self._running = False
         self._active_jobs = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._last_job_end = time.monotonic()
+        self._reaper_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
@@ -58,13 +78,29 @@ class TranscriptionWorker:
 
         self._running = True
         self._semaphore = asyncio.Semaphore(self.concurrency)
-        logger.info("Transcription worker started (concurrency=%d)", self.concurrency)
+
+        # Jobs left in 'extracting'/'processing' by a previous run are never
+        # touched again, and enqueue() won't re-add their recording, so recover
+        # them before starting rather than stranding those recordings forever.
+        try:
+            recovered = self.queue.reset_stale_jobs()
+            if recovered:
+                logger.warning("Recovered %d job(s) abandoned by a previous run", recovered)
+        except Exception:
+            logger.exception("Stale job recovery failed")
+
+        logger.info("Transcription worker started (concurrency=%d, gpu_idle_timeout=%ss)",
+                    self.concurrency, self.gpu_idle_timeout)
+
+        if self.gpu_idle_timeout > 0:
+            self._reaper_task = asyncio.create_task(self._idle_reaper())
 
         while self._running:
             try:
                 job = self.queue.dequeue()
                 if job:
                     await self._semaphore.acquire()
+                    self._active_jobs += 1
                     asyncio.create_task(self._process_with_semaphore(job))
                 else:
                     await asyncio.sleep(self.poll_interval)
@@ -72,13 +108,104 @@ class TranscriptionWorker:
                 logger.exception("Worker loop error")
                 await asyncio.sleep(self.poll_interval)
 
+    async def _idle_reaper(self) -> None:
+        """Release Whisper/diarization models when the queue has been idle.
+
+        Models are reloaded automatically on the next job. This trades a few
+        seconds of reload latency for several GB of VRAM that would otherwise
+        sit pinned 24/7 between recordings.
+        """
+        interval = max(15.0, min(self.gpu_idle_timeout / 4, 60.0))
+        while self._running:
+            await asyncio.sleep(interval)
+            if self._active_jobs > 0:
+                continue
+            if not (self.engine.loaded or diarization.is_loaded()):
+                continue
+            idle_for = time.monotonic() - self._last_job_end
+            if idle_for < self.gpu_idle_timeout:
+                continue
+            # Only *pending* work should hold the models: the worker loop will
+            # pick it up within poll_interval. Deliberately not checking the
+            # 'extracting'/'processing' counts here — those are rows some worker
+            # claimed, and a job this process is really running is already
+            # covered by _active_jobs above. Rows abandoned by an earlier run
+            # stay in those states forever, and treating them as live work
+            # pinned several GB of VRAM indefinitely.
+            try:
+                if self.queue.stats().get("pending"):
+                    continue
+            except Exception:
+                logger.debug("Queue stats unavailable during idle check", exc_info=True)
+            logger.info("Idle for %.0fs — releasing GPU models", idle_for)
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, self.engine.unload)
+                await loop.run_in_executor(None, diarization.unload)
+            except Exception:
+                logger.exception("Failed to release GPU models")
+
+    async def _await_vram(self, label: str, need_mb: float = GPU_MIN_FREE_MB) -> None:
+        """Block until the GPU has ``need_mb`` free, or the wait times out.
+
+        Other tenants on this card (a live TV transcoder, Ollama, OCR
+        containers) come and go, so starting a memory-hungry step the moment a
+        job arrives can OOM even though the same job would succeed a minute
+        later. Nothing here is latency-sensitive — every job is queued or
+        batched — so waiting is nearly free, while an OOM costs the whole step.
+
+        On timeout this logs and returns rather than raising: a permanently busy
+        GPU must not stall the queue forever, and if the attempt does OOM the
+        existing handler already marks the job for retry.
+        """
+        if GPU_WAIT_TIMEOUT <= 0 or need_mb <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        # Hand back our own cached-but-unused blocks first, so we wait on a true
+        # shortage rather than on memory we are already holding.
+        await loop.run_in_executor(None, release_cuda_memory)
+
+        deadline = time.monotonic() + GPU_WAIT_TIMEOUT
+        waited_from: Optional[float] = None
+        while True:
+            free = await loop.run_in_executor(None, gpu_free_mb)
+            if free is None:
+                return  # No nvidia-smi / no GPU: nothing useful to gate on.
+            if free >= need_mb:
+                if waited_from is not None:
+                    logger.info(
+                        "GPU freed up after %.0fs — starting %s (%.0f MiB free)",
+                        time.monotonic() - waited_from, label, free,
+                    )
+                return
+            if waited_from is None:
+                waited_from = time.monotonic()
+                logger.info(
+                    "Waiting for VRAM before %s: %.0f MiB free, need %.0f MiB",
+                    label, free, need_mb,
+                )
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "GPU still busy after %.0fs (%.0f MiB free, need %.0f MiB) — "
+                    "attempting %s anyway", GPU_WAIT_TIMEOUT, free, need_mb, label,
+                )
+                return
+            await asyncio.sleep(GPU_WAIT_POLL)
+
     def stop(self) -> None:
         self._running = False
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            self._reaper_task = None
+        self.engine.unload()
+        diarization.unload()
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
             await self._process(job)
         finally:
+            self._active_jobs -= 1
+            self._last_job_end = time.monotonic()
             self._semaphore.release()
 
     async def _process(self, job: TranscriptionJob) -> None:
@@ -99,18 +226,16 @@ class TranscriptionWorker:
         else:
             base_recording_id = getattr(job, "_base_recording_id", job.recording_id)
 
-        # For incremental jobs, compute a time offset from byte offset
+        # Resume from persisted ASR evidence, not a byte/duration ratio. MPEG
+        # bitrate varies and the old estimate produced overlapping/skipped time.
         start_seconds = None
-        if is_incremental and offset > 0:
-            try:
-                total_duration = await self.extractor.get_duration(job.file_path)
-                file_size = os.path.getsize(job.file_path)
-                if file_size > 0 and total_duration > 0:
-                    start_seconds = (offset / file_size) * total_duration
-                    logger.info("Incremental job: byte offset %d -> %.1fs of %.1fs",
-                                offset, start_seconds, total_duration)
-            except Exception:
-                logger.warning("Could not compute time offset for incremental job, extracting full")
+        if is_incremental and not is_final:
+            asr_end = self.store.get_evidence_end(base_recording_id, "asr")
+            start_seconds = max(0.0, asr_end - 2.0) if asr_end else None
+            logger.info(
+                "Incremental job: persisted ASR end %.1fs -> extraction start %.1fs",
+                asr_end, start_seconds or 0.0,
+            )
 
         # Step 1: Extract audio
         try:
@@ -119,6 +244,12 @@ class TranscriptionWorker:
                 job.file_path, job.recording_id, start_seconds=start_seconds,
             )
             self.queue.update_status(job.job_id, "processing", temp_audio_path=audio_path)
+        except PermanentExtractionError as e:
+            # Retrying re-reads the whole source file for a guaranteed failure,
+            # so fail straight to error and leave a readable reason behind.
+            logger.error("Extraction permanently failed for %s: %s", job.job_id, e)
+            self.queue.update_status(job.job_id, "error", error=f"Extraction: {e}")
+            return
         except Exception as e:
             logger.error("Extraction failed for %s: %s", job.job_id, e)
             self.queue.mark_for_retry(job.job_id, f"Extraction: {e}")
@@ -129,12 +260,13 @@ class TranscriptionWorker:
         #   coverage >= 85% && max_gap < 6s        -> cc      (skip whisper)
         #   coverage < 30% || cc_segments < 20     -> stt     (current behavior)
         #   else                                   -> mixed   (cc + gap-fill stt)
-        # Skip CC for incremental jobs - they need whisper on the partial audio.
+        # Final incremental jobs inspect the completed file and reconcile the
+        # sidecar/embedded CC with a full-file ASR pass.
         loop = asyncio.get_running_loop()
         cc_segments: Optional[list] = None
         cc_analysis: Optional[Dict] = None
         transcription_mode = "stt"
-        if not is_incremental and cc_extractor.is_available():
+        if (not is_incremental or is_final) and cc_extractor.is_available():
             try:
                 cc_segments = await loop.run_in_executor(None, cc_extractor.extract, job.file_path)
             except Exception:
@@ -142,6 +274,10 @@ class TranscriptionWorker:
                 cc_segments = None
             if not cc_segments:
                 logger.info("No CC found for %s, falling back to STT", job.recording_id)
+            if cc_segments:
+                if not caption_snapshot_is_usable(cc_segments):
+                    logger.warning("Rejected malformed captions for %s", job.recording_id)
+                    cc_segments = None
             if cc_segments:
                 try:
                     total_duration = await self.extractor.get_duration(job.file_path)
@@ -158,8 +294,18 @@ class TranscriptionWorker:
                         transcription_mode = "cc"
                     elif cc_analysis["coverage_pct"] >= 30.0 and cc_analysis["segment_count"] >= 20:
                         transcription_mode = "mixed"
+                if is_final:
+                    # The rolling ASR pass may have lagged or failed. A completed
+                    # recording gets one authoritative full-audio pass while the
+                    # extracted CC is preserved as independent evidence below.
+                    transcription_mode = "stt"
 
         # Step 2: Transcribe according to chosen mode
+        # Whisper is the first VRAM-hungry step. Skipped when the model is
+        # already resident, since that memory is ours already and we would be
+        # waiting for headroom we do not actually need.
+        if transcription_mode != "cc" and self.engine.uses_gpu and not self.engine.loaded:
+            await self._await_vram("transcription")
         if transcription_mode == "cc":
             # Use CC segments verbatim, strip any speaker prefixes for clean text.
             segments = []
@@ -248,11 +394,25 @@ class TranscriptionWorker:
             for seg in segments:
                 seg["start"] = round(seg["start"] + start_seconds, 2)
                 seg["end"] = round(seg["end"] + start_seconds, 2)
+                for word in seg.get("words") or []:
+                    word["start"] = round(word["start"] + start_seconds, 2)
+                    word["end"] = round(word["end"] + start_seconds, 2)
 
         # Step 2.5: Speaker diarization (optional — runs if pyannote is available)
         # Skip diarization for non-final incremental jobs (will run on complete file)
         diarization_turns = []
         if diarization.is_available() and not (is_incremental and not is_final):
+            # All Whisper work for this job is done by now, and diarization is
+            # the memory-hungry step. Holding both resident peaks around 6.5 GB
+            # of VRAM; dropping Whisper first keeps the peak near 4 GB so a live
+            # TV transcoder sharing this GPU has headroom. Nothing here is
+            # latency-sensitive (every job is queued or batched) and transcribe()
+            # reloads on demand, so the reload cost lands on batch throughput
+            # rather than on anything a viewer sees.
+            await loop.run_in_executor(None, self.engine.unload)
+            # Whisper's VRAM has just gone back to the driver, so this is the
+            # cleanest point to check we actually have room for diarization.
+            await self._await_vram("diarization")
             try:
                 diarization_turns = await loop.run_in_executor(
                     None, diarization.diarize, audio_path
@@ -268,36 +428,70 @@ class TranscriptionWorker:
             except Exception:
                 logger.exception("Diarization failed for %s (non-blocking, continuing without speakers)", job.job_id)
 
-        # Step 3: Generate VTT
-        vtt = self.engine.segments_to_vtt(segments)
-
-        # Step 4: Build metadata
+        # Step 3: Reconcile evidence into the same progressive transcript.
         store_id = base_recording_id if is_incremental else job.recording_id
-        meta = TranscriptMetadata(
-            recording_id=store_id,
-            system=job.system,
-            title=store_id,  # Will be enriched later via MCP
-            duration=info.get("duration", 0),
-            word_count=len(full_text.split()),
-            transcript=full_text,
-            keywords=self._extract_keywords(full_text),
-            vtt=vtt,
-            source=transcription_mode,
-        )
+        is_complete = (not is_incremental) or is_final
+        if is_final and cc_segments:
+            clean_cc = []
+            for segment in cc_segments:
+                text, speaker = cc_extractor.strip_speaker_prefix(segment["text"])
+                clean_cc.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "text": text,
+                    "speaker": speaker,
+                })
+            self.store.ingest_evidence(
+                store_id, job.system, clean_cc, evidence="cc", final=True
+            )
+        if transcription_mode == "cc":
+            self.store.ingest_evidence(
+                store_id, job.system, segments, evidence="cc", final=is_complete
+            )
+        elif transcription_mode == "mixed":
+            cc_evidence = [s for s in segments if s.get("source") == "cc"]
+            asr_evidence = [s for s in segments if s.get("source") != "cc"]
+            if cc_evidence:
+                self.store.ingest_evidence(
+                    store_id, job.system, cc_evidence,
+                    evidence="cc", final=is_complete,
+                )
+            if asr_evidence:
+                self.store.ingest_evidence(
+                    store_id, job.system, asr_evidence,
+                    evidence="asr", final=is_complete,
+                )
+        else:
+            self.store.ingest_evidence(
+                store_id, job.system, segments, evidence="asr", final=is_complete
+            )
+        if is_complete:
+            self.store.finalize_recording(store_id, job.system)
 
-        # Step 5: Store (append for incremental, overwrite otherwise)
-        self.store.save(meta, append=is_incremental)
+        saved_meta = self.store.get(store_id)
+        if saved_meta is None:
+            raise RuntimeError(f"Progressive transcript did not materialize: {store_id}")
+        meta = saved_meta
+        full_text = meta.transcript
+        segments = meta.segments
+
+        if self.enrichment and not is_complete:
+            self.enrichment.index.upsert_live_transcript(
+                store_id, job.system, job.file_path, segments,
+                transcript_state=meta.transcript_state,
+            )
 
         # Step 6: Enrich (only for complete or final incremental jobs)
         if self.enrichment and not (is_incremental and not is_final):
+            enrich_segments = segments
             try:
                 await self.enrichment.enrich({
                     "recording_id": store_id,
                     "system": job.system,
-                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in segments],
+                    "segments": [{"start": s.get("start", 0), "end": s.get("end", 0), "text": s.get("text", ""), "speaker": s.get("speaker")} for s in enrich_segments],
                     "diarization_turns": diarization_turns,
                     "transcript_text": full_text,
-                    "word_count": len(full_text.split()),
+                    "word_count": meta.word_count,
                     "language": info.get("language", "en"),
                     "confidence": info.get("language_probability", 0.0),
                     "model": self.engine.model_name,

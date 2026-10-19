@@ -104,6 +104,9 @@ class TranscriptSidecar:
         for path in paths:
             try:
                 doc = self.read(path)
+                if not self._source_media_exists(doc, path):
+                    logger.info("Skipping sidecar with missing source media: %s", path)
+                    continue
                 rec = self._doc_to_recording(doc, path)
                 index.insert_recording(rec)
 
@@ -124,6 +127,23 @@ class TranscriptSidecar:
 
         logger.info("Reindexed %d recordings from %s", count, directory)
         return count
+
+    @staticmethod
+    def _source_media_exists(doc: Dict[str, Any], sidecar_path: str) -> bool:
+        """Return whether the recording represented by a sidecar still exists."""
+        meta_path = doc.get("metadata", {}).get("file_path")
+        if meta_path and os.path.isfile(meta_path) and os.path.getsize(meta_path) > 0:
+            return True
+
+        suffix = ".transcript.json"
+        if not sidecar_path.endswith(suffix):
+            return False
+        base = sidecar_path[:-len(suffix)]
+        for ext in (".mpg", ".mpeg", ".ts", ".m2ts", ".mp4", ".mkv", ".avi"):
+            candidate = base + ext
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return True
+        return False
 
     def _doc_to_recording(self, doc: Dict, sidecar_path: str) -> Dict[str, Any]:
         """Convert a sidecar document to a recordings table row dict."""
