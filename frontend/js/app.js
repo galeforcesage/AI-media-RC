@@ -4,6 +4,8 @@
 (function () {
   'use strict';
 
+  let transcriptRefreshTimer = null;
+
   // ─── Boot ─────────────────────────────────────────────────
 
   document.addEventListener('DOMContentLoaded', async () => {
@@ -297,7 +299,13 @@
 
     // Close button for transcript dialog
     document.getElementById('transcript-close').addEventListener('click', () => {
+      if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+      transcriptRefreshTimer = null;
       document.getElementById('transcript-dialog').close();
+    });
+    document.getElementById('transcript-dialog').addEventListener('close', () => {
+      if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+      transcriptRefreshTimer = null;
     });
 
     // Close button for summary dialog
@@ -1004,6 +1012,8 @@
     document.getElementById('transcript-edit').hidden = false;
     document.getElementById('transcript-save').hidden = true;
     document.getElementById('transcript-cancel-edit').hidden = true;
+    if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+    transcriptRefreshTimer = null;
     dialog.showModal();
 
     try {
@@ -1012,41 +1022,61 @@
         bodyEl.innerHTML = `<p>Transcript not found.</p>`;
         return;
       }
+      renderTranscriptDialogData(data, recordingId);
 
-      // Meta bar
-      const metaParts = [];
-      if (data.word_count) metaParts.push(`${data.word_count.toLocaleString()} words`);
-      if (data.duration) metaParts.push(`${Math.round(data.duration / 60)} min`);
-      if (data.system) metaParts.push(data.system);
-      metaEl.textContent = metaParts.join(' · ');
-
-      // Summary
-      let html = '';
-      if (data.summary) {
-        html += `<div class="transcript-summary"><strong>Summary:</strong> ${esc(data.summary)}</div>`;
+      if ((data.transcript_state || 'final') !== 'final') {
+        transcriptRefreshTimer = setInterval(async () => {
+          if (!dialog.open || bodyEl.querySelector('.editing')) return;
+          const updated = await loadTranscriptData(recordingId).catch(() => null);
+          if (!updated) return;
+          renderTranscriptDialogData(updated, recordingId);
+          if ((updated.transcript_state || 'final') === 'final') {
+            clearInterval(transcriptRefreshTimer);
+            transcriptRefreshTimer = null;
+          }
+        }, 10000);
       }
-      if (data.keywords && data.keywords.length) {
-        html += `<div class="transcript-keywords">${data.keywords.map(k => `<span class="tx-keyword">${esc(k)}</span>`).join(' ')}</div>`;
-      }
-
-      // Transcript text — prefer VTT (segment timing → paragraphing). Falls back
-      // to the flat blob only if no VTT is stored.
-      const text = data.transcript || '(No transcript text available)';
-      let displayHtml;
-      if (data.vtt && data.vtt.includes('<v ')) {
-        displayHtml = formatVttWithSpeakers(data.vtt);
-      } else if (data.vtt && data.vtt.includes('-->')) {
-        displayHtml = formatVttAsParagraphs(data.vtt);
-      } else {
-        displayHtml = `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
-      }
-      html += `<div class="transcript-content" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${displayHtml}</div>`;
-
-      bodyEl.innerHTML = html;
-      actionsEl.hidden = false;
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error: ${esc(err.message)}</p>`;
     }
+  }
+
+  function renderTranscriptDialogData(data, recordingId) {
+    const metaEl = document.getElementById('transcript-meta');
+    const bodyEl = document.getElementById('transcript-body');
+    const actionsEl = document.getElementById('transcript-actions');
+    const editButton = document.getElementById('transcript-edit');
+    const state = String(data.transcript_state || 'final').toLowerCase();
+    const metaParts = [];
+    if (data.word_count) metaParts.push(`${data.word_count.toLocaleString()} words`);
+    if (data.duration) metaParts.push(`${Math.round(data.duration / 60)} min`);
+    if (data.system) metaParts.push(data.system);
+    if (state === 'live') metaParts.push('LIVE · provisional');
+    else if (state === 'stable') metaParts.push('STABLE');
+    else metaParts.push('FINAL');
+    metaEl.textContent = metaParts.join(' · ');
+
+    let html = '';
+    if (data.summary) {
+      html += `<div class="transcript-summary"><strong>Summary:</strong> ${esc(data.summary)}</div>`;
+    }
+    if (data.keywords && data.keywords.length) {
+      html += `<div class="transcript-keywords">${data.keywords.map(k => `<span class="tx-keyword">${esc(k)}</span>`).join(' ')}</div>`;
+    }
+
+    const text = data.transcript || '(No transcript text available)';
+    let displayHtml;
+    if (data.vtt && data.vtt.includes('<v ')) {
+      displayHtml = formatVttWithSpeakers(data.vtt);
+    } else if (data.vtt && data.vtt.includes('-->')) {
+      displayHtml = formatVttAsParagraphs(data.vtt);
+    } else {
+      displayHtml = `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
+    }
+    html += `<div class="transcript-content" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${displayHtml}</div>`;
+    bodyEl.innerHTML = html;
+    actionsEl.hidden = false;
+    editButton.hidden = state !== 'final';
   }
 
   function buildTranscriptSummaryPrompt(showTitle, episodeTitle, transcriptText = '', recordingId = '') {

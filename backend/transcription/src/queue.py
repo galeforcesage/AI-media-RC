@@ -42,9 +42,13 @@ class TranscriptionQueue:
                 error TEXT DEFAULT '',
                 created_at REAL,
                 updated_at REAL,
-                duration REAL DEFAULT 0
+                duration REAL DEFAULT 0,
+                priority INTEGER DEFAULT 0
             )
         """)
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "priority" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0")
         self._conn.commit()
         logger.info("Transcription queue opened: %s", self.db_path)
 
@@ -60,10 +64,10 @@ class TranscriptionQueue:
         ).fetchone()
         if existing:
             logger.debug("Job for recording %s already queued", job.recording_id)
-            return job
+            return self.get_job(existing["job_id"]) or job
         # For incremental jobs, also dedup on file_path — don't allow multiple
         # pending/processing jobs for the same physical file
-        if "__inc_" in job.recording_id:
+        if "__inc_" in job.recording_id and not job.recording_id.endswith("__final"):
             existing_path = self._conn.execute(
                 "SELECT job_id FROM jobs WHERE file_path = ? AND status IN ('pending', 'extracting', 'processing')",
                 (job.file_path,),
@@ -71,14 +75,14 @@ class TranscriptionQueue:
             if existing_path:
                 logger.debug("Incremental job for file %s already queued (job %s)",
                              job.file_path, existing_path["job_id"])
-                return job
+                return self.get_job(existing_path["job_id"]) or job
         self._conn.execute(
             """INSERT INTO jobs (job_id, system, recording_id, file_path, temp_audio_path,
-                status, attempts, max_attempts, error, created_at, updated_at, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, attempts, max_attempts, error, created_at, updated_at, duration, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job.job_id, job.system, job.recording_id, job.file_path,
              job.temp_audio_path, job.status, job.attempts, job.max_attempts,
-             job.error, job.created_at, job.updated_at, job.duration),
+             job.error, job.created_at, job.updated_at, job.duration, job.priority),
         )
         self._conn.commit()
         logger.info("Enqueued job %s for %s (%s)", job.job_id, job.recording_id, job.system)
@@ -100,7 +104,8 @@ class TranscriptionQueue:
         deliberately does not increment them.
         """
         row = self._conn.execute(
-            "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+            "SELECT * FROM jobs WHERE status = 'pending' "
+            "ORDER BY priority DESC, created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
             return None
@@ -250,4 +255,5 @@ class TranscriptionQueue:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             duration=row["duration"],
+            priority=row["priority"] if "priority" in row.keys() else 0,
         )

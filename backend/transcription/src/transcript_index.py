@@ -64,6 +64,7 @@ class TranscriptIndex:
                 source_id       TEXT,
                 sidecar_path    TEXT,
                 transcribed_at  INTEGER,
+                transcript_state TEXT NOT NULL DEFAULT 'final',
                 created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -95,6 +96,7 @@ class TranscriptIndex:
                 text            TEXT NOT NULL,
                 speaker         TEXT,
                 confidence      REAL,
+                transcript_state TEXT NOT NULL DEFAULT 'final',
                 word_count      INTEGER,
                 created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -130,6 +132,22 @@ class TranscriptIndex:
                 generated_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
         """)
+        recording_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(recordings)").fetchall()
+        }
+        if "transcript_state" not in recording_cols:
+            self._conn.execute(
+                "ALTER TABLE recordings ADD COLUMN transcript_state TEXT DEFAULT 'final'"
+            )
+        chunk_cols = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(transcript_chunks)"
+            ).fetchall()
+        }
+        if "transcript_state" not in chunk_cols:
+            self._conn.execute(
+                "ALTER TABLE transcript_chunks ADD COLUMN transcript_state TEXT DEFAULT 'final'"
+            )
         self._conn.commit()
         logger.info("Transcript index tables created")
 
@@ -212,6 +230,88 @@ class TranscriptIndex:
                     ),
                 )
         logger.info("Indexed %d chunks for %s", len(chunks), recording_id)
+
+    def upsert_live_transcript(
+        self,
+        recording_id: str,
+        system: str,
+        file_path: str,
+        segments: List[Dict[str, Any]],
+        transcript_state: str,
+    ) -> None:
+        """Keep progressively reconciled text searchable before enrichment."""
+        if not segments:
+            return
+        duration = max(float(segment.get("end", 0)) for segment in segments)
+        file_size = None
+        try:
+            import os
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            pass
+        with self._transaction():
+            self._conn.execute(
+                """INSERT INTO recordings
+                   (recording_id, system, title, duration, file_path, file_size,
+                    transcribed_at, transcript_state, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now'), ?,
+                           strftime('%s','now'))
+                   ON CONFLICT(recording_id) DO UPDATE SET
+                     duration=excluded.duration, file_path=excluded.file_path,
+                     file_size=excluded.file_size,
+                     transcript_state=excluded.transcript_state,
+                     transcribed_at=excluded.transcribed_at,
+                     updated_at=excluded.updated_at""",
+                (
+                    recording_id, system, recording_id, duration, file_path,
+                    file_size, transcript_state,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM transcript_chunks WHERE recording_id=?", (recording_id,)
+            )
+            chunks: Dict[int, Dict[str, Any]] = {}
+            for segment in segments:
+                index = int(float(segment.get("start", 0)) // 30)
+                chunk = chunks.setdefault(index, {
+                    "start": float(segment.get("start", 0)),
+                    "end": float(segment.get("end", 0)),
+                    "texts": [],
+                    "speakers": [],
+                    "confidence": 1.0,
+                    "states": [],
+                })
+                chunk["start"] = min(chunk["start"], float(segment.get("start", 0)))
+                chunk["end"] = max(chunk["end"], float(segment.get("end", 0)))
+                chunk["texts"].append(str(segment.get("text", "")))
+                if segment.get("speaker"):
+                    chunk["speakers"].append(str(segment["speaker"]))
+                chunk["confidence"] = min(
+                    chunk["confidence"], float(segment.get("confidence") or 0.5)
+                )
+                chunk["states"].append(segment.get("state", transcript_state))
+            for chunk_index, chunk in sorted(chunks.items()):
+                state = (
+                    "live" if "live" in chunk["states"]
+                    else "stable" if "stable" in chunk["states"]
+                    else "final"
+                )
+                text = " ".join(chunk["texts"]).strip()
+                self._conn.execute(
+                    """INSERT INTO transcript_chunks
+                       (recording_id, chunk_index, start_time, end_time, text,
+                        speaker, confidence, transcript_state, word_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        recording_id, chunk_index, chunk["start"], chunk["end"],
+                        text, chunk["speakers"][0] if chunk["speakers"] else None,
+                        chunk["confidence"], state, len(text.split()),
+                    ),
+                )
+        logger.debug(
+            "Progressively indexed %d segments for %s (%s)",
+            len(segments), recording_id, transcript_state,
+        )
 
     def insert_summary(self, recording_id: str, summary: Dict[str, Any]) -> None:
         with self._transaction():
@@ -384,6 +484,7 @@ class TranscriptIndex:
             SELECT r.recording_id, r.title, r.episode_title, r.channel,
                    r.genre, r.system, r.record_date, r.air_date,
                    tc.chunk_index, tc.start_time, tc.end_time,
+                   tc.transcript_state, tc.confidence,
                    snippet(transcript_fts, 0, '<b>', '</b>', '...', 32) AS snippet,
                    rank
             FROM transcript_fts
@@ -421,7 +522,13 @@ class TranscriptIndex:
         from collections import Counter
         rec_hits = Counter(row["recording_id"] for row in rows)
         indexed = list(enumerate(rows))
-        indexed.sort(key=lambda ir: (-rec_hits[ir[1]["recording_id"]], ir[1]["rank"], ir[0]))
+        trust = {"final": 0, "stable": 1, "live": 2}
+        indexed.sort(key=lambda ir: (
+            -rec_hits[ir[1]["recording_id"]],
+            trust.get(ir[1]["transcript_state"], 2),
+            ir[1]["rank"],
+            ir[0],
+        ))
         ordered = [dict(row) for _, row in indexed]
         return ordered[offset:offset + limit]
 

@@ -32,6 +32,7 @@ from src.enrichment import MetadataEnrichmentPipeline
 from src.transcript_index import TranscriptIndex
 from src.sidecar import TranscriptSidecar
 from src.discovery import discover_all
+from src.progressive import LiveTranscriptMonitor
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +93,7 @@ async def run(args: argparse.Namespace) -> None:
     await server.start()
 
     tasks = []
+    live_monitor = LiveTranscriptMonitor(store=store, index=server.index)
 
     # File watchers — auto-discover directories if not explicitly specified
     if not args.no_watchers:
@@ -157,6 +159,7 @@ async def run(args: argparse.Namespace) -> None:
             name = f"sagetv-{i}" if len(sagetv_dirs) > 1 else "sagetv"
             watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live,
                                   on_file_deleted=on_file_deleted)
+            live_monitor.register(watcher)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching SageTV dir: %s", d)
 
@@ -164,6 +167,7 @@ async def run(args: argparse.Namespace) -> None:
             name = f"channels-{i}" if len(channels_dirs) > 1 else "channels"
             watcher = FileWatcher(name, d, "channelsdvr", queue, enable_live=not args.no_live,
                                   on_file_deleted=on_file_deleted)
+            live_monitor.register(watcher)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching Channels DVR dir: %s", d)
 
@@ -172,6 +176,8 @@ async def run(args: argparse.Namespace) -> None:
                 "No recording directories found. Use --sagetv-dir / --channels-dir "
                 "or ensure MCP servers are reachable for auto-discovery."
             )
+        elif not args.no_live:
+            tasks.append(asyncio.create_task(live_monitor.start()))
 
     # Transcription worker
     if not args.no_worker:
