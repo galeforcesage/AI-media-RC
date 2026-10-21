@@ -39,6 +39,7 @@ from services.entity_context import EntityContextStore
 from services.ssd_extractor import SSDExtractor
 from services.transcription_queue import TranscriptionQueue
 from services.mcp_client import MCPClient
+from services.pending_actions import PendingActionStore
 
 logger = get_logger(__name__)
 
@@ -125,6 +126,10 @@ class Orchestrator:
         # Conversation-scoped entity memory for multi-turn context
         self.entity_store = EntityContextStore(
             ttl=config.get("entity_ttl", 600.0),
+        )
+        ui_config = config.get("ui", {})
+        self.pending_actions = PendingActionStore(
+            ttl_seconds=ui_config.get("pending_action_ttl_seconds", 300),
         )
 
         # Transcription queue

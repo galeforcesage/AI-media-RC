@@ -589,6 +589,7 @@
     let statusLog = [];
 
     try {
+      const renderedSurfaceIds = new Set();
       const data = await API.queryStream(text, State.get().llmFocus, (status) => {
         // Status callback — if we were streaming tokens, a new status
         // means the LLM is doing tool calls; revert to thinking indicator
@@ -618,6 +619,10 @@
         streamedText += token;
         streamEl.textContent = streamedText;
         msgContainer.scrollTop = msgContainer.scrollHeight;
+      }, (message) => {
+        if (!message || renderedSurfaceIds.has(message.surface_id)) return;
+        renderedSurfaceIds.add(message.surface_id);
+        A2UI.render(message, msgContainer);
       });
 
       // Convert thinking indicator into a persistent status log
@@ -643,6 +648,11 @@
       if (results && results.length > 0) {
         UI.addEpisodeCards(results);
       }
+      (data.ui_messages || []).forEach((message) => {
+        if (!message || renderedSurfaceIds.has(message.surface_id)) return;
+        renderedSurfaceIds.add(message.surface_id);
+        A2UI.render(message, msgContainer);
+      });
     } catch (e) {
       thinking.remove();
       if (streamEl) streamEl.remove();

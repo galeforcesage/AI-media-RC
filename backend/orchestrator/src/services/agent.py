@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from utils.logger import get_logger
 from utils.tracing import span as trace_span, start_span, end_span
 from utils.metrics import agent_iterations_total, agent_tool_calls_total, agent_tool_duration, agent_tool_errors_total
+from services.ui_surface import recording_list_surface
 from services.planner_base import PlannerBase
 from services.mcp_tool_registry import MCPToolRegistry
 
@@ -269,32 +270,24 @@ def _format_recording_line(idx: int, rec: dict) -> str:
     return " ".join(parts)
 
 
-def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
-                       tool_results: dict[str, dict]) -> str | None:
-    """Attempt to directly format tool results as a recording list.
-
-    Args:
-        tool_calls_executed: List of (tool_name, args) executed this iteration.
-        tool_results: Map of call_key -> result dict.
-
-    Returns:
-        Formatted string if direct-format applies, None to fall back to LLM.
-    """
-    # Only apply if ALL executed tools are listing tools
+def _collect_recording_items(
+    tool_calls_executed: list[tuple[str, dict]],
+    tool_results: dict[str, dict],
+) -> list[dict] | None:
+    """Collect and normalize records when every result is a listing result."""
     if not tool_calls_executed:
         return None
     for tool_name, _args in tool_calls_executed:
         if tool_name not in _LISTING_TOOLS:
             return None
 
-    # Collect all recording items
     all_items: list[dict] = []
-    seen_keys: set[str] = set()  # dedup by title + episode_title + air_date
+    seen_keys: set[str] = set()
 
     for call_key, result in tool_results.items():
         items = _extract_recording_items(call_key.split(":")[0], result)
         if items is None:
-            return None  # Non-list result — fall back to LLM
+            return None
         for item in items:
             dedup_key = (
                 (item.get("title", "") + "|" +
@@ -316,13 +309,21 @@ def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
                         seen_keys.add(dedup_key)
                         all_items.append(fr)
 
+    def _sort_key(record):
+        return record.get("start_time", "") or record.get("air_date", "")
+
+    all_items.sort(key=_sort_key)
+    return all_items
+
+
+def _try_direct_format(tool_calls_executed: list[tuple[str, dict]],
+                       tool_results: dict[str, dict]) -> str | None:
+    """Attempt to directly format tool results as a recording list."""
+    all_items = _collect_recording_items(tool_calls_executed, tool_results)
+    if all_items is None:
+        return None
     if not all_items:
         return "No recordings found."
-
-    # Sort by start_time or air_date for chronological order
-    def _sort_key(r):
-        return r.get("start_time", "") or r.get("air_date", "")
-    all_items.sort(key=_sort_key)
 
     lines = [_format_recording_line(i + 1, rec) for i, rec in enumerate(all_items)]
 
@@ -553,6 +554,7 @@ class AgentLoop(PlannerBase):
         self._openai_tools: List[Dict[str, Any]] | None = None  # cached OpenAI-format tools
         self._tool_schemas: Dict[str, Dict[str, Any]] = {}  # cached schemas for validation
         self._tool_registry = MCPToolRegistry(orchestrator)
+        self._confirmation_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # OpenAI-format tool schema discovery
@@ -1787,12 +1789,26 @@ class AgentLoop(PlannerBase):
                     trace.validation = "PASS"
                     trace.model = llm_result.get("model", "")
                     trace.log()
-                    return {
+                    response = {
                         "status": "ok",
                         "response": direct,
                         "model": llm_result.get("model", ""),
                         "iterations": iteration + 1,
                     }
+                    ui_config = self._orch.config.get("ui", {})
+                    if ui_config.get("enabled", False):
+                        records = _collect_recording_items(
+                            _iter_calls, self._tool_results_cache
+                        )
+                        if records:
+                            response["ui_messages"] = [
+                                recording_list_surface(
+                                    records,
+                                    text_fallback=direct,
+                                    title="Recording results",
+                                )
+                            ]
+                    return response
 
             # ── Inject tool results back into conversation ──
             _FORMAT_REMINDER = (
@@ -2419,6 +2435,30 @@ class AgentLoop(PlannerBase):
         except Exception as exc:
             logger.exception("Tool %s failed", tool_name)
             return {"error": str(exc)}
+
+    async def execute_confirmed_tool(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        systems: list[str] | None = None,
+    ) -> Dict[str, Any]:
+        """Execute one server-held action after explicit user confirmation."""
+        if tool_name not in self._DANGEROUS_TOOLS and tool_name not in self._OWNER_TOOLS:
+            return {"error": "Action is not registered for confirmation"}
+
+        async with self._confirmation_lock:
+            previous_systems = getattr(
+                self, "_active_systems", {"sagetv", "channelsdvr"}
+            )
+            try:
+                self._active_systems = (
+                    set(systems) if systems else {"sagetv", "channelsdvr"}
+                )
+                confirmed_args = dict(args)
+                confirmed_args["_confirmed"] = True
+                return await self._execute_tool(tool_name, confirmed_args)
+            finally:
+                self._active_systems = previous_systems
 
     @staticmethod
     def _query_variants(raw: str) -> list[str]:

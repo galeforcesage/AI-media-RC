@@ -4,7 +4,7 @@
   Provides offline shell so the app installs on all platforms.
 */
 
-const CACHE_NAME = 'llm-remote-v3.6.6';
+const CACHE_NAME = 'llm-remote-v3.7.0';
 
 const SHELL_ASSETS = [
   '/',
@@ -14,10 +14,12 @@ const SHELL_ASSETS = [
   '/js/api.js',
   '/js/state.js',
   '/js/ui.js',
+  '/js/a2ui.js',
   '/js/pcm16-streamer.js',
   '/js/voice.js',
   '/js/app.js',
   '/manifest.json',
+  '/catalogs/llm-remote-v1.json',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

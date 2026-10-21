@@ -68,7 +68,7 @@ const API = (() => {
    * Streaming query via SSE — calls onStatus(msg) for each status update,
    * then returns the final result object.
    */
-  async function queryStream(text, systems, onStatus, signal, onToken) {
+  async function queryStream(text, systems, onStatus, signal, onToken, onUI) {
     const resp = await fetch(`${baseUrl}/api/query/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -96,11 +96,31 @@ const API = (() => {
           const evt = JSON.parse(line.slice(6));
           if (evt.type === 'status' && onStatus) onStatus(evt.message);
           else if (evt.type === 'token' && onToken) onToken(evt.token);
+          else if (evt.type === 'ui' && onUI) onUI(evt.message);
           else if (evt.type === 'result') finalResult = evt.data;
         } catch (_) { /* skip malformed */ }
       }
     }
     return finalResult || { error: 'No response from server.' };
+  }
+
+  async function dispatchUIAction(actionId, action) {
+    const resp = await fetch(`${baseUrl}/api/ui/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ action_id: actionId, action }),
+    });
+    if (resp.status === 401) {
+      window.location.href = '/login.html';
+      throw new Error('unauthorized');
+    }
+    let data = {};
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok) {
+      return { error: data.detail || `Action failed (${resp.status})` };
+    }
+    return data;
   }
 
   async function playback(action, params = {}) {
@@ -309,7 +329,7 @@ const API = (() => {
 
   return {
     setBaseUrl, setSessionUrl,
-    query, queryStream, queryWS, connectEvents, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu, alerts, clearAlerts,
+    query, queryStream, dispatchUIAction, queryWS, connectEvents, playback, search, getTranscript, searchTranscripts, playTitle, system, health, services, gpu, alerts, clearAlerts,
     listDevices, bridgeDevices, bridgeStatus, addDevice, updateDevice, discoverDevices, deleteDevice, setDefaultDevice,
     resolveSession, listSessions, whoami,
     authCheck, authLogout, adminLogin, adminCheck, adminLogout,

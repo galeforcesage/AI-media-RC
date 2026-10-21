@@ -102,4 +102,26 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if timeout_val <= 0:
         raise ValueError("Invalid agent.openclaw.timeout_ms; must be > 0")
 
+    ui_cfg = config.get("ui", {}) or {}
+    if ui_cfg:
+        if ui_cfg.get("protocol", "a2ui-v0.9.1") != "a2ui-v0.9.1":
+            raise ValueError("Invalid ui.protocol; only a2ui-v0.9.1 is supported")
+        if ui_cfg.get("mode", "deterministic") != "deterministic":
+            raise ValueError("Invalid ui.mode; only deterministic mode is supported")
+        if ui_cfg.get(
+            "catalog_id", "urn:llm-remote:a2ui:catalog:v1"
+        ) != "urn:llm-remote:a2ui:catalog:v1":
+            raise ValueError("Invalid ui.catalog_id; unsupported catalog")
+        if ui_cfg.get("allow_model_layout", False):
+            raise ValueError("ui.allow_model_layout is not supported")
+        try:
+            max_components = int(ui_cfg.get("max_components_per_surface", 100))
+            ttl_seconds = int(ui_cfg.get("pending_action_ttl_seconds", 300))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid UI numeric configuration") from exc
+        if not 1 <= max_components <= 500:
+            raise ValueError("ui.max_components_per_surface must be between 1 and 500")
+        if not 30 <= ttl_seconds <= 3600:
+            raise ValueError("ui.pending_action_ttl_seconds must be between 30 and 3600")
+
     return config
