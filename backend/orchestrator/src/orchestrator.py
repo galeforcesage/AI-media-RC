@@ -1273,6 +1273,8 @@ class Orchestrator:
                 "llm_response": agent_result.get("response", ""),
                 "iterations": agent_result.get("iterations", 1),
             }
+            if agent_result.get("ui_messages"):
+                llm_result["ui_messages"] = agent_result["ui_messages"]
 
             # Optional TTS synthesis
             if synthesize and agent_result.get("status") == "ok":
