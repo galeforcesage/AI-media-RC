@@ -129,3 +129,39 @@ def test_http_confirmation_replaces_raw_tool_and_arguments(monkeypatch):
     assert "linux_restart_service" not in serialized
     assert "service_name" not in serialized
     assert "sagetv" not in serialized
+
+
+def test_http_compiles_episode_metadata_into_recording_surface(monkeypatch):
+    class FakeOrchestrator:
+        config = {
+            "ui": {
+                "enabled": True,
+                "max_components_per_surface": 100,
+            }
+        }
+
+    monkeypatch.setattr(http, "_orchestrator", FakeOrchestrator())
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/query",
+        "headers": [],
+    })
+    result = http._prepare_ui_result(
+        {
+            "status": "ok",
+            "llm_response": '1. "Example"',
+            "episode_meta": [{
+                "title": "Example",
+                "episode_title": "Pilot",
+                "channel": "10.1",
+                "system": "channelsdvr",
+            }],
+        },
+        request,
+        ["channelsdvr"],
+    )
+
+    surface = result["ui_messages"][0]
+    assert surface["components"][0]["component"] == "RecordingList"
+    assert surface["components"][0]["props"]["items"][0]["title"] == "Example"

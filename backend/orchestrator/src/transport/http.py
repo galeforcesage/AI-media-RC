@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from utils.tracing import start_trace, end_trace
 from utils.metrics import http_requests_total, http_request_duration, http_errors_total
 from services.a2ui_validator import validate_surface, SurfaceValidationError
-from services.ui_surface import confirmation_surface
+from services.ui_surface import confirmation_surface, recording_list_surface
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,25 @@ def _prepare_ui_result(
                     expires_at=pending.expires_at,
                 )
             )
+
+    episode_meta = result.get("episode_meta")
+    if (
+        ui_config.get("enabled", False)
+        and not result.get("ui_messages")
+        and isinstance(episode_meta, list)
+        and episode_meta
+    ):
+        result["ui_messages"] = [
+            recording_list_surface(
+                episode_meta,
+                text_fallback=(
+                    result.get("llm_response")
+                    or result.get("response")
+                    or ""
+                ),
+                title="Recording results",
+            )
+        ]
 
     validated = []
     for message in result.get("ui_messages", []):
