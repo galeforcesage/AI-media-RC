@@ -131,7 +131,7 @@ def test_http_confirmation_replaces_raw_tool_and_arguments(monkeypatch):
     assert "sagetv" not in serialized
 
 
-def test_http_compiles_episode_metadata_into_recording_surface(monkeypatch):
+def test_http_prefers_existing_episode_cards_over_recording_surface(monkeypatch):
     class FakeOrchestrator:
         config = {
             "ui": {
@@ -147,6 +147,10 @@ def test_http_compiles_episode_metadata_into_recording_surface(monkeypatch):
         "path": "/api/query",
         "headers": [],
     })
+    recording_surface = recording_list_surface(
+        [{"title": "Example", "episode_title": "Pilot"}],
+        text_fallback='1. "Example"',
+    )
     result = http._prepare_ui_result(
         {
             "status": "ok",
@@ -157,11 +161,10 @@ def test_http_compiles_episode_metadata_into_recording_surface(monkeypatch):
                 "channel": "10.1",
                 "system": "channelsdvr",
             }],
+            "ui_messages": [recording_surface],
         },
         request,
         ["channelsdvr"],
     )
 
-    surface = result["ui_messages"][0]
-    assert surface["components"][0]["component"] == "RecordingList"
-    assert surface["components"][0]["props"]["items"][0]["title"] == "Example"
+    assert "ui_messages" not in result

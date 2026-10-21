@@ -2548,7 +2548,9 @@ class AgentLoop(PlannerBase):
     ) -> Dict[str, Any]:
         """Call a transcript tool via direct TCP JSON-RPC to port 8770."""
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 8770, limit=1024 * 1024)
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", 8770, limit=16 * 1024 * 1024
+            )
             request = json.dumps({
                 "jsonrpc": "2.0",
                 "id": 1,

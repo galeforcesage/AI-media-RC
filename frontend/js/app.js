@@ -236,14 +236,25 @@
     });
 
     // Episode card title clicks — view transcript
-    document.getElementById('messages').addEventListener('click', (e) => {
+    document.getElementById('messages').addEventListener('click', async (e) => {
       const link = e.target.closest('.ec-transcript-link');
       if (!link) return;
       e.preventDefault();
-      const recordingId = link.dataset.recordingId;
       const txTitle = link.dataset.title;
-      if (!recordingId) return;
-      showTranscriptDialog(recordingId, txTitle);
+      if (!txTitle) return;
+      try {
+        const search = await API.searchTranscripts(txTitle);
+        const results = search?.results || [];
+        const system = link.closest('.episode-card')?.dataset.system || '';
+        const match = results.find(r => r.system === system) || results[0];
+        if (!match?.recording_id) {
+          UI.addMessage(`No transcript is available for ${txTitle}.`, 'assistant');
+          return;
+        }
+        showTranscriptDialog(match.recording_id, txTitle);
+      } catch (err) {
+        UI.addMessage(`Transcript lookup failed: ${err.message}`, 'error');
+      }
     });
 
     // Show title clicks — search and show metadata popup
