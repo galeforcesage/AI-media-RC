@@ -1493,6 +1493,7 @@ class AgentLoop(PlannerBase):
                         "response": final,
                         "model": llm_result.get("model", ""),
                         "iterations": iteration + 1,
+                        "suppress_transcript_results": _is_transcript_summary_query,
                         "streamed": True,
                     }
 

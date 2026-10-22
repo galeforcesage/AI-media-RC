@@ -1287,7 +1287,13 @@ class Orchestrator:
             # Transcript-summary queries already identify the selected episode
             # in the answer. Search snippets are not actionable episode cards.
             llm_result["transcript_results"] = (
-                [] if (_summary_title or _has_inline_transcript) else transcript_hits
+                []
+                if (
+                    agent_result.get("suppress_transcript_results")
+                    or _summary_title
+                    or _has_inline_transcript
+                )
+                else transcript_hits
             )
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
