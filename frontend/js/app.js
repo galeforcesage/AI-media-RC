@@ -656,7 +656,15 @@
 
       // Render clickable episode cards if transcript results were returned
       const results = data.transcript_results;
-      if (results && results.length > 0) {
+      const isTranscriptSummary = (
+        /\b(?:summari[sz]e|summary|recap)\b/i.test(text)
+        && /\btranscript\b/i.test(text)
+      ) || (
+        /Episode Overview/i.test(response)
+        && /Plot Breakdown/i.test(response)
+        && /Key Takeaways/i.test(response)
+      );
+      if (!isTranscriptSummary && results && results.length > 0) {
         UI.addEpisodeCards(results);
       }
       (data.ui_messages || []).forEach((message) => {
