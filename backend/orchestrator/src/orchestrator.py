@@ -1284,8 +1284,11 @@ class Orchestrator:
                     if tts_result.get("status") == "ok":
                         llm_result["audio_path"] = tts_result["audio_path"]
 
-            # Attach transcript hits for the frontend
-            llm_result["transcript_results"] = transcript_hits
+            # Transcript-summary queries already identify the selected episode
+            # in the answer. Search snippets are not actionable episode cards.
+            llm_result["transcript_results"] = (
+                [] if (_summary_title or _has_inline_transcript) else transcript_hits
+            )
             if shadow_info is not None:
                 llm_result["shadow"] = shadow_info
 

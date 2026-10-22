@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 
 from transport import http
 from services.a2ui_validator import SurfaceValidationError, validate_surface
+from services.agent import AgentLoop
 from services.pending_actions import PendingActionStore
 from services.ui_surface import confirmation_surface, recording_list_surface
 from utils.config import validate_config
@@ -168,3 +169,19 @@ def test_http_prefers_existing_episode_cards_over_recording_surface(monkeypatch)
     )
 
     assert "ui_messages" not in result
+
+
+def test_summary_fills_empty_and_missing_sections():
+    summary = (
+        "1) Episode Overview: An overview.\n"
+        "2) Plot Breakdown:\n- A plot point.\n"
+        "3) Key Characters:\n- Janine.\n"
+        "4) Important Dialogue and Turning Points:\n"
+        "5) Themes and Story Arcs:\n- Teamwork.\n"
+    )
+
+    assert AgentLoop._summary_has_empty_section(summary)
+    repaired = AgentLoop._fill_missing_summary_sections(summary)
+
+    assert "4) Important Dialogue and Turning Points:\n- Not shown in transcript." in repaired
+    assert "6) Key Takeaways:\n- Not shown in transcript." in repaired

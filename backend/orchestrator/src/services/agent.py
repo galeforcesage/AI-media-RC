@@ -1433,6 +1433,7 @@ class AgentLoop(PlannerBase):
                         _looks_wrong = bool(
                             re.search(r"(?im)^\s*\d+\.\s+.*\b(watched|unwatched)\b", final)
                             or re.search(r"\b(?:please\s+provide|unable\s+to\s+find|couldn't\s+find)\b", final, re.I)
+                            or self._summary_has_empty_section(final)
                         )
                         if _looks_wrong:
                             cache = getattr(self, "_tool_results_cache", {}) or {}
@@ -1471,6 +1472,7 @@ class AgentLoop(PlannerBase):
                                 repaired = self._strip_markers((repair or {}).get("response", ""))
                                 if repaired and not re.search(r"(?im)^\s*\d+\.\s+.*\b(watched|unwatched)\b", repaired):
                                     final = repaired
+                        final = self._fill_missing_summary_sections(final)
 
                     # Post-hoc answer validation (Layer 3 — Formal Validator)
                     vr = self._validate_answer(final, user_query)
@@ -2059,6 +2061,78 @@ class AgentLoop(PlannerBase):
         if "transcript" in ql:
             return True
         return bool(re.search(r"\b(?:from|for|of)\b", ql) and re.search(r"\b(?:show|episode)\b", ql))
+
+    _SUMMARY_SECTIONS = (
+        "Episode Overview",
+        "Plot Breakdown",
+        "Key Characters",
+        "Important Dialogue and Turning Points",
+        "Themes and Story Arcs",
+        "Key Takeaways",
+    )
+
+    @classmethod
+    def _summary_has_empty_section(cls, answer: str) -> bool:
+        """Return whether a numbered transcript-summary section has no content."""
+        for index, title in enumerate(cls._SUMMARY_SECTIONS, 1):
+            next_index = index + 1
+            boundary = (
+                rf"(?=\s*(?:#{{1,6}}\s*)?{next_index}[\).]\s*)"
+                if next_index <= len(cls._SUMMARY_SECTIONS)
+                else r"(?=\s*$)"
+            )
+            pattern = (
+                rf"(?is)\b{index}[\).]\s*{re.escape(title)}\s*:?\s*"
+                + boundary
+            )
+            if re.search(pattern, answer or ""):
+                return True
+        return False
+
+    @classmethod
+    def _fill_missing_summary_sections(cls, answer: str) -> str:
+        """Ensure every required summary section exists and contains text."""
+        result = (answer or "").strip()
+        fallback = "- Not shown in transcript."
+        for index, title in enumerate(cls._SUMMARY_SECTIONS, 1):
+            heading = rf"(?:#{{1,6}}\s*)?{index}[\).]\s*{re.escape(title)}\s*:?"
+            match = re.search(heading, result, re.I)
+            if not match:
+                next_index = index + 1
+                next_match = (
+                    re.search(
+                        rf"(?:#{{1,6}}\s*)?{next_index}[\).]\s*",
+                        result,
+                        re.I,
+                    )
+                    if next_index <= len(cls._SUMMARY_SECTIONS)
+                    else None
+                )
+                section = f"{index}) {title}:\n{fallback}\n\n"
+                if next_match:
+                    result = result[:next_match.start()] + section + result[next_match.start():]
+                else:
+                    result = f"{result}\n\n{section}".strip()
+                match = re.search(heading, result, re.I)
+
+            next_index = index + 1
+            end_match = (
+                re.search(
+                    rf"(?:#{{1,6}}\s*)?{next_index}[\).]\s*",
+                    result[match.end():],
+                    re.I,
+                )
+                if match and next_index <= len(cls._SUMMARY_SECTIONS)
+                else None
+            )
+            end = (
+                match.end() + end_match.start()
+                if match and end_match
+                else len(result)
+            )
+            if match and not result[match.end():end].strip():
+                result = result[:match.end()] + f"\n{fallback}\n\n" + result[end:]
+        return result.strip()
 
     # ------------------------------------------------------------------
     # Post-hoc answer validation (Layer 3 — Formal Validator)
