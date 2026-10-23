@@ -735,11 +735,13 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
 }
 .transcript-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   justify-content: flex-end;
   padding-top: 0.5rem;
   border-top: 1px solid var(--border);
 }
+.transcript-copilot-btn { margin-right: auto; }
 
 dialog fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 0.75rem; margin-bottom: 0.75rem; }
 dialog legend { color: var(--primary); font-size: 0.9rem; padding: 0 0.3rem; }

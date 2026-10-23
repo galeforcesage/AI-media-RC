@@ -324,6 +324,7 @@
       <p>Loading...</p>
     </div>
     <div class="transcript-actions" id="transcript-actions" hidden>
+      <button type="button" id="transcript-ask-copilot" class="btn-small transcript-copilot-btn">Copy &amp; Ask Copilot</button>
       <button type="button" id="transcript-edit" class="btn-small">&#9998; Edit</button>
       <button type="button" id="transcript-save" class="btn-small" hidden>&#128190; Save</button>
       <button type="button" id="transcript-cancel-edit" class="btn-small" hidden>Cancel</button>
@@ -347,7 +348,7 @@
   <script src="js/a2ui.js?v=1.0.0"></script>
   <script src="js/pcm16-streamer.js?v=3.4.2"></script>
   <script src="js/voice.js?v=3.4.2"></script>
-  <script src="js/app.js?v=3.4.9"></script>
+  <script src="js/app.js?v=3.4.10"></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function(err) {

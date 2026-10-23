@@ -305,6 +305,43 @@
       document.getElementById('summary-dialog').close();
     });
 
+    document.getElementById('transcript-ask-copilot').addEventListener('click', async () => {
+      const button = document.getElementById('transcript-ask-copilot');
+      const body = document.getElementById('transcript-body');
+      const transcript = body.querySelector('.transcript-content')?.dataset.original
+        || body.querySelector('.transcript-text')?.dataset.original
+        || '';
+      if (!transcript.trim()) {
+        UI.addMessage('No transcript text is available to copy.', 'error');
+        return;
+      }
+
+      const copilotWindow = window.open('about:blank', '_blank');
+      if (!copilotWindow) {
+        UI.addMessage('Allow pop-ups for this site to open Microsoft Copilot.', 'error');
+        return;
+      }
+
+      const originalLabel = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Copying...';
+      try {
+        await copyTextToClipboard(`What happened for this show transcript\n\n${transcript}`);
+        copilotWindow.opener = null;
+        copilotWindow.location.replace('https://copilot.cloud.microsoft/chat');
+        button.textContent = 'Copied - paste in Copilot';
+        setTimeout(() => {
+          button.textContent = originalLabel;
+          button.disabled = false;
+        }, 2500);
+      } catch (err) {
+        copilotWindow.close();
+        button.textContent = originalLabel;
+        button.disabled = false;
+        UI.addMessage(`Could not copy transcript: ${err.message}`, 'error');
+      }
+    });
+
     // Transcript edit/save/cancel
     document.getElementById('transcript-edit').addEventListener('click', () => {
       const body = document.getElementById('transcript-body');
@@ -961,6 +998,24 @@
     const data = await API.getTranscript(recordingId);
     if (!data || data.error) return null;
     return data;
+  }
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('Clipboard access was denied');
   }
 
   async function showTranscriptDialog(recordingId, txTitle) {
