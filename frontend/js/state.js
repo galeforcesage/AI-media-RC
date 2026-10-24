@@ -40,18 +40,33 @@ const State = (() => {
   function onChange(fn) { listeners.push(fn); }
 
   async function refreshDevices() {
-    // Auto-discover SageTV contexts before listing
-    try { await API.discoverDevices(); } catch (_) { /* non-fatal */ }
+    let devices = [];
     try {
-      const data = await API.listDevices();
+      const data = await API.discoverDevices();
       if (data.success) {
-        set({ devices: data.devices });
+        devices = data.discovered || [];
       }
     } catch (e) {
-      console.warn('Failed to load devices:', e);
+      console.warn('Failed to discover online SageTV devices:', e);
     }
-    // Also refresh bridge devices
-    await refreshBridgeDevices();
+
+    let bridgeDevices = [];
+    try {
+      const data = await API.bridgeDevices();
+      bridgeDevices = data.devices || [];
+    } catch (e) {
+      console.warn('Failed to load bridge devices:', e);
+    }
+
+    const activeIds = new Set([
+      ...devices.map(d => d.device_id),
+      ...bridgeDevices.map(d => `bridge:${d.device_name || d.device_model || 'Unknown'}`),
+    ]);
+    const updates = { devices, bridgeDevices };
+    if (state.deviceId && !activeIds.has(state.deviceId)) {
+      Object.assign(updates, { deviceId: '', sessionId: '', session: null });
+    }
+    set(updates);
   }
 
   async function refreshBridgeDevices() {
@@ -118,13 +133,29 @@ const State = (() => {
     }
   }
 
+  let _eventStream = null;
+
   function startPolling(intervalMs = 7000) {
     stopPolling();
     refreshSession();
     refreshBridgeDevices();
+
+    // Try WebSocket events stream first (push-based, no polling needed)
+    try {
+      _eventStream = API.connectEvents((evt) => {
+        if (evt.type === 'playback_update' && evt.data) {
+          set({ session: evt.data, connected: true });
+        } else if (evt.type === 'health' && evt.data) {
+          set({ connected: evt.data.status === 'ok' });
+        }
+      });
+    } catch (_) {
+      _eventStream = null;
+    }
+
+    // Fall back to polling if WS not available or as a supplement
     state.polling = setInterval(refreshSession, intervalMs);
-    // Bridge device list changes rarely — poll every 30s
-    state._bridgePoll = setInterval(refreshBridgeDevices, 30000);
+    state._bridgePoll = setInterval(refreshDevices, 30000);
   }
 
   function stopPolling() {
@@ -135,6 +166,10 @@ const State = (() => {
     if (state._bridgePoll) {
       clearInterval(state._bridgePoll);
       state._bridgePoll = null;
+    }
+    if (_eventStream) {
+      _eventStream.close();
+      _eventStream = null;
     }
   }
 

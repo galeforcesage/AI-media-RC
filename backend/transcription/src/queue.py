@@ -42,9 +42,17 @@ class TranscriptionQueue:
                 error TEXT DEFAULT '',
                 created_at REAL,
                 updated_at REAL,
-                duration REAL DEFAULT 0
+                duration REAL DEFAULT 0,
+                priority INTEGER DEFAULT 0
             )
         """)
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "priority" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0")
+        if "dead_letter_reason" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN dead_letter_reason TEXT DEFAULT ''"
+            )
         self._conn.commit()
         logger.info("Transcription queue opened: %s", self.db_path)
 
@@ -60,10 +68,10 @@ class TranscriptionQueue:
         ).fetchone()
         if existing:
             logger.debug("Job for recording %s already queued", job.recording_id)
-            return job
+            return self.get_job(existing["job_id"]) or job
         # For incremental jobs, also dedup on file_path — don't allow multiple
         # pending/processing jobs for the same physical file
-        if "__inc_" in job.recording_id:
+        if "__inc_" in job.recording_id and not job.recording_id.endswith("__final"):
             existing_path = self._conn.execute(
                 "SELECT job_id FROM jobs WHERE file_path = ? AND status IN ('pending', 'extracting', 'processing')",
                 (job.file_path,),
@@ -71,14 +79,14 @@ class TranscriptionQueue:
             if existing_path:
                 logger.debug("Incremental job for file %s already queued (job %s)",
                              job.file_path, existing_path["job_id"])
-                return job
+                return self.get_job(existing_path["job_id"]) or job
         self._conn.execute(
             """INSERT INTO jobs (job_id, system, recording_id, file_path, temp_audio_path,
-                status, attempts, max_attempts, error, created_at, updated_at, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, attempts, max_attempts, error, created_at, updated_at, duration, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job.job_id, job.system, job.recording_id, job.file_path,
              job.temp_audio_path, job.status, job.attempts, job.max_attempts,
-             job.error, job.created_at, job.updated_at, job.duration),
+             job.error, job.created_at, job.updated_at, job.duration, job.priority),
         )
         self._conn.commit()
         logger.info("Enqueued job %s for %s (%s)", job.job_id, job.recording_id, job.system)
@@ -87,7 +95,8 @@ class TranscriptionQueue:
     def dequeue(self) -> Optional[TranscriptionJob]:
         """Get the next pending job (oldest first)."""
         row = self._conn.execute(
-            "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+            "SELECT * FROM jobs WHERE status = 'pending' "
+            "ORDER BY priority DESC, created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
             return None
@@ -174,6 +183,91 @@ class TranscriptionQueue:
             for r in rows
         ]
 
+    def recover_stale_jobs(self, stale_seconds: int = 1800) -> int:
+        """Reset stale jobs back to 'pending' if under max_attempts,
+        or move to 'dead_letter' if exhausted. Returns count recovered."""
+        cutoff = time.time() - stale_seconds
+        now = time.time()
+        rows = self._conn.execute(
+            """SELECT job_id, attempts, max_attempts, error
+               FROM jobs
+               WHERE status IN ('extracting', 'processing')
+                 AND updated_at < ?""",
+            (cutoff,),
+        ).fetchall()
+        recovered = 0
+        for row in rows:
+            job_id = row["job_id"]
+            if row["attempts"] >= row["max_attempts"]:
+                # Move to dead letter
+                self._conn.execute(
+                    """UPDATE jobs SET status = 'dead_letter',
+                       dead_letter_reason = ?, updated_at = ?
+                       WHERE job_id = ?""",
+                    (f"Stale after {row['attempts']} attempts: {row['error']}", now, job_id),
+                )
+                logger.warning("Job %s moved to dead letter (exhausted retries)", job_id)
+            else:
+                # Reset to pending for retry
+                self._conn.execute(
+                    """UPDATE jobs SET status = 'pending', updated_at = ?
+                       WHERE job_id = ?""",
+                    (now, job_id),
+                )
+                recovered += 1
+                logger.info("Job %s recovered from stale state -> pending", job_id)
+        self._conn.commit()
+        return recovered
+
+    def list_dead_letter(self, limit: int = 50) -> List[Dict]:
+        """List jobs in dead_letter status."""
+        rows = self._conn.execute(
+            """SELECT job_id, system, recording_id, file_path, attempts,
+                      error, dead_letter_reason, created_at, updated_at
+               FROM jobs WHERE status = 'dead_letter'
+               ORDER BY updated_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "job_id": r["job_id"],
+                "system": r["system"],
+                "recording_id": r["recording_id"],
+                "file_path": r["file_path"],
+                "attempts": r["attempts"],
+                "error": r["error"],
+                "dead_letter_reason": r["dead_letter_reason"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    def retry_dead_letter(self, job_id: str) -> bool:
+        """Reset a dead-lettered job back to pending for retry."""
+        row = self._conn.execute(
+            "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if not row or row["status"] != "dead_letter":
+            return False
+        now = time.time()
+        self._conn.execute(
+            """UPDATE jobs SET status = 'pending', attempts = 0,
+               error = '', dead_letter_reason = '', updated_at = ?
+               WHERE job_id = ?""",
+            (now, job_id),
+        )
+        self._conn.commit()
+        logger.info("Dead-lettered job %s retried -> pending", job_id)
+        return True
+
+    def dead_letter_count(self) -> int:
+        """Return count of dead-lettered jobs."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'dead_letter'"
+        ).fetchone()
+        return row["cnt"] if row else 0
+
     def _row_to_job(self, row) -> TranscriptionJob:
         return TranscriptionJob(
             job_id=row["job_id"],
@@ -188,4 +282,5 @@ class TranscriptionQueue:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             duration=row["duration"],
+            priority=row["priority"] if "priority" in row.keys() else 0,
         )

@@ -17,6 +17,78 @@
   --shadow: 0 2px 8px rgba(0,0,0,0.4);
 }
 
+/* ---- Trusted dynamic surfaces (local A2UI catalog) ---- */
+.a2ui-surface {
+  width: min(100%, 760px);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--primary);
+  padding: 0.85rem;
+}
+.a2ui-title {
+  color: var(--primary);
+  font-size: 1rem;
+  margin-bottom: 0.65rem;
+}
+.a2ui-recording-list {
+  display: grid;
+  gap: 0.55rem;
+}
+.a2ui-recording-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem;
+}
+.a2ui-recording-title {
+  font-weight: 700;
+}
+.a2ui-recording-episode {
+  margin-top: 0.15rem;
+}
+.a2ui-recording-meta {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-top: 0.35rem;
+}
+.a2ui-confirmation {
+  display: grid;
+  gap: 0.65rem;
+}
+.a2ui-confirmation code {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.a2ui-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.a2ui-action {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.85rem;
+  cursor: pointer;
+}
+.a2ui-action.primary {
+  background: var(--primary-dark);
+}
+.a2ui-action.danger {
+  background: var(--danger);
+  color: #fff;
+}
+.a2ui-action:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+.a2ui-error {
+  color: #ff8a80;
+}
+.a2ui-outcome {
+  color: #81c784;
+}
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html { font-size: 16px; }
@@ -349,6 +421,13 @@ body {
   gap: 0.15rem;
   min-width: 0;
 }
+.episode-card .ec-mainline {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
 .episode-card .ec-transcript-link {
   font-weight: 600;
   color: var(--primary);
@@ -357,6 +436,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 .episode-card .ec-transcript-link:hover {
   text-decoration: underline;
@@ -378,9 +460,49 @@ body {
 }
 .ec-play-btn:hover { opacity: 0.8; }
 .ec-play-btn.loading { opacity: 0.4; pointer-events: none; }
+.ec-dvr-tag {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 .ec-title { font-weight: 600; }
 .ec-meta { font-size: 0.8rem; color: var(--text-muted); }
 .ec-snippet { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
+.ec-se {
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-left: 0.25rem;
+}
+.episode-card .ec-ep-link { margin-left: 0.15rem; }
+.episode-card .ec-title.show-link {
+  color: var(--primary);
+  text-decoration: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+.episode-card .ec-title.show-link:hover { text-decoration: underline; }
+.ec-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.ec-badge.ec-unwatched { color: var(--primary); border-color: var(--primary); }
+.ec-badge.ec-watched { color: var(--text-muted); }
 .episode-results { max-width: 100%; }
 
 .input-row { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
@@ -663,11 +785,13 @@ dialog h2 { margin-bottom: 1rem; font-size: 1.2rem; }
 }
 .transcript-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   justify-content: flex-end;
   padding-top: 0.5rem;
   border-top: 1px solid var(--border);
 }
+.transcript-copilot-btn { margin-right: auto; }
 
 dialog fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 0.75rem; margin-bottom: 0.75rem; }
 dialog legend { color: var(--primary); font-size: 0.9rem; padding: 0 0.3rem; }

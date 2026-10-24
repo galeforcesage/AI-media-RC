@@ -14,6 +14,9 @@ import subprocess
 import time
 from typing import Any, Dict, Optional
 
+from utils.tracing import span as trace_span
+from utils.metrics import mcp_calls_total, mcp_call_duration, mcp_errors_total
+
 logger = logging.getLogger(__name__)
 
 # Map MCP client names to watchdog service names
@@ -154,19 +157,31 @@ class MCPClient:
         Returns:
             Parsed result from the tool (the content text parsed as JSON).
         """
-        result = await self._rpc("tools/call", {
-            "name": tool_name,
-            "arguments": arguments or {},
-        })
-        # Unwrap MCP content envelope
-        content = result.get("content", [])
-        if content and isinstance(content, list):
-            text = content[0].get("text", "{}")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"raw": text}
-        return result
+        mcp_calls_total.inc(labels={"server": self.name, "tool": tool_name})
+        start = time.time()
+        try:
+            async with trace_span("mcp.call_tool", {"mcp.server": self.name, "mcp.tool": tool_name}) as s:
+                result = await self._rpc("tools/call", {
+                    "name": tool_name,
+                    "arguments": arguments or {},
+                })
+                # Unwrap MCP content envelope
+                content = result.get("content", [])
+                if content and isinstance(content, list):
+                    text = content[0].get("text", "{}")
+                    try:
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        parsed = {"raw": text}
+                else:
+                    parsed = result
+                s.set_attribute("result_size", len(str(parsed)))
+                mcp_call_duration.observe(time.time() - start)
+                return parsed
+        except Exception as exc:
+            mcp_errors_total.inc(labels={"server": self.name, "tool": tool_name})
+            mcp_call_duration.observe(time.time() - start)
+            raise
 
     async def read_resource(self, uri: str) -> Any:
         """Read an MCP resource by URI."""

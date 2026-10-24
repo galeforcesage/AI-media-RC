@@ -8,6 +8,7 @@ Outputs timestamped segments.
 
 from __future__ import annotations
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -131,6 +132,7 @@ class WhisperEngine:
             audio_path,
             language=language,
             beam_size=5,
+            word_timestamps=True,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
         )
@@ -143,6 +145,16 @@ class WhisperEngine:
                 "start": round(seg.start, 2),
                 "end": round(seg.end, 2),
                 "text": seg.text.strip(),
+                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                "words": [
+                    {
+                        "start": round(word.start, 2),
+                        "end": round(word.end, 2),
+                        "word": word.word.strip(),
+                        "confidence": round(float(word.probability), 3),
+                    }
+                    for word in (seg.words or [])
+                ],
             })
 
         elapsed = time.time() - start
@@ -176,6 +188,7 @@ class WhisperEngine:
                 audio_path,
                 language=language,
                 beam_size=5,
+                word_timestamps=True,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
             )
@@ -191,6 +204,16 @@ class WhisperEngine:
                 "start": round(seg.start + time_offset, 2),
                 "end": round(seg.end + time_offset, 2),
                 "text": text,
+                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                "words": [
+                    {
+                        "start": round(word.start + time_offset, 2),
+                        "end": round(word.end + time_offset, 2),
+                        "word": word.word.strip(),
+                        "confidence": round(float(word.probability), 3),
+                    }
+                    for word in (seg.words or [])
+                ],
             })
         return out
 

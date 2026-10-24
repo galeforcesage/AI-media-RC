@@ -7,11 +7,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Dict, Optional
 
 import aiohttp
 
 from utils.logger import get_logger
+from utils.tracing import span as trace_span
+from utils.metrics import llm_requests_total, llm_request_duration, llm_errors_total
 
 logger = get_logger(__name__)
 
@@ -110,47 +113,59 @@ class LLMService:
             Dict with status, prompt, response, and model.
         """
         logger.info("LLM generating response (prompt length=%d)", len(prompt))
+        llm_requests_total.inc()
+        start = time.time()
         try:
-            payload = {
-                "model": self.model,
-                "system": SYSTEM_PROMPT,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": self.temperature,
-                    "num_predict": self.num_predict,
-                    "num_thread": self.num_threads,
-                },
-            }
-            if params:
-                payload["options"].update(params)
-            if "qwen3" in self.model:
-                payload["think"] = False
-            timeout = aiohttp.ClientTimeout(total=300)
-            async with self._inference_semaphore:
-              async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self.base_url}/api/generate", json=payload
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("Ollama error %d: %s", resp.status, body[:200])
-                        return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
-                    data = await resp.json()
+            async with trace_span("llm.generate", {"model": self.model, "prompt_length": len(prompt)}) as s:
+                payload = {
+                    "model": self.model,
+                    "system": SYSTEM_PROMPT,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_predict": self.num_predict,
+                        "num_thread": self.num_threads,
+                    },
+                }
+                if params:
+                    payload["options"].update(params)
+                if "qwen3" in self.model:
+                    payload["think"] = False
+                timeout = aiohttp.ClientTimeout(total=300)
+                async with self._inference_semaphore:
+                  async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        f"{self.base_url}/api/generate", json=payload
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error("Ollama error %d: %s", resp.status, body[:200])
+                            s.set_error(f"HTTP {resp.status}")
+                            llm_errors_total.inc()
+                            llm_request_duration.observe(time.time() - start)
+                            return {"error": f"Ollama HTTP {resp.status}: {body[:200]}"}
+                        data = await resp.json()
 
-            response_text = data.get("response", "").strip()
-            logger.info("LLM response (%d chars): %s", len(response_text), response_text[:100])
-            return {
-                "status": "ok",
-                "prompt": prompt,
-                "response": response_text,
-                "model": self.model,
-            }
+                response_text = data.get("response", "").strip()
+                s.set_attribute("response_length", len(response_text))
+                llm_request_duration.observe(time.time() - start)
+                logger.info("LLM response (%d chars): %s", len(response_text), response_text[:100])
+                return {
+                    "status": "ok",
+                    "prompt": prompt,
+                    "response": response_text,
+                    "model": self.model,
+                }
         except asyncio.TimeoutError:
             logger.error("LLM generation timed out")
+            llm_errors_total.inc()
+            llm_request_duration.observe(time.time() - start)
             return {"error": "LLM generation timed out (300s)"}
         except Exception as exc:
             logger.exception("LLM generation error")
+            llm_errors_total.inc()
+            llm_request_duration.observe(time.time() - start)
             return {"error": str(exc)}
 
     async def generate_chat(

@@ -4,6 +4,8 @@
 (function () {
   'use strict';
 
+  let transcriptRefreshTimer = null;
+
   // ─── Boot ─────────────────────────────────────────────────
 
   document.addEventListener('DOMContentLoaded', async () => {
@@ -209,7 +211,12 @@
       const card = playBtn.closest('.episode-card');
       if (!card) return;
       const title = card.dataset.title;
-      const system = card.dataset.system || State.get().system;
+      const availableSystems = (card.dataset.systems || '')
+        .split(',').filter(Boolean);
+      const selectedSystem = State.get().system;
+      const system = availableSystems.includes(selectedSystem)
+        ? selectedSystem
+        : (card.dataset.system || selectedSystem);
       if (!title) return;
 
       const deviceId = State.get().deviceId;
@@ -236,14 +243,25 @@
     });
 
     // Episode card title clicks — view transcript
-    document.getElementById('messages').addEventListener('click', (e) => {
+    document.getElementById('messages').addEventListener('click', async (e) => {
       const link = e.target.closest('.ec-transcript-link');
       if (!link) return;
       e.preventDefault();
-      const recordingId = link.dataset.recordingId;
       const txTitle = link.dataset.title;
-      if (!recordingId) return;
-      showTranscriptDialog(recordingId, txTitle);
+      if (!txTitle) return;
+      try {
+        const search = await API.searchTranscripts(txTitle);
+        const results = search?.results || [];
+        const system = link.closest('.episode-card')?.dataset.system || '';
+        const match = results.find(r => r.system === system) || results[0];
+        if (!match?.recording_id) {
+          UI.addMessage(`No transcript is available for ${txTitle}.`, 'assistant');
+          return;
+        }
+        showTranscriptDialog(match.recording_id, txTitle);
+      } catch (err) {
+        UI.addMessage(`Transcript lookup failed: ${err.message}`, 'error');
+      }
     });
 
     // Show title clicks — search and show metadata popup
@@ -286,12 +304,64 @@
 
     // Close button for transcript dialog
     document.getElementById('transcript-close').addEventListener('click', () => {
+      if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+      transcriptRefreshTimer = null;
       document.getElementById('transcript-dialog').close();
+    });
+    document.getElementById('transcript-dialog').addEventListener('close', () => {
+      if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+      transcriptRefreshTimer = null;
     });
 
     // Close button for summary dialog
     document.getElementById('summary-close').addEventListener('click', () => {
       document.getElementById('summary-dialog').close();
+    });
+
+    document.getElementById('transcript-ask-copilot').addEventListener('click', async () => {
+      const button = document.getElementById('transcript-ask-copilot');
+      const body = document.getElementById('transcript-body');
+      const transcript = body.querySelector('.transcript-content')?.dataset.original
+        || body.querySelector('.transcript-text')?.dataset.original
+        || '';
+      if (!transcript.trim()) {
+        UI.addMessage('No transcript text is available to copy.', 'error');
+        return;
+      }
+
+      const copilotWindow = window.open('about:blank', '_blank');
+      if (!copilotWindow) {
+        UI.addMessage('Allow pop-ups for this site to open Microsoft Copilot.', 'error');
+        return;
+      }
+
+      const originalLabel = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Copying...';
+      try {
+        await copyTextToClipboard(
+          `Analyze this episode based on the transcript below. Explain the major storylines and how ` +
+          `they develop; the key characters involved; any notable regular characters who appear to ` +
+          `be absent, if that can be determined confidently; important scenes, conflicts, turning ` +
+          `points, reveals, and resolutions; character motivations and relationships; and how each ` +
+          `storyline ends or remains unresolved. Use specific details from the transcript rather than ` +
+          `giving only a short summary. If the transcript is incomplete or unclear, identify the gap ` +
+          `and do not invent details.\n\n` +
+          `Transcript:\n${transcript}`
+        );
+        copilotWindow.opener = null;
+        copilotWindow.location.replace('https://copilot.cloud.microsoft/chat');
+        button.textContent = 'Copied - paste in Copilot';
+        setTimeout(() => {
+          button.textContent = originalLabel;
+          button.disabled = false;
+        }, 2500);
+      } catch (err) {
+        copilotWindow.close();
+        button.textContent = originalLabel;
+        button.disabled = false;
+        UI.addMessage(`Could not copy transcript: ${err.message}`, 'error');
+      }
     });
 
     // Transcript edit/save/cancel
@@ -589,6 +659,7 @@
     let statusLog = [];
 
     try {
+      const renderedSurfaceIds = new Set();
       const data = await API.queryStream(text, State.get().llmFocus, (status) => {
         // Status callback — if we were streaming tokens, a new status
         // means the LLM is doing tool calls; revert to thinking indicator
@@ -618,6 +689,10 @@
         streamedText += token;
         streamEl.textContent = streamedText;
         msgContainer.scrollTop = msgContainer.scrollHeight;
+      }, (message) => {
+        if (!message || renderedSurfaceIds.has(message.surface_id)) return;
+        renderedSurfaceIds.add(message.surface_id);
+        A2UI.render(message, msgContainer);
       });
 
       // Convert thinking indicator into a persistent status log
@@ -636,13 +711,36 @@
       }
 
       const response = data.response || data.llm_response || data.error || 'No response from server.';
-      UI.addMessage(response, data.error ? 'error' : 'assistant');
-
-      // Render clickable episode cards if transcript results were returned
+      const meta = data.episode_meta;
       const results = data.transcript_results;
-      if (results && results.length > 0) {
-        UI.addEpisodeCards(results);
+      const isTranscriptSummary = (
+        /\b(?:summari[sz]e|summary|recap)\b/i.test(text)
+        && /\btranscript\b/i.test(text)
+      ) || (
+        /Episode Overview/i.test(response)
+        && /Plot Breakdown/i.test(response)
+        && /Key Takeaways/i.test(response)
+      );
+
+      if (data.error) {
+        UI.addMessage(response, 'error');
+      } else if (isTranscriptSummary) {
+        UI.addMessage(response, 'assistant');
+      } else {
+        const merged = mergeEpisodeResults(response, meta || results);
+        if (merged) {
+          if (merged.prose) UI.addMessage(merged.prose, 'assistant');
+          UI.addEpisodeResults(merged.items, { contentSearch: isContentQuery(text) });
+        } else {
+          UI.addMessage(response, 'assistant');
+          if (results && results.length > 0) UI.addEpisodeCards(results);
+        }
       }
+      (data.ui_messages || []).forEach((message) => {
+        if (!message || renderedSurfaceIds.has(message.surface_id)) return;
+        renderedSurfaceIds.add(message.surface_id);
+        A2UI.render(message, msgContainer);
+      });
     } catch (e) {
       thinking.remove();
       if (streamEl) streamEl.remove();
@@ -934,6 +1032,24 @@
     return data;
   }
 
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('Clipboard access was denied');
+  }
+
   async function showTranscriptDialog(recordingId, txTitle) {
     const dialog = document.getElementById('transcript-dialog');
     const titleEl = document.getElementById('transcript-title');
@@ -948,6 +1064,8 @@
     document.getElementById('transcript-edit').hidden = false;
     document.getElementById('transcript-save').hidden = true;
     document.getElementById('transcript-cancel-edit').hidden = true;
+    if (transcriptRefreshTimer) clearInterval(transcriptRefreshTimer);
+    transcriptRefreshTimer = null;
     dialog.showModal();
 
     try {
@@ -956,41 +1074,61 @@
         bodyEl.innerHTML = `<p>Transcript not found.</p>`;
         return;
       }
+      renderTranscriptDialogData(data, recordingId);
 
-      // Meta bar
-      const metaParts = [];
-      if (data.word_count) metaParts.push(`${data.word_count.toLocaleString()} words`);
-      if (data.duration) metaParts.push(`${Math.round(data.duration / 60)} min`);
-      if (data.system) metaParts.push(data.system);
-      metaEl.textContent = metaParts.join(' · ');
-
-      // Summary
-      let html = '';
-      if (data.summary) {
-        html += `<div class="transcript-summary"><strong>Summary:</strong> ${esc(data.summary)}</div>`;
+      if ((data.transcript_state || 'final') !== 'final') {
+        transcriptRefreshTimer = setInterval(async () => {
+          if (!dialog.open || bodyEl.querySelector('.editing')) return;
+          const updated = await loadTranscriptData(recordingId).catch(() => null);
+          if (!updated) return;
+          renderTranscriptDialogData(updated, recordingId);
+          if ((updated.transcript_state || 'final') === 'final') {
+            clearInterval(transcriptRefreshTimer);
+            transcriptRefreshTimer = null;
+          }
+        }, 10000);
       }
-      if (data.keywords && data.keywords.length) {
-        html += `<div class="transcript-keywords">${data.keywords.map(k => `<span class="tx-keyword">${esc(k)}</span>`).join(' ')}</div>`;
-      }
-
-      // Transcript text — prefer VTT (segment timing → paragraphing). Falls back
-      // to the flat blob only if no VTT is stored.
-      const text = data.transcript || '(No transcript text available)';
-      let displayHtml;
-      if (data.vtt && data.vtt.includes('<v ')) {
-        displayHtml = formatVttWithSpeakers(data.vtt);
-      } else if (data.vtt && data.vtt.includes('-->')) {
-        displayHtml = formatVttAsParagraphs(data.vtt);
-      } else {
-        displayHtml = `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
-      }
-      html += `<div class="transcript-content" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${displayHtml}</div>`;
-
-      bodyEl.innerHTML = html;
-      actionsEl.hidden = false;
     } catch (err) {
       bodyEl.innerHTML = `<p class="si-error">Error: ${esc(err.message)}</p>`;
     }
+  }
+
+  function renderTranscriptDialogData(data, recordingId) {
+    const metaEl = document.getElementById('transcript-meta');
+    const bodyEl = document.getElementById('transcript-body');
+    const actionsEl = document.getElementById('transcript-actions');
+    const editButton = document.getElementById('transcript-edit');
+    const state = String(data.transcript_state || 'final').toLowerCase();
+    const metaParts = [];
+    if (data.word_count) metaParts.push(`${data.word_count.toLocaleString()} words`);
+    if (data.duration) metaParts.push(`${Math.round(data.duration / 60)} min`);
+    if (data.system) metaParts.push(data.system);
+    if (state === 'live') metaParts.push('LIVE · provisional');
+    else if (state === 'stable') metaParts.push('STABLE');
+    else metaParts.push('FINAL');
+    metaEl.textContent = metaParts.join(' · ');
+
+    let html = '';
+    if (data.summary) {
+      html += `<div class="transcript-summary"><strong>Summary:</strong> ${esc(data.summary)}</div>`;
+    }
+    if (data.keywords && data.keywords.length) {
+      html += `<div class="transcript-keywords">${data.keywords.map(k => `<span class="tx-keyword">${esc(k)}</span>`).join(' ')}</div>`;
+    }
+
+    const text = data.transcript || '(No transcript text available)';
+    let displayHtml;
+    if (data.vtt && data.vtt.includes('<v ')) {
+      displayHtml = formatVttWithSpeakers(data.vtt);
+    } else if (data.vtt && data.vtt.includes('-->')) {
+      displayHtml = formatVttAsParagraphs(data.vtt);
+    } else {
+      displayHtml = `<pre class="transcript-text" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${esc(text)}</pre>`;
+    }
+    html += `<div class="transcript-content" data-recording-id="${esc(recordingId)}" data-original="${esc(text)}">${displayHtml}</div>`;
+    bodyEl.innerHTML = html;
+    actionsEl.hidden = false;
+    editButton.hidden = state !== 'final';
   }
 
   function buildTranscriptSummaryPrompt(showTitle, episodeTitle, transcriptText = '', recordingId = '') {
@@ -1108,6 +1246,88 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  function isContentQuery(q) {
+    const s = (q || '').toLowerCase();
+    const listing = /\b(what(?:'s| is| was| are| were|'?s)?\s+(?:recorded|record|available|on the dvr|on my dvr)|list\s|unwatched\b|what did i record|what'?s available|show me .*recording)\b/.test(s);
+    const content = /\b(who|what did|what happened|what was said|said|says?|talk|talked|talking|discuss|mention|about|topic|why|how did|when did|quote|scene|moment|happen(?:s|ed)?|storyline|plot)\b/.test(s);
+    return content && !listing;
+  }
+
+  function fmtEpochDate(v) {
+    const n = Number(v);
+    if (!n || Number.isNaN(n)) return '';
+    const ms = n > 1e12 ? n : n * 1000;
+    try {
+      return new Date(ms).toLocaleDateString(
+        undefined,
+        { weekday: 'short', month: 'short', day: 'numeric' }
+      );
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function mergeEpisodeResults(response, results) {
+    if (!response) return null;
+    const norm = (v) => (v || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const lineRe = /^\s*(?:\d+\.|[-•*])\s+["“”]([^"“”]+)["“”](?:\s+["“”]([^"“”]+)["“”])?\s*(.*)$/;
+
+    const items = [];
+    const proseLines = [];
+    for (const line of response.split(/\r?\n/)) {
+      const match = line.match(lineRe);
+      if (!match) {
+        proseLines.push(line);
+        continue;
+      }
+      const showName = (match[1] || '').trim();
+      const epTitle = (match[2] || '').trim();
+      const rest = (match[3] || '').trim();
+      const seMatch = rest.match(/\bS\d{1,2}E\d{1,3}\b/i);
+      const watchMatch = rest.match(/\b(Watched|Unwatched|Unknown)\b/i);
+      const dateStr = rest
+        .replace(/\bS\d{1,2}E\d{1,3}\b/i, '')
+        .replace(/\b(Watched|Unwatched|Unknown)\b/i, '')
+        .replace(/^[\s—\-–·|]+|[\s—\-–·|]+$/g, '')
+        .trim();
+      items.push({
+        showName,
+        epTitle,
+        se: seMatch ? seMatch[0].toUpperCase() : '',
+        watched: watchMatch ? watchMatch[1] : '',
+        dateStr,
+      });
+    }
+    if (items.length === 0) return null;
+
+    const resultByKey = {};
+    (results || []).forEach((result) => {
+      const show = (result.display_title || result.title || '')
+        .replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '');
+      const key = norm(show) + '|' + norm(result.episode_title);
+      if (!resultByKey[key]) resultByKey[key] = result;
+    });
+    items.forEach((item) => {
+      const result = resultByKey[norm(item.showName) + '|' + norm(item.epTitle)];
+      if (!result) return;
+      item.recordingId = result.recording_id || '';
+      item.system = result.system || '';
+      item.systems = Array.isArray(result.systems) ? result.systems : [];
+      item.dvrLabel = result.dvr_label || '';
+      item.upcoming = !!result.upcoming;
+      item.channel = result.channel || '';
+      item.startTime = result.start_time != null ? result.start_time : null;
+      item.snippet = result.snippet || '';
+      if (!item.se && result.se_label) item.se = result.se_label;
+      if (!item.dateStr && (result.record_date || result.air_date)) {
+        item.dateStr = fmtEpochDate(result.record_date || result.air_date);
+      }
+    });
+
+    const prose = proseLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { items, prose };
   }
 
   function formatVttWithSpeakers(vtt) {
