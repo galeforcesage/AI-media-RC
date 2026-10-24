@@ -211,7 +211,12 @@
       const card = playBtn.closest('.episode-card');
       if (!card) return;
       const title = card.dataset.title;
-      const system = card.dataset.system || State.get().system;
+      const availableSystems = (card.dataset.systems || '')
+        .split(',').filter(Boolean);
+      const selectedSystem = State.get().system;
+      const system = availableSystems.includes(selectedSystem)
+        ? selectedSystem
+        : (card.dataset.system || selectedSystem);
       if (!title) return;
 
       const deviceId = State.get().deviceId;
@@ -706,9 +711,7 @@
       }
 
       const response = data.response || data.llm_response || data.error || 'No response from server.';
-      UI.addMessage(response, data.error ? 'error' : 'assistant');
-
-      // Render clickable episode cards if transcript results were returned
+      const meta = data.episode_meta;
       const results = data.transcript_results;
       const isTranscriptSummary = (
         /\b(?:summari[sz]e|summary|recap)\b/i.test(text)
@@ -718,8 +721,20 @@
         && /Plot Breakdown/i.test(response)
         && /Key Takeaways/i.test(response)
       );
-      if (!isTranscriptSummary && results && results.length > 0) {
-        UI.addEpisodeCards(results);
+
+      if (data.error) {
+        UI.addMessage(response, 'error');
+      } else if (isTranscriptSummary) {
+        UI.addMessage(response, 'assistant');
+      } else {
+        const merged = mergeEpisodeResults(response, meta || results);
+        if (merged) {
+          if (merged.prose) UI.addMessage(merged.prose, 'assistant');
+          UI.addEpisodeResults(merged.items, { contentSearch: isContentQuery(text) });
+        } else {
+          UI.addMessage(response, 'assistant');
+          if (results && results.length > 0) UI.addEpisodeCards(results);
+        }
       }
       (data.ui_messages || []).forEach((message) => {
         if (!message || renderedSurfaceIds.has(message.surface_id)) return;
@@ -1231,6 +1246,88 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  function isContentQuery(q) {
+    const s = (q || '').toLowerCase();
+    const listing = /\b(what(?:'s| is| was| are| were|'?s)?\s+(?:recorded|record|available|on the dvr|on my dvr)|list\s|unwatched\b|what did i record|what'?s available|show me .*recording)\b/.test(s);
+    const content = /\b(who|what did|what happened|what was said|said|says?|talk|talked|talking|discuss|mention|about|topic|why|how did|when did|quote|scene|moment|happen(?:s|ed)?|storyline|plot)\b/.test(s);
+    return content && !listing;
+  }
+
+  function fmtEpochDate(v) {
+    const n = Number(v);
+    if (!n || Number.isNaN(n)) return '';
+    const ms = n > 1e12 ? n : n * 1000;
+    try {
+      return new Date(ms).toLocaleDateString(
+        undefined,
+        { weekday: 'short', month: 'short', day: 'numeric' }
+      );
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function mergeEpisodeResults(response, results) {
+    if (!response) return null;
+    const norm = (v) => (v || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const lineRe = /^\s*(?:\d+\.|[-•*])\s+["“”]([^"“”]+)["“”](?:\s+["“”]([^"“”]+)["“”])?\s*(.*)$/;
+
+    const items = [];
+    const proseLines = [];
+    for (const line of response.split(/\r?\n/)) {
+      const match = line.match(lineRe);
+      if (!match) {
+        proseLines.push(line);
+        continue;
+      }
+      const showName = (match[1] || '').trim();
+      const epTitle = (match[2] || '').trim();
+      const rest = (match[3] || '').trim();
+      const seMatch = rest.match(/\bS\d{1,2}E\d{1,3}\b/i);
+      const watchMatch = rest.match(/\b(Watched|Unwatched|Unknown)\b/i);
+      const dateStr = rest
+        .replace(/\bS\d{1,2}E\d{1,3}\b/i, '')
+        .replace(/\b(Watched|Unwatched|Unknown)\b/i, '')
+        .replace(/^[\s—\-–·|]+|[\s—\-–·|]+$/g, '')
+        .trim();
+      items.push({
+        showName,
+        epTitle,
+        se: seMatch ? seMatch[0].toUpperCase() : '',
+        watched: watchMatch ? watchMatch[1] : '',
+        dateStr,
+      });
+    }
+    if (items.length === 0) return null;
+
+    const resultByKey = {};
+    (results || []).forEach((result) => {
+      const show = (result.display_title || result.title || '')
+        .replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '');
+      const key = norm(show) + '|' + norm(result.episode_title);
+      if (!resultByKey[key]) resultByKey[key] = result;
+    });
+    items.forEach((item) => {
+      const result = resultByKey[norm(item.showName) + '|' + norm(item.epTitle)];
+      if (!result) return;
+      item.recordingId = result.recording_id || '';
+      item.system = result.system || '';
+      item.systems = Array.isArray(result.systems) ? result.systems : [];
+      item.dvrLabel = result.dvr_label || '';
+      item.upcoming = !!result.upcoming;
+      item.channel = result.channel || '';
+      item.startTime = result.start_time != null ? result.start_time : null;
+      item.snippet = result.snippet || '';
+      if (!item.se && result.se_label) item.se = result.se_label;
+      if (!item.dateStr && (result.record_date || result.air_date)) {
+        item.dateStr = fmtEpochDate(result.record_date || result.air_date);
+      }
+    });
+
+    const prose = proseLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { items, prose };
   }
 
   function formatVttWithSpeakers(vtt) {

@@ -185,6 +185,86 @@ const UI = (() => {
     el['messages'].scrollTop = el['messages'].scrollHeight;
   }
 
+  function addEpisodeResults(items, opts = {}) {
+    if (!items || items.length === 0) return;
+    const contentSearch = !!opts.contentSearch;
+    const bubble = document.createElement('div');
+    bubble.className = 'message assistant episode-results';
+
+    const heading = document.createElement('div');
+    heading.className = 'episode-results-heading';
+    heading.textContent = 'Matching episodes:';
+    bubble.appendChild(heading);
+
+    items.forEach(it => {
+      const showName = it.showName || 'Unknown';
+      const epTitle = it.epTitle || '';
+      const se = it.se || '';
+      const card = document.createElement('div');
+      card.className = 'episode-card';
+      card.dataset.recordingId = it.recordingId || '';
+      card.dataset.title = showName;
+      card.dataset.system = it.system || '';
+      card.dataset.systems = (it.systems || []).join(',');
+
+      const showLink =
+        `<a class="ec-title show-link" href="#" data-title="${esc(showName)}">${esc(showName)}</a>`;
+      const epLink = epTitle
+        ? ` <a class="ec-title ec-ep-link show-link" href="#" ` +
+          `data-title="${esc(epTitle)}" data-show="${esc(showName)}">${esc(epTitle)}</a>`
+        : '';
+      const seHtml = se ? ` <span class="ec-se">${esc(se)}</span>` : '';
+
+      const metaBits = [];
+      if (it.dateStr) metaBits.push(esc(it.dateStr));
+      if (it.channel && !(it.dateStr && it.dateStr.includes(it.channel))) {
+        metaBits.push(`(${esc(it.channel)})`);
+      }
+      if (it.dvrLabel) metaBits.push(esc(it.dvrLabel));
+      if (contentSearch && it.startTime != null) {
+        metaBits.push(`at ${esc(formatTime(it.startTime))}`);
+      }
+      let metaHtml = metaBits.length
+        ? `<span class="ec-meta">${metaBits.join(' · ')}</span>`
+        : '';
+      if (it.watched) {
+        const watched = String(it.watched).toLowerCase();
+        const cls = watched === 'watched'
+          ? 'ec-badge ec-watched'
+          : watched === 'unwatched'
+            ? 'ec-badge ec-unwatched'
+            : 'ec-badge';
+        metaHtml += ` <span class="${cls}">${esc(it.watched)}</span>`;
+      }
+
+      const rawSnippet = (it.snippet || '').replace(/<\/?b>/g, '');
+      const snippet = contentSearch && rawSnippet
+        ? `<span class="ec-snippet">${esc(rawSnippet.substring(0, 120))}…</span>`
+        : '';
+      const dvrLabel = it.system === 'sagetv'
+        ? 'SageTV'
+        : it.system === 'channelsdvr'
+          ? 'Channels'
+          : '';
+      const trailing = it.upcoming
+        ? (dvrLabel
+          ? `<span class="ec-dvr-tag" title="Scheduled on ${esc(dvrLabel)}">${esc(dvrLabel)}</span>`
+          : '')
+        : '<button class="ec-play-btn" title="Play on device">▶</button>';
+
+      card.innerHTML =
+        `<div class="ec-text">` +
+        `<div class="ec-mainline">${showLink}${epLink}${seHtml}${metaHtml}</div>` +
+        snippet +
+        `</div>` +
+        trailing;
+      bubble.appendChild(card);
+    });
+
+    el['messages'].appendChild(bubble);
+    el['messages'].scrollTop = el['messages'].scrollHeight;
+  }
+
   function clearMessages() {
     el['messages'].innerHTML = '';
   }
@@ -568,7 +648,7 @@ const UI = (() => {
 
   return {
     cacheElements, updateNowPlaying, formatTime, updateDpad,
-    addMessage, addMessageHTML, addEpisodeCards, clearMessages,
+    addMessage, addMessageHTML, addEpisodeCards, addEpisodeResults, clearMessages,
     updatePicker, updateLLMFocusCheckboxes, updateLLMFocusLabel,
     updateDevicePicker, updateStatus,
     renderDeviceList, renderServiceGrid, renderDvrGrid, renderGpuGrid, renderSystemOutput, renderTranscriptionTab, renderAlerts,
