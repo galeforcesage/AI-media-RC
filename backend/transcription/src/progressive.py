@@ -109,7 +109,10 @@ def resolve_text(cc_text: str, asr_text: str) -> tuple[str, str, float]:
         confidence = 0.5 + 0.35 * cc_quality + 0.15 * ratio
         return cc_text, "cc_preferred", round(min(0.99, confidence), 3)
     if cc_text:
-        return cc_text, "cc", round(0.55 + 0.35 * text_quality_score(cc_text), 3)
+        cc_quality = text_quality_score(cc_text)
+        if cc_quality < 0.35:
+            return "", "rejected_cc", 0.0
+        return cc_text, "cc", round(0.55 + 0.35 * cc_quality, 3)
     return asr_text, "asr", round(0.45 + 0.4 * text_quality_score(asr_text), 3)
 
 

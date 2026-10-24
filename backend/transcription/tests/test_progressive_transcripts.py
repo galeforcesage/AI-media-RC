@@ -61,6 +61,14 @@ def test_resolver_uses_asr_when_cc_is_corrupt():
     assert confidence >= 0.8
 
 
+def test_resolver_omits_corrupt_cc_without_asr_fallback():
+    resolved, source, confidence = resolve_text("HDHDHDHDHDHDHDHD", "")
+
+    assert resolved == ""
+    assert source == "rejected_cc"
+    assert confidence == 0.0
+
+
 def test_resolver_keeps_clean_cc_when_both_sources_are_usable():
     resolved, source, confidence = resolve_text(
         "You don't even need silverware for that.",
