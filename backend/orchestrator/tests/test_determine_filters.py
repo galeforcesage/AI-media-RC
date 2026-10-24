@@ -304,3 +304,10 @@ def test_watch_inventory_phrasings_are_unwatched_title_filters(prompt, expected)
     assert filters.title == expected
     assert filters.watched is WatchedState.UNWATCHED
     assert filters.transcript_query is None
+
+
+def test_recordings_of_title_extracts_series_filter():
+    filters = extract_filters("recordings of Airwolf")
+
+    assert filters.title == "Airwolf"
+    assert filters.transcript_query is None

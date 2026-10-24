@@ -843,7 +843,8 @@ class Orchestrator:
                 r"(?:i|we)\s+have|(?:i|we)'ve\s+got|(?:i|we)\s+got)\b"
                 r"|\bdo\s+(?:i|we)\s+have\b[^?]*"
                 r"\b(?:episodes?|shows?|recordings?|programs?)\b"
-                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b",
+                r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                r"|\b(?:recordings?|episodes?|shows?|programs?)\s+of\s+[^?]+",
                 re.I,
             )
             _content_marker_re = re.compile(
@@ -858,6 +859,19 @@ class Orchestrator:
                 and not _has_inline_transcript
                 and not _is_meta_transcript
             )
+            _recordings_prompt = prompt
+            _bare_title = re.fullmatch(
+                r"\s*([A-Za-z0-9][A-Za-z0-9'&:-]*)[?.!]*\s*",
+                prompt,
+            )
+            if _bare_title:
+                _candidate = _bare_title.group(1).strip()
+                if _candidate.lower() not in {
+                    "hello", "hi", "hey", "help", "thanks", "thank you",
+                    "yes", "no", "okay", "ok",
+                }:
+                    _recordings_prompt = f"recordings of {_candidate}"
+                    _is_recordings_listing = True
 
             # ── Authoritative recordings search/listing (compiler-driven) ──
             # The local model is unreliable at BOTH picking the filtered DVR
@@ -870,7 +884,7 @@ class Orchestrator:
             if _is_recordings_listing:
                 try:
                     _det = await self._compiled_recordings_listing(
-                        prompt, active, status_callback
+                        _recordings_prompt, active, status_callback
                     )
                 except Exception:
                     logger.warning(
