@@ -297,11 +297,18 @@ const UI = (() => {
 
   function updateDevicePicker(devices, selectedId, bridgeDevices, system) {
     const picker = el['device-picker'];
-    picker.innerHTML = '<option value="">Select device...</option>';
+    const onlineDevices = (devices || []).filter(d => d.online !== false);
+    const onlineBridgeDevices =
+      system === 'channelsdvr' ? (bridgeDevices || []) : [];
+    const hasOnlineDevices =
+      onlineDevices.length > 0 || onlineBridgeDevices.length > 0;
+    picker.innerHTML = hasOnlineDevices
+      ? '<option value="">Select device...</option>'
+      : '<option value="">No online devices</option>';
 
-    // Show registered session-manager devices
-    if (devices && devices.length > 0) {
-      devices.forEach(d => {
+    // Show only currently-discovered session-manager devices.
+    if (onlineDevices.length > 0) {
+      onlineDevices.forEach(d => {
         const opt = document.createElement('option');
         opt.value = d.device_id;
         opt.textContent = d.friendly_name || d.device_id;
@@ -311,10 +318,10 @@ const UI = (() => {
     }
 
     // When Channels DVR is selected, show connected playback devices
-    if (system === 'channelsdvr' && bridgeDevices && bridgeDevices.length > 0) {
+    if (onlineBridgeDevices.length > 0) {
       const group = document.createElement('optgroup');
       group.label = 'Playback Devices (online)';
-      bridgeDevices.forEach(d => {
+      onlineBridgeDevices.forEach(d => {
         const opt = document.createElement('option');
         const name = d.device_name || d.device_model || 'Unknown';
         const icon = d.device_type === 'direct' ? '📺' : '🟢';

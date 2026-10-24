@@ -40,18 +40,33 @@ const State = (() => {
   function onChange(fn) { listeners.push(fn); }
 
   async function refreshDevices() {
-    // Auto-discover SageTV contexts before listing
-    try { await API.discoverDevices(); } catch (_) { /* non-fatal */ }
+    let devices = [];
     try {
-      const data = await API.listDevices();
+      const data = await API.discoverDevices();
       if (data.success) {
-        set({ devices: data.devices });
+        devices = data.discovered || [];
       }
     } catch (e) {
-      console.warn('Failed to load devices:', e);
+      console.warn('Failed to discover online SageTV devices:', e);
     }
-    // Also refresh bridge devices
-    await refreshBridgeDevices();
+
+    let bridgeDevices = [];
+    try {
+      const data = await API.bridgeDevices();
+      bridgeDevices = data.devices || [];
+    } catch (e) {
+      console.warn('Failed to load bridge devices:', e);
+    }
+
+    const activeIds = new Set([
+      ...devices.map(d => d.device_id),
+      ...bridgeDevices.map(d => `bridge:${d.device_name || d.device_model || 'Unknown'}`),
+    ]);
+    const updates = { devices, bridgeDevices };
+    if (state.deviceId && !activeIds.has(state.deviceId)) {
+      Object.assign(updates, { deviceId: '', sessionId: '', session: null });
+    }
+    set(updates);
   }
 
   async function refreshBridgeDevices() {
@@ -140,7 +155,7 @@ const State = (() => {
 
     // Fall back to polling if WS not available or as a supplement
     state.polling = setInterval(refreshSession, intervalMs);
-    state._bridgePoll = setInterval(refreshBridgeDevices, 30000);
+    state._bridgePoll = setInterval(refreshDevices, 30000);
   }
 
   function stopPolling() {
