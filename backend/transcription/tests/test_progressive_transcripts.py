@@ -9,7 +9,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.models import TranscriptionJob
-from src.progressive import caption_snapshot_is_usable
+from src.progressive import (
+    caption_snapshot_is_usable,
+    resolve_text,
+    text_quality_score,
+)
 from src import cc_extractor
 from src.cc_extractor import _parse_srt
 from src.queue import TranscriptionQueue
@@ -30,6 +34,42 @@ def test_rejects_implausible_caption_timestamps():
     assert caption_snapshot_is_usable([
         {"start": 47_970.0, "end": 47_974.0, "text": "Valid looking words"}
     ]) is False
+
+
+def test_rejects_repeated_caption_decoder_garbage():
+    segments = [
+        {
+            "start": float(i * 10),
+            "end": float(i * 10 + 10),
+            "text": "HD" * (8 + i),
+        }
+        for i in range(8)
+    ]
+
+    assert caption_snapshot_is_usable(segments) is False
+    assert text_quality_score("HDHDHDHDHDHDHD") < 0.35
+
+
+def test_resolver_uses_asr_when_cc_is_corrupt():
+    resolved, source, confidence = resolve_text(
+        "HDHDHDHDHDHDHDHD",
+        "The cafeteria staff is cooking up some new options for lunches.",
+    )
+
+    assert resolved.startswith("The cafeteria staff")
+    assert source == "asr_preferred"
+    assert confidence >= 0.8
+
+
+def test_resolver_keeps_clean_cc_when_both_sources_are_usable():
+    resolved, source, confidence = resolve_text(
+        "You don't even need silverware for that.",
+        "you don't even need silverware for that",
+    )
+
+    assert resolved == "You don't even need silverware for that."
+    assert source == "cc_preferred"
+    assert confidence >= 0.9
 
 
 def test_ffmpeg_subcc_srt_tags_are_cleaned():

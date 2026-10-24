@@ -15,6 +15,55 @@ from . import cc_extractor
 logger = logging.getLogger(__name__)
 
 
+def text_quality_score(text: str) -> float:
+    """Estimate whether transcript evidence resembles useful natural language."""
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    if not text:
+        return 0.0
+
+    printable = sum(ch.isprintable() for ch in text) / len(text)
+    alpha = sum(ch.isalpha() for ch in text)
+    digits = sum(ch.isdigit() for ch in text)
+    alpha_ratio = alpha / len(text)
+    score = 1.0
+
+    if printable < 0.98:
+        score -= 0.5
+    if alpha < 2:
+        score -= 0.7
+    elif alpha_ratio < 0.25:
+        score -= 0.45
+    elif alpha_ratio < 0.45:
+        score -= 0.2
+    if digits > alpha:
+        score -= 0.45
+    if "\ufffd" in text:
+        score -= 0.5
+
+    compact = re.sub(r"[^a-z0-9]", "", text.lower())
+    if len(compact) >= 8:
+        for unit_size in range(1, min(5, len(compact) // 3 + 1)):
+            unit = compact[:unit_size]
+            repeated = (unit * ((len(compact) + unit_size - 1) // unit_size))[
+                :len(compact)
+            ]
+            if compact == repeated:
+                score -= 0.9
+                break
+
+    words = re.findall(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)?", text.lower())
+    if len(words) >= 6:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.25:
+            score -= 0.5
+        elif unique_ratio < 0.4:
+            score -= 0.2
+    if words and max(len(word) for word in words) > 40:
+        score -= 0.35
+
+    return round(max(0.0, min(1.0, score)), 3)
+
+
 def caption_snapshot_is_usable(segments: List[Dict]) -> bool:
     """Reject decoder garbage while allowing short, newly-started caption feeds."""
     texts = [re.sub(r"\s+", " ", str(s.get("text", "")).strip()) for s in segments]
@@ -41,6 +90,9 @@ def caption_snapshot_is_usable(segments: List[Dict]) -> bool:
         return False
     if len(texts) >= 10 and len(set(texts)) / len(texts) < 0.15:
         return False
+    low_quality = sum(text_quality_score(text) < 0.35 for text in texts)
+    if len(texts) >= 3 and low_quality / len(texts) >= 0.3:
+        return False
     return True
 
 
@@ -49,10 +101,16 @@ def resolve_text(cc_text: str, asr_text: str) -> tuple[str, str, float]:
     asr_text = (asr_text or "").strip()
     if cc_text and asr_text:
         ratio = difflib.SequenceMatcher(None, cc_text.lower(), asr_text.lower()).ratio()
-        return cc_text, "cc_preferred", round(0.75 + 0.24 * ratio, 3)
+        cc_quality = text_quality_score(cc_text)
+        asr_quality = text_quality_score(asr_text)
+        if cc_quality < 0.35 or asr_quality >= cc_quality + 0.25:
+            confidence = 0.45 + 0.4 * asr_quality + 0.15 * ratio
+            return asr_text, "asr_preferred", round(min(0.99, confidence), 3)
+        confidence = 0.5 + 0.35 * cc_quality + 0.15 * ratio
+        return cc_text, "cc_preferred", round(min(0.99, confidence), 3)
     if cc_text:
-        return cc_text, "cc", 0.82
-    return asr_text, "asr", 0.65
+        return cc_text, "cc", round(0.55 + 0.35 * text_quality_score(cc_text), 3)
+    return asr_text, "asr", round(0.45 + 0.4 * text_quality_score(asr_text), 3)
 
 
 class LiveTranscriptMonitor:
