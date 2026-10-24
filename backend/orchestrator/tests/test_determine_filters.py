@@ -289,3 +289,18 @@ def test_inventory_preamble_preserves_leading_the():
     assert extract_filters("show me The Voice recordings").title == "The Voice"
     assert extract_filters("recordings of The Office").title == "The Office"
 
+
+@pytest.mark.parametrize(
+    "prompt,expected",
+    [
+        ("what traitors shows do we have to watch?", "traitors"),
+        ("what NCIS episodes do I have to watch?", "NCIS"),
+        ("do we have any Columbo episodes to watch?", "Columbo"),
+    ],
+)
+def test_watch_inventory_phrasings_are_unwatched_title_filters(prompt, expected):
+    filters = extract_filters(prompt)
+
+    assert filters.title == expected
+    assert filters.watched is WatchedState.UNWATCHED
+    assert filters.transcript_query is None

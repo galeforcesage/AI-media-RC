@@ -788,7 +788,10 @@ def extract_filters(prompt: str) -> DetermineFilters:
 
     # 11) Watched state.
     if re.search(r"\bunwatched\b|\bnot\s+watched\b|\bhaven'?t\s+watched\b|"
-                 r"\bnever\s+watched\b", working, re.I):
+                 r"\bnever\s+watched\b|"
+                 r"\b(?:need|have|got|left)\s+to\s+watch\b|"
+                 r"\b(?:episodes?|shows?|recordings?|programs?)\b[^?]*"
+                 r"\bto\s+watch\b", working, re.I):
         f["watched"] = WatchedState.UNWATCHED
     elif re.search(r"\balready\s+watched\b|\bwatched\b", working, re.I):
         f["watched"] = WatchedState.WATCHED
@@ -838,8 +841,8 @@ _TITLE_CUE_PATTERNS = [
     r"\b(?:show|series|program|programme)\s+(?:called|named|titled)\s+(.+?)(?:\?|$)",
     # "recordings of Columbo" / "episodes of Columbo"
     r"\b(?:recordings?|episodes?)\s+of\s+(.+?)(?:\?|$)",
-    # "Columbo recordings" / "Columbo episodes"
-    r"\b(.+?)\s+(?:recordings?|episodes?)\b",
+    # "Columbo recordings" / "Columbo episodes" / "Traitors shows"
+    r"\b(.+?)\s+(?:recordings?|episodes?|shows?|programs?)\b",
 ]
 _TITLE_CUE_RE = [re.compile(p, re.I) for p in _TITLE_CUE_PATTERNS]
 
@@ -851,7 +854,8 @@ _TITLE_CUE_RE = [re.compile(p, re.I) for p in _TITLE_CUE_PATTERNS]
 _PREAMBLE_STRIP = re.compile(
     r"^(?:"
     r"what(?:'s| is| are)?|which|how\s+many|"
-    r"do\s+i\s+have(?:\s+any)?|have\s+i\s+got|i\s+have|i've\s+got|"
+    r"do\s+(?:i|we)\s+have(?:\s+any)?|have\s+(?:i|we)\s+got|"
+    r"(?:i|we)\s+have|(?:i|we)'ve\s+got|"
     r"all(?:\s+(?:the|my|of))?|any|some"
     r")\s+",
     re.I,

@@ -839,8 +839,10 @@ class Orchestrator:
                 # <show> episodes do I have", "all the X episodes I have",
                 # "do I have any X episodes", "how many X episodes do I have".
                 r"|\b(?:episodes?|shows?|recordings?|programs?)\b[^?]*"
-                r"\b(?:do\s+i\s+have|have\s+i\s+got|i\s+have|i've\s+got|i\s+got)\b"
-                r"|\bdo\s+i\s+have\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b"
+                r"\b(?:do\s+(?:i|we)\s+have|have\s+(?:i|we)\s+got|"
+                r"(?:i|we)\s+have|(?:i|we)'ve\s+got|(?:i|we)\s+got)\b"
+                r"|\bdo\s+(?:i|we)\s+have\b[^?]*"
+                r"\b(?:episodes?|shows?|recordings?|programs?)\b"
                 r"|\bhow\s+many\b[^?]*\b(?:episodes?|shows?|recordings?|programs?)\b",
                 re.I,
             )
@@ -1503,6 +1505,8 @@ class Orchestrator:
             parts.append(f"episode {f.episode}")
         if getattr(f.watched, "value", "any") == "watched":
             parts.append("(watched)")
+        elif getattr(f.watched, "value", "any") == "unwatched":
+            parts.append("(unwatched)")
         label = (" " + " ".join(parts)) if parts else ""
         dr = f.recorded_between
         if dr and dr.start_utc and dr.end_utc:
@@ -1603,6 +1607,50 @@ class Orchestrator:
                 return int(float(v))
             except Exception:
                 return 0
+
+        if f.title:
+            def _normalized_series_title(value: str) -> str:
+                normalized = re.sub(
+                    r"[^a-z0-9]+", " ", (value or "").lower()
+                ).strip()
+                return re.sub(r"^(?:the|a|an)\s+", "", normalized)
+
+            _requested_title = _normalized_series_title(f.title)
+            _exact_title_matches = [
+                row for row in recs
+                if _normalized_series_title(row.get("title") or "")
+                == _requested_title
+            ]
+            if _exact_title_matches:
+                recs = _exact_title_matches
+
+        def _watched_state(row) -> bool | None:
+            value = row.get("watched")
+            if value is None:
+                value = row.get("is_watched")
+            if value is None:
+                value = row.get("Watched")
+            if value is None:
+                value = row.get("PlayedAt")
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "y", "watched"}:
+                    return True
+                if normalized in {
+                    "false", "0", "no", "n", "unwatched", "",
+                }:
+                    return False
+            return None
+
+        _watched_filter = getattr(f.watched, "value", "any")
+        if _watched_filter == "unwatched":
+            recs = [row for row in recs if _watched_state(row) is not True]
+        elif _watched_filter == "watched":
+            recs = [row for row in recs if _watched_state(row) is True]
 
         recs.sort(key=_rd_key, reverse=True)
         _label = self._describe_filters(f)
