@@ -335,9 +335,13 @@
       button.textContent = 'Copying...';
       try {
         await copyTextToClipboard(
-          `Summarize what happened in this episode based only on the transcript below. ` +
-          `Cover the main plot, key events, important character moments, and how the episode ends. ` +
-          `If the transcript is incomplete or unclear, identify the gap rather than guessing.\n\n` +
+          `Analyze this episode based on the transcript below. Explain the major storylines and how ` +
+          `they develop; the key characters involved; any notable regular characters who appear to ` +
+          `be absent, if that can be determined confidently; important scenes, conflicts, turning ` +
+          `points, reveals, and resolutions; character motivations and relationships; and how each ` +
+          `storyline ends or remains unresolved. Use specific details from the transcript rather than ` +
+          `giving only a short summary. If the transcript is incomplete or unclear, identify the gap ` +
+          `and do not invent details.\n\n` +
           `Transcript:\n${transcript}`
         );
         copilotWindow.opener = null;
