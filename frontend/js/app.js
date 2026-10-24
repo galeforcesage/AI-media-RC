@@ -334,7 +334,12 @@
       button.disabled = true;
       button.textContent = 'Copying...';
       try {
-        await copyTextToClipboard(`What happened for this show transcript\n\n${transcript}`);
+        await copyTextToClipboard(
+          `Summarize what happened in this episode based only on the transcript below. ` +
+          `Cover the main plot, key events, important character moments, and how the episode ends. ` +
+          `If the transcript is incomplete or unclear, identify the gap rather than guessing.\n\n` +
+          `Transcript:\n${transcript}`
+        );
         copilotWindow.opener = null;
         copilotWindow.location.replace('https://copilot.cloud.microsoft/chat');
         button.textContent = 'Copied - paste in Copilot';
