@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Dict, Optional, Set
 
 from .enrichment import MetadataEnrichmentPipeline
 from .extractor import AudioExtractor
@@ -19,6 +19,7 @@ from .models import TranscriptMetadata, TranscriptionJob
 from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .whisper_engine import WhisperEngine
+from .gpu_control import GpuExecutionController
 from . import diarization
 from . import cc_extractor
 
@@ -34,19 +35,24 @@ class TranscriptionWorker:
         store: MetadataStore,
         extractor: AudioExtractor,
         engine: WhisperEngine,
+        gpu: GpuExecutionController,
         concurrency: int = 1,
         poll_interval: float = 10.0,
+        gpu_segment_seconds: float = 30.0,
     ):
         self.queue = queue
         self.store = store
         self.extractor = extractor
         self.engine = engine
+        self.gpu = gpu
         self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
+        self.gpu_segment_seconds = max(5.0, gpu_segment_seconds)
         self._running = False
         self._active_jobs = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._tasks: Set[asyncio.Task] = set()
 
     async def start(self) -> None:
         # Lower our own process priority so DVR playback/recording isn't starved.
@@ -65,20 +71,30 @@ class TranscriptionWorker:
                 job = self.queue.dequeue()
                 if job:
                     await self._semaphore.acquire()
-                    asyncio.create_task(self._process_with_semaphore(job))
+                    task = asyncio.create_task(self._process_with_semaphore(job))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
                 else:
                     await asyncio.sleep(self.poll_interval)
             except Exception:
                 logger.exception("Worker loop error")
                 await asyncio.sleep(self.poll_interval)
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._running = False
+        if self._tasks:
+            for task in self._tasks:
+                task.cancel()
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     async def _process_with_semaphore(self, job: TranscriptionJob) -> None:
         try:
             await self._process(job)
+        except asyncio.CancelledError:
+            self.queue.requeue_incomplete(job.job_id, "Interrupted at durable GPU checkpoint")
+            raise
         finally:
+            await self.gpu.release_idle()
             self._semaphore.release()
 
     async def _process(self, job: TranscriptionJob) -> None:
@@ -199,17 +215,39 @@ class TranscriptionWorker:
                 "Mixed path for %s: %d CC segments + %d gap regions (%.1fs to whisper)",
                 job.recording_id, len(cc_clean), len(gaps), gap_total,
             )
-            stt_segments: list = []
+            checkpoint = self.queue.load_checkpoint(job.job_id)
+            if (
+                checkpoint
+                and checkpoint["mode"] == "mixed"
+                and abs(checkpoint["audio_duration"] - total_duration) <= 1.0
+            ):
+                completed_gap_end = checkpoint["completed_seconds"]
+                stt_segments = list(checkpoint["segments"])
+            else:
+                completed_gap_end = 0.0
+                stt_segments = []
+                if checkpoint:
+                    self.queue.clear_checkpoint(job.job_id)
             mix_start = time.time()
             for gap_start, gap_end in gaps:
+                if gap_end <= completed_gap_end:
+                    continue
                 clip_path = await self.extractor.extract_region(audio_path, gap_start, gap_end)
                 if not clip_path:
                     continue
                 try:
-                    new_segs = await loop.run_in_executor(
-                        None, self.engine.transcribe_clip, clip_path, gap_start
-                    )
-                    stt_segments.extend(new_segs)
+                    async with self.gpu.gpu_segment():
+                        new_segs = await loop.run_in_executor(
+                            None, self.engine.transcribe_clip, clip_path, gap_start
+                        )
+                        stt_segments.extend(new_segs)
+                        self.queue.save_checkpoint(
+                            job.job_id,
+                            gap_end,
+                            total_duration,
+                            stt_segments,
+                            mode="mixed",
+                        )
                 except Exception:
                     logger.exception("Gap-fill transcribe failed [%.2f-%.2f]", gap_start, gap_end)
                 finally:
@@ -231,8 +269,10 @@ class TranscriptionWorker:
             )
         else:
             try:
-                full_text, segments, info = await loop.run_in_executor(
-                    None, self.engine.transcribe, audio_path
+                full_text, segments, info = await self._transcribe_segmented(
+                    job,
+                    audio_path,
+                    loop,
                 )
                 # Tag STT segments with source for downstream consumers
                 for seg in segments:
@@ -307,12 +347,88 @@ class TranscriptionWorker:
                 logger.exception("Enrichment failed for %s (non-blocking)", job.job_id)
 
         self.queue.update_status(job.job_id, "done", duration=info.get("duration", 0))
+        self.queue.clear_checkpoint(job.job_id)
 
         # Step 7: Cleanup
         self.extractor.cleanup(audio_path)
 
         logger.info("Job %s complete: %d words, %.0fs audio",
                      job.job_id, meta.word_count, meta.duration)
+
+    async def _transcribe_segmented(
+        self,
+        job: TranscriptionJob,
+        audio_path: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> tuple:
+        """Transcribe bounded clips and checkpoint each completed clip."""
+        duration = await self.extractor.get_duration(audio_path)
+        if duration <= 0:
+            raise RuntimeError("Unable to determine extracted audio duration")
+
+        checkpoint = self.queue.load_checkpoint(job.job_id)
+        if (
+            checkpoint
+            and checkpoint["mode"] == "stt"
+            and abs(checkpoint["audio_duration"] - duration) <= 1.0
+        ):
+            completed = min(float(checkpoint["completed_seconds"]), duration)
+            segments = list(checkpoint["segments"])
+            logger.info(
+                "Resuming job %s from durable GPU checkpoint %.1fs/%0.1fs",
+                job.job_id,
+                completed,
+                duration,
+            )
+        else:
+            completed = 0.0
+            segments = []
+            if checkpoint:
+                self.queue.clear_checkpoint(job.job_id)
+
+        started = time.time()
+        while completed < duration:
+            clip_end = min(duration, completed + self.gpu_segment_seconds)
+            clip_path = await self.extractor.extract_region(audio_path, completed, clip_end)
+            if not clip_path:
+                raise RuntimeError(
+                    f"Failed to create transcription clip {completed:.1f}-{clip_end:.1f}"
+                )
+            try:
+                async with self.gpu.gpu_segment():
+                    new_segments = await loop.run_in_executor(
+                        None,
+                        self.engine.transcribe_clip,
+                        clip_path,
+                        completed,
+                    )
+                    segments.extend(new_segments)
+                    completed = clip_end
+                    self.queue.save_checkpoint(
+                        job.job_id,
+                        completed,
+                        duration,
+                        segments,
+                        mode="stt",
+                    )
+            finally:
+                self.extractor.cleanup(clip_path)
+
+        full_text = " ".join(
+            str(segment.get("text", "")).strip()
+            for segment in segments
+            if str(segment.get("text", "")).strip()
+        )
+        elapsed = time.time() - started
+        info = {
+            "language": "en",
+            "language_probability": 1.0,
+            "duration": round(duration, 2),
+            "model": self.engine.model_name,
+            "elapsed_seconds": round(elapsed, 1),
+            "realtime_factor": round(elapsed / max(duration, 1), 2),
+        }
+        return full_text, segments, info
 
     @staticmethod
     def _extract_keywords(text: str, top_n: int = 10) -> list:

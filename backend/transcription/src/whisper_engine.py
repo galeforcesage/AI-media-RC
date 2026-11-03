@@ -7,10 +7,11 @@ Outputs timestamped segments.
 """
 
 from __future__ import annotations
+import gc
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,21 @@ class WhisperEngine:
             cpu_threads=self._cpu_threads,
         )
         logger.info("Whisper model loaded in %.1fs", time.time() - start)
+
+    def unload(self) -> None:
+        """Release CTranslate2/CUDA state at a broker safe point."""
+        if self._model is None:
+            return
+        self._model = None
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            logger.debug("CUDA cache cleanup unavailable", exc_info=True)
+        logger.info("Whisper model unloaded")
 
     def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.

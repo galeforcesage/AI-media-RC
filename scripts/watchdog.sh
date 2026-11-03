@@ -57,7 +57,11 @@ SVC_DIR[transcription]="$ROOT/backend/transcription"
 _NCPU=$(nproc 2>/dev/null || echo 4)
 _WHISPER_THREADS=$(( _NCPU / 4 > 0 ? _NCPU / 4 : 1 ))
 _FFMPEG_THREADS=$(( _WHISPER_THREADS / 2 > 0 ? _WHISPER_THREADS / 2 : 1 ))
-SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
+_GPU_BROKER_URL="${TRANSCRIPTION_GPU_BROKER_URL:-http://127.0.0.1:7235}"
+_GPU_APPLICATION_ID="${TRANSCRIPTION_GPU_APPLICATION_ID:-ai-media-rc-transcription}"
+_GPU_PEAK_VRAM_MB="${TRANSCRIPTION_GPU_PEAK_VRAM_MB:-6144}"
+_GPU_CALLBACK_URL="${TRANSCRIPTION_GPU_CALLBACK_URL:-http://127.0.0.1:8770/gpu/reclamation}"
+SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --gpu-broker-url $_GPU_BROKER_URL --gpu-application-id $_GPU_APPLICATION_ID --gpu-peak-vram-mb $_GPU_PEAK_VRAM_MB --gpu-callback-url $_GPU_CALLBACK_URL --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
 SVC_LOG[transcription]="/tmp/transcription.log"
 SVC_PORT[transcription]=8770
 

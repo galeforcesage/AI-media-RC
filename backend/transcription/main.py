@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 
 from src.extractor import AudioExtractor
@@ -27,9 +28,9 @@ from src.store import MetadataStore
 from src.watcher import FileWatcher
 from src.whisper_engine import WhisperEngine
 from src.worker import TranscriptionWorker
+from src.gpu_broker import BrokerConfig, GpuBrokerClient
+from src.gpu_control import GpuExecutionController
 from src.enrichment import MetadataEnrichmentPipeline
-from src.transcript_index import TranscriptIndex
-from src.sidecar import TranscriptSidecar
 from src.discovery import discover_all
 
 
@@ -45,12 +46,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ssd-temp", default="/tmp/transcription")
     p.add_argument("--whisper-model", default="auto")
     p.add_argument("--whisper-device", default="auto")
-    import os
     _quarter = max(1, (os.cpu_count() or 4) // 4)
     _ffmpeg = max(1, _quarter // 2)
     p.add_argument("--whisper-threads", type=int, default=_quarter, help=f"CPU threads for Whisper inference (default: {_quarter}, 25%% of cores)")
     p.add_argument("--ffmpeg-threads", type=int, default=_ffmpeg, help=f"CPU threads for ffmpeg extraction (default: {_ffmpeg})")
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument(
+        "--gpu-broker-url",
+        default=os.environ.get("TRANSCRIPTION_GPU_BROKER_URL", "http://127.0.0.1:7235"),
+    )
+    p.add_argument(
+        "--gpu-application-id",
+        default=os.environ.get("TRANSCRIPTION_GPU_APPLICATION_ID", "ai-media-rc-transcription"),
+    )
+    p.add_argument(
+        "--gpu-peak-vram-mb",
+        type=int,
+        default=int(os.environ.get("TRANSCRIPTION_GPU_PEAK_VRAM_MB", "6144")),
+    )
+    p.add_argument(
+        "--gpu-callback-url",
+        default=os.environ.get("TRANSCRIPTION_GPU_CALLBACK_URL"),
+        help="Broker callback URL (default: http://127.0.0.1:<port>/gpu/reclamation)",
+    )
+    p.add_argument(
+        "--gpu-segment-seconds",
+        type=float,
+        default=float(os.environ.get("TRANSCRIPTION_GPU_SEGMENT_SECONDS", "30")),
+        help="Maximum audio duration per checkpointable Whisper clip",
+    )
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
     p.add_argument("--no-live", action="store_true", help="Disable live/incremental transcription during recording")
@@ -78,12 +102,32 @@ async def run(args: argparse.Namespace) -> None:
     store = MetadataStore(db_path=args.db)
     store.open()
 
-    # MCP server
+    gpu_controller = None
+    worker = None
+    if not args.no_worker:
+        callback_url = args.gpu_callback_url or (
+            f"http://127.0.0.1:{args.port}/gpu/reclamation"
+        )
+        engine = WhisperEngine(
+            model_name=args.whisper_model,
+            device=args.whisper_device,
+            cpu_threads=args.whisper_threads,
+        )
+        broker = GpuBrokerClient(BrokerConfig(
+            base_url=args.gpu_broker_url,
+            application_id=args.gpu_application_id,
+            callback_url=callback_url,
+            peak_vram_mb=args.gpu_peak_vram_mb,
+        ))
+        gpu_controller = GpuExecutionController(broker=broker, engine=engine)
+
+    # MCP + broker callback server
     server = TranscriptionServer(
         config={"mcp_host": args.host, "mcp_port": args.port,
             "index_db": "transcript_index.db", "sidecar_dir": "sidecars"},
         queue=queue,
         store=store,
+        gpu_controller=gpu_controller,
     )
     await server.start()
 
@@ -143,17 +187,14 @@ async def run(args: argparse.Namespace) -> None:
     # Transcription worker
     if not args.no_worker:
         extractor = AudioExtractor(ssd_temp_dir=args.ssd_temp, ffmpeg_threads=args.ffmpeg_threads)
-        engine = WhisperEngine(
-            model_name=args.whisper_model,
-            device=args.whisper_device,
-            cpu_threads=args.whisper_threads,
-        )
         worker = TranscriptionWorker(
             queue=queue,
             store=store,
             extractor=extractor,
             engine=engine,
+            gpu=gpu_controller,
             concurrency=args.concurrency,
+            gpu_segment_seconds=args.gpu_segment_seconds,
         )
         # Wire enrichment pipeline with configurable MCP endpoints
         worker.enrichment = MetadataEnrichmentPipeline(
@@ -162,7 +203,11 @@ async def run(args: argparse.Namespace) -> None:
             sagetv_url=args.sagetv_mcp,
             channels_url=args.channels_mcp,
         )
-        tasks.append(asyncio.create_task(worker.start()))
+        async def run_worker() -> None:
+            await gpu_controller.start()
+            await worker.start()
+
+        tasks.append(asyncio.create_task(run_worker()))
 
     # Wait for shutdown signal
     stop = asyncio.Event()
@@ -176,8 +221,14 @@ async def run(args: argparse.Namespace) -> None:
     await stop.wait()
 
     # Cleanup
+    if gpu_controller:
+        await gpu_controller.shutdown()
+    if worker:
+        await worker.stop()
     for t in tasks:
-        t.cancel()
+        if not t.done():
+            t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     await server.stop()
     queue.close()
     store.close()

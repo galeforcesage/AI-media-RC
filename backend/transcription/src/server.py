@@ -13,7 +13,7 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from .models import TranscriptMetadata
+from .gpu_control import GpuExecutionController, ReclamationError
 from .queue import TranscriptionQueue
 from .store import MetadataStore
 from .search_service import TranscriptSearchService
@@ -26,11 +26,18 @@ logger = logging.getLogger(__name__)
 class TranscriptionServer:
     """TCP JSON-RPC server exposing transcription resources and tools."""
 
-    def __init__(self, config: Dict[str, Any], queue: TranscriptionQueue, store: MetadataStore):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        queue: TranscriptionQueue,
+        store: MetadataStore,
+        gpu_controller: Optional[GpuExecutionController] = None,
+    ):
         self.host = config.get("mcp_host", "127.0.0.1")
         self.port = config.get("mcp_port", 8770)
         self.queue = queue
         self.store = store
+        self.gpu_controller = gpu_controller
         self._server: Optional[asyncio.AbstractServer] = None
 
         # Cross-metadata reasoning layer
@@ -57,10 +64,15 @@ class TranscriptionServer:
         peer = writer.get_extra_info("peername")
         logger.debug("Client connected: %s", peer)
         try:
+            first_line = await reader.readline()
+            if not first_line:
+                return
+            if first_line.startswith((b"POST ", b"GET ")):
+                await self._handle_http(first_line, reader, writer)
+                return
             while True:
-                line = await reader.readline()
-                if not line:
-                    break
+                line = first_line
+                first_line = b""
                 try:
                     request = json.loads(line.decode())
                 except json.JSONDecodeError:
@@ -71,10 +83,17 @@ class TranscriptionServer:
                         }) + "\n").encode()
                     )
                     await writer.drain()
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    first_line = line
                     continue
                 response = await self._dispatch(request)
                 writer.write((json.dumps(response) + "\n").encode())
                 await writer.drain()
+                first_line = await reader.readline()
+                if not first_line:
+                    break
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -82,6 +101,80 @@ class TranscriptionServer:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def _handle_http(
+        self,
+        request_line: bytes,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Multiplex broker callbacks with the existing JSON-lines listener."""
+        try:
+            method, path, _version = request_line.decode().strip().split(" ", 2)
+            headers: Dict[str, str] = {}
+            while True:
+                line = await reader.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                name, value = line.decode().split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+            content_length = int(headers.get("content-length", "0"))
+            body = await reader.readexactly(content_length) if content_length else b""
+
+            if method == "GET" and path == "/health":
+                await self._write_http(writer, 200, {"status": "ok"})
+                return
+            if method != "POST" or path not in {"/gpu/reclamation", "/checkpoint"}:
+                await self._write_http(writer, 404, {"error": "not found"})
+                return
+            if self.gpu_controller is None:
+                await self._write_http(writer, 503, {"error": "GPU worker is disabled"})
+                return
+            try:
+                payload = json.loads(body.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                await self._write_http(writer, 400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(payload, dict):
+                await self._write_http(writer, 400, {"error": "JSON body must be an object"})
+                return
+            try:
+                response = await self.gpu_controller.handle_callback(payload)
+                await self._write_http(writer, 200, response)
+            except ReclamationError as exc:
+                await self._write_http(writer, exc.status, {"error": str(exc)})
+            except Exception:
+                logger.exception("GPU reclamation callback failed")
+                await self._write_http(writer, 500, {"error": "reclamation callback failed"})
+        except Exception:
+            logger.exception("Malformed HTTP request")
+            await self._write_http(writer, 400, {"error": "malformed HTTP request"})
+
+    @staticmethod
+    async def _write_http(
+        writer: asyncio.StreamWriter,
+        status: int,
+        body: Dict[str, Any],
+    ) -> None:
+        reasons = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            409: "Conflict",
+            500: "Internal Server Error",
+            503: "Service Unavailable",
+        }
+        encoded = json.dumps(body).encode()
+        writer.write(
+            (
+                f"HTTP/1.1 {status} {reasons.get(status, 'Error')}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(encoded)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode()
+            + encoded
+        )
+        await writer.drain()
 
     async def _dispatch(self, request: Dict) -> Dict:
         req_id = request.get("id")

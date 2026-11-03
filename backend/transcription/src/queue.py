@@ -45,6 +45,26 @@ class TranscriptionQueue:
                 duration REAL DEFAULT 0
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_checkpoints (
+                job_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL DEFAULT 'stt',
+                completed_seconds REAL NOT NULL DEFAULT 0,
+                audio_duration REAL NOT NULL DEFAULT 0,
+                segments_json TEXT NOT NULL DEFAULT '[]',
+                updated_at REAL NOT NULL
+            )
+        """)
+        checkpoint_columns = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(job_checkpoints)"
+            ).fetchall()
+        }
+        if "mode" not in checkpoint_columns:
+            self._conn.execute(
+                "ALTER TABLE job_checkpoints ADD COLUMN mode TEXT NOT NULL DEFAULT 'stt'"
+            )
         self._conn.commit()
         logger.info("Transcription queue opened: %s", self.db_path)
 
@@ -122,6 +142,68 @@ class TranscriptionQueue:
             return False
         self.update_status(job_id, "pending", error=error)
         return True
+
+    def save_checkpoint(
+        self,
+        job_id: str,
+        completed_seconds: float,
+        audio_duration: float,
+        segments: List[Dict],
+        mode: str = "stt",
+    ) -> None:
+        """Durably record completed Whisper clips for duplicate-free resume."""
+        self._conn.execute(
+            """INSERT INTO job_checkpoints
+               (job_id, mode, completed_seconds, audio_duration, segments_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(job_id) DO UPDATE SET
+                 mode=excluded.mode,
+                 completed_seconds=excluded.completed_seconds,
+                 audio_duration=excluded.audio_duration,
+                 segments_json=excluded.segments_json,
+                 updated_at=excluded.updated_at""",
+            (
+                job_id,
+                mode,
+                completed_seconds,
+                audio_duration,
+                json.dumps(segments),
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+
+    def load_checkpoint(self, job_id: str) -> Optional[Dict]:
+        row = self._conn.execute(
+            "SELECT * FROM job_checkpoints WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            segments = json.loads(row["segments_json"])
+        except (TypeError, json.JSONDecodeError):
+            logger.error("Discarding corrupt transcription checkpoint for %s", job_id)
+            self.clear_checkpoint(job_id)
+            return None
+        return {
+            "mode": row["mode"],
+            "completed_seconds": float(row["completed_seconds"]),
+            "audio_duration": float(row["audio_duration"]),
+            "segments": segments,
+        }
+
+    def clear_checkpoint(self, job_id: str) -> None:
+        self._conn.execute("DELETE FROM job_checkpoints WHERE job_id = ?", (job_id,))
+        self._conn.commit()
+
+    def requeue_incomplete(self, job_id: str, reason: str) -> None:
+        """Return interrupted work to pending without consuming another attempt."""
+        self._conn.execute(
+            "UPDATE jobs SET status = 'pending', error = ?, updated_at = ? WHERE job_id = ?",
+            (reason, time.time(), job_id),
+        )
+        self._conn.commit()
 
     def get_job(self, job_id: str) -> Optional[TranscriptionJob]:
         row = self._conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()

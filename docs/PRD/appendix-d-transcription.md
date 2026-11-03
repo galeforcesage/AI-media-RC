@@ -1,5 +1,5 @@
 =========================================
-Appendix D — Transcription Subsystem Specification
+Appendix D ï¿½ Transcription Subsystem Specification
 =========================================
 This appendix defines the complete, standalone transcription subsystem used by both SageTV and ChannelsDVR.
 It is designed for:
@@ -26,7 +26,7 @@ This enables:
 * Scene detection
 * Quote search
 * Topic extraction
-* Voicedriven “find the episode where…” queries
+* Voicedriven ï¿½find the episode whereï¿½ï¿½ queries
 
 D.2 Architecture Overview
 [Recording Created]
@@ -172,7 +172,7 @@ The subsystem:
 LLM Remote can:
 * Search recordings
 * Summarize episodes
-* Provide “find the scene where…” queries
+* Provide ï¿½find the scene whereï¿½ï¿½ queries
 
 D.6 Performance Requirements
 * Must not interfere with recording
@@ -209,3 +209,40 @@ D.9 Security Model
 * Metadata stored locally
 * MCP resources readonly
 
+D.10 GPU Resource Broker and LIVE Precedence
+
+The transcription worker is a local managed-GPU client. It registers with the
+GPU Resource Broker before processing GPU work using:
+
+* Service class: `BATCH`
+* Durability: `CHECKPOINTABLE`
+* Active GPU mode transition: `CHECKPOINTED`
+* Placement: local `MANAGED_GPU`
+* Default broker URL: `http://127.0.0.1:7235`
+* Default callback URL: `http://127.0.0.1:8770/gpu/reclamation`
+
+The application identity and peak VRAM estimate are configurable with
+`--gpu-application-id` / `TRANSCRIPTION_GPU_APPLICATION_ID` and
+`--gpu-peak-vram-mb` / `TRANSCRIPTION_GPU_PEAK_VRAM_MB`.
+
+The worker must hold a generation-fenced broker lease before loading Whisper or
+starting every GPU clip. Long recordings are split into bounded clips (30
+seconds by default), and completed clips are stored in the transcription
+database as durable checkpoints. Broker outages retry with capped exponential
+backoff. Lease loss unloads Whisper at the next clip boundary and blocks further
+GPU work until a new lease is granted.
+
+The existing port 8770 listener accepts MCP JSON-lines traffic and HTTP broker
+callbacks. It remains bound to `127.0.0.1` by default. The callback supports:
+
+* Legacy one-shot checkpoint requests with `action`, `idempotency_key`, and
+  `deadline_ms`.
+* Two-phase `PREPARE` and `COMMIT` reclamation requests keyed by
+  `reclamation_id`.
+
+`PREPARE` prevents another GPU clip from starting. `COMMIT` waits for the active
+bounded clip, preserves its checkpoint, unloads Whisper/CUDA state, releases the
+lease, samples GPU utilization, and returns `COMMITTED`. Duplicate callback
+phases return the original response. Queue processing resumes only after a new
+lease is acquired. SIGTERM follows the same safe-point, unload, and release
+sequence.
