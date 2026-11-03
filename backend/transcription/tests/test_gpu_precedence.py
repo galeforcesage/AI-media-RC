@@ -222,6 +222,7 @@ class RetryBroker(GpuBrokerClient):
         ))
         self.failures = failures
         self.requests = []
+        self.renew_generation = 3
 
     async def _request(self, method, path, payload, headers=None):
         self.requests.append((method, path, payload, headers))
@@ -232,10 +233,28 @@ class RetryBroker(GpuBrokerClient):
                 self.failures -= 1
                 raise BrokerError("temporary outage")
             return {
-                "lease_id": "lease-retry",
-                "lease_generation": 3,
+                "grant": {
+                    "provider_id": "local",
+                    "gpu_device_id": "0",
+                    "mode": "MANAGED_GPU",
+                    "lease_id": "lease-retry",
+                    "lease_generation": 3,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "execution_endpoint": None,
+                    "keep_alive": 30,
+                }
+            }
+        if path.endswith("/renew"):
+            self.renew_generation += 1
+            return {
+                "id": "lease-retry",
+                "request_id": "request-1",
                 "gpu_device_id": "0",
-                "ttl_seconds": 60,
+                "mode_name": "MANAGED_GPU",
+                "state": "ACTIVE",
+                "generation": self.renew_generation,
+                "reserved_mb": 4096,
+                "expires_at": "2099-01-01T00:00:00Z",
             }
         return {}
 
@@ -255,6 +274,27 @@ class BrokerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("CHECKPOINTABLE", registration["durability"])
         self.assertEqual("CHECKPOINTED", registration["active_gpu_mode_transition"])
         self.assertEqual("MANAGED_GPU", registration["resource_type"])
+        renewed = await broker._renew_lease(lease)
+        renew_call = [call for call in broker.requests if call[1].endswith("/renew")][-1]
+        self.assertEqual("POST", renew_call[0])
+        self.assertEqual(
+            "/v1/leases/lease-retry/renew",
+            renew_call[1],
+        )
+        self.assertEqual({"generation": 3}, renew_call[2])
+        self.assertEqual(4, renewed.generation)
+
+        broker.lease = renewed
+        await broker.release()
+        release_call = [
+            call for call in broker.requests if call[1].endswith("/release")
+        ][-1]
+        self.assertEqual("POST", release_call[0])
+        self.assertEqual(
+            "/v1/leases/lease-retry/release",
+            release_call[1],
+        )
+        self.assertEqual({"generation": 4}, release_call[2])
         await broker.close()
 
 

@@ -246,3 +246,8 @@ lease, samples GPU utilization, and returns `COMMITTED`. Duplicate callback
 phases return the original response. Queue processing resumes only after a new
 lease is acquired. SIGTERM follows the same safe-point, unload, and release
 sequence.
+
+The deployed lease lifecycle uses `POST /v1/leases/{lease_id}/renew` and
+`POST /v1/leases/{lease_id}/release`, each with a JSON body containing the
+current `generation`. Initial grants are read from the broker's `grant` object;
+renewal responses use the lease lifecycle schema and may advance `generation`.

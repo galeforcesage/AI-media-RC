@@ -7,6 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -145,14 +146,9 @@ class GpuBrokerClient:
             return
         try:
             await self._request(
-                "DELETE",
-                f"/v1/leases/{lease.lease_id}",
-                {
-                    "application_id": self.config.application_id,
-                    "lease_id": lease.lease_id,
-                    "lease_generation": lease.generation,
-                },
-                headers=self._lease_headers(lease),
+                "POST",
+                f"/v1/leases/{lease.lease_id}/release",
+                {"generation": lease.generation},
             )
             logger.info(
                 "GPU lease released: id=%s generation=%d",
@@ -221,17 +217,7 @@ class GpuBrokerClient:
                 if self.lease is not lease:
                     return
                 try:
-                    data = await self._request(
-                        "POST",
-                        f"/v1/leases/{lease.lease_id}/renew",
-                        {
-                            "application_id": self.config.application_id,
-                            "lease_id": lease.lease_id,
-                            "lease_generation": lease.generation,
-                        },
-                        headers=self._lease_headers(lease),
-                    )
-                    renewed = self._parse_lease(data, default_lease=lease)
+                    renewed = await self._renew_lease(lease)
                     if renewed.lease_id != lease.lease_id:
                         raise LeaseLostError("broker changed lease id during renewal")
                     if renewed.generation < lease.generation:
@@ -251,6 +237,14 @@ class GpuBrokerClient:
                     logger.warning("GPU lease renewal failed before expiry: %s", exc)
         except asyncio.CancelledError:
             pass
+
+    async def _renew_lease(self, lease: GpuLease) -> GpuLease:
+        data = await self._request(
+            "POST",
+            f"/v1/leases/{lease.lease_id}/renew",
+            {"generation": lease.generation},
+        )
+        return self._parse_lease(data, default_lease=lease)
 
     async def _cancel_renewal(self) -> None:
         task = self._renew_task
@@ -287,18 +281,11 @@ class GpuBrokerClient:
             return data
 
     @staticmethod
-    def _lease_headers(lease: GpuLease) -> Dict[str, str]:
-        return {
-            "X-GPU-Lease-ID": lease.lease_id,
-            "X-GPU-Lease-Generation": str(lease.generation),
-        }
-
-    @staticmethod
     def _parse_lease(
         data: Dict[str, Any],
         default_lease: Optional[GpuLease] = None,
     ) -> GpuLease:
-        body = data.get("lease", data)
+        body = data.get("grant", data.get("lease", data))
         if not isinstance(body, dict):
             raise BrokerError("broker lease response is not an object")
 
@@ -316,8 +303,15 @@ class GpuBrokerClient:
                 "broker lease response requires lease_id, lease_generation, and gpu_device_id"
             )
 
-        ttl = body.get("ttl_seconds", body.get("lease_ttl_seconds", 30.0))
-        renew = body.get("renew_after_seconds", body.get("renewal_interval_seconds"))
+        ttl = GpuBrokerClient._seconds_until_expiry(body.get("expires_at"))
+        if ttl is None:
+            ttl = body.get("ttl_seconds", body.get("lease_ttl_seconds", 30.0))
+        renew = body.get(
+            "renew_after_seconds",
+            body.get("renewal_interval_seconds", body.get("keep_alive")),
+        )
+        if isinstance(renew, bool):
+            renew = None
         try:
             ttl_seconds = max(1.0, float(ttl))
             renew_seconds = max(0.1, float(renew if renew is not None else ttl_seconds / 2))
@@ -331,3 +325,18 @@ class GpuBrokerClient:
             expires_at_monotonic=time.monotonic() + ttl_seconds,
             renewal_interval_seconds=min(renew_seconds, ttl_seconds * 0.8),
         )
+
+    @staticmethod
+    def _seconds_until_expiry(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (int, float)):
+                epoch = float(value)
+                if epoch > 10_000_000_000:
+                    epoch /= 1000
+                return max(1.0, epoch - time.time())
+            text = str(value).strip().replace("Z", "+00:00")
+            return max(1.0, datetime.fromisoformat(text).timestamp() - time.time())
+        except (TypeError, ValueError):
+            raise BrokerError("broker returned invalid expires_at")
