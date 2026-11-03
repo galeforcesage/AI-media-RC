@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 
 from src.extractor import AudioExtractor
+from src.gpu_broker import GpuBroker
 from src.queue import TranscriptionQueue
 from src.server import TranscriptionServer
 from src.store import MetadataStore
@@ -31,6 +33,8 @@ from src.enrichment import MetadataEnrichmentPipeline
 from src.transcript_index import TranscriptIndex
 from src.sidecar import TranscriptSidecar
 from src.discovery import discover_all
+from src.progressive import LiveTranscriptMonitor
+from src import diarization
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +55,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--whisper-threads", type=int, default=_quarter, help=f"CPU threads for Whisper inference (default: {_quarter}, 25%% of cores)")
     p.add_argument("--ffmpeg-threads", type=int, default=_ffmpeg, help=f"CPU threads for ffmpeg extraction (default: {_ffmpeg})")
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--gpu-broker", action="store_true",
+                   default=os.environ.get("GPU_BROKER_ENABLED", "").lower()
+                   in {"1", "true", "yes", "on"})
+    p.add_argument("--gpu-broker-url",
+                   default=os.environ.get("GPU_BROKER_URL", "http://127.0.0.1:7235"))
+    p.add_argument("--gpu-broker-provider",
+                   default=os.environ.get("GPU_BROKER_PROVIDER", "sagetv-cl-ollama"))
     p.add_argument("--no-watchers", action="store_true", help="Disable file watchers")
     p.add_argument("--no-worker", action="store_true", help="Disable transcription worker (server-only mode)")
     p.add_argument("--no-live", action="store_true", help="Disable live/incremental transcription during recording")
@@ -88,6 +99,7 @@ async def run(args: argparse.Namespace) -> None:
     await server.start()
 
     tasks = []
+    live_monitor = LiveTranscriptMonitor(store=store, index=server.index)
 
     # File watchers — auto-discover directories if not explicitly specified
     if not args.no_watchers:
@@ -124,6 +136,7 @@ async def run(args: argparse.Namespace) -> None:
             name = f"sagetv-{i}" if len(sagetv_dirs) > 1 else "sagetv"
             watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live,
                                   on_file_deleted=on_file_deleted)
+            live_monitor.register(watcher)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching SageTV dir: %s", d)
 
@@ -131,6 +144,7 @@ async def run(args: argparse.Namespace) -> None:
             name = f"channels-{i}" if len(channels_dirs) > 1 else "channels"
             watcher = FileWatcher(name, d, "channelsdvr", queue, enable_live=not args.no_live,
                                   on_file_deleted=on_file_deleted)
+            live_monitor.register(watcher)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching Channels DVR dir: %s", d)
 
@@ -139,8 +153,12 @@ async def run(args: argparse.Namespace) -> None:
                 "No recording directories found. Use --sagetv-dir / --channels-dir "
                 "or ensure MCP servers are reachable for auto-discovery."
             )
+        elif not args.no_live:
+            tasks.append(asyncio.create_task(live_monitor.start()))
 
     # Transcription worker
+    worker = None
+    gpu_broker = None
     if not args.no_worker:
         extractor = AudioExtractor(ssd_temp_dir=args.ssd_temp, ffmpeg_threads=args.ffmpeg_threads)
         engine = WhisperEngine(
@@ -148,11 +166,21 @@ async def run(args: argparse.Namespace) -> None:
             device=args.whisper_device,
             cpu_threads=args.whisper_threads,
         )
+        if args.gpu_broker:
+            gpu_broker = GpuBroker(
+                engine.request_interrupt,
+                lambda: engine.running or diarization.is_running(),
+                lambda: (engine.unload(), diarization.unload()),
+                url=args.gpu_broker_url,
+                provider_id=args.gpu_broker_provider,
+            )
+            await gpu_broker.startup()
         worker = TranscriptionWorker(
             queue=queue,
             store=store,
             extractor=extractor,
             engine=engine,
+            gpu_broker=gpu_broker,
             concurrency=args.concurrency,
         )
         # Wire enrichment pipeline with configurable MCP endpoints
@@ -176,6 +204,11 @@ async def run(args: argparse.Namespace) -> None:
     await stop.wait()
 
     # Cleanup
+    if worker:
+        worker.stop()
+    if gpu_broker:
+        engine.request_interrupt()
+        await gpu_broker.shutdown()
     for t in tasks:
         t.cancel()
     await server.stop()

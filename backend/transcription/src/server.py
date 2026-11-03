@@ -229,6 +229,32 @@ class TranscriptionServer:
                 },
             },
         },
+        {
+            "name": "transcript_health",
+            "description": "Get transcription pipeline health: queue stats, stale jobs, dead letter count, worker status.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "transcript_dead_letter",
+            "description": "List dead-lettered transcription jobs that exhausted retries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max results (default 50)"},
+                },
+            },
+        },
+        {
+            "name": "transcript_retry_dead_letter",
+            "description": "Retry a dead-lettered job by resetting it to pending.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Job ID to retry"},
+                },
+                "required": ["job_id"],
+            },
+        },
     ]
 
     async def _tools_list(self, p):
@@ -246,6 +272,7 @@ class TranscriptionServer:
                 "episode": r.episode,
                 "word_count": r.word_count,
                 "snippet": r.transcript[:200],
+                "transcript_state": r.transcript_state,
             }) for r in results]
             return self._tool_ok({"results": data, "count": len(data)})
 
@@ -328,6 +355,7 @@ class TranscriptionServer:
                 "episode": r.episode,
                 "word_count": r.word_count,
                 "created_at": r.created_at,
+                "transcript_state": r.transcript_state,
             }) for r in recent]
             stats = self.store.stats()
             return self._tool_ok({"total": stats["total_transcripts"],
@@ -337,6 +365,32 @@ class TranscriptionServer:
             directory = args.get("directory", str(self.sidecar.output_dir))
             count = self.sidecar.reindex_all(directory, self.index)
             return self._tool_ok({"reindexed": count, "directory": directory})
+
+        elif name == "transcript_health":
+            stats = self.queue.stats()
+            stale = self.queue.find_stale_jobs()
+            dlq_count = self.queue.dead_letter_count()
+            return self._tool_ok({
+                "queue_stats": stats,
+                "stale_jobs": len(stale),
+                "stale_details": stale[:10],
+                "dead_letter_count": dlq_count,
+                "status": "healthy" if not stale else "degraded",
+            })
+
+        elif name == "transcript_dead_letter":
+            limit = args.get("limit", 50)
+            jobs = self.queue.list_dead_letter(limit)
+            return self._tool_ok({"jobs": jobs, "count": len(jobs)})
+
+        elif name == "transcript_retry_dead_letter":
+            job_id = args.get("job_id", "")
+            if not job_id:
+                return self._tool_err("job_id is required")
+            success = self.queue.retry_dead_letter(job_id)
+            if success:
+                return self._tool_ok({"retried": job_id, "new_status": "pending"})
+            return self._tool_err(f"Job {job_id} not found in dead letter queue")
 
         return self._tool_err(f"Unknown tool: {name}")
 
@@ -359,7 +413,8 @@ class TranscriptionServer:
         if uri == "transcript://recent":
             metas = self.store.list_recent(20)
             data = [{"recording_id": m.recording_id, "title": m.title,
-                      "word_count": m.word_count, "duration": m.duration} for m in metas]
+                      "word_count": m.word_count, "duration": m.duration,
+                      "transcript_state": m.transcript_state} for m in metas]
             return self._res(uri, data)
 
         elif uri == "transcript://stats":
@@ -373,7 +428,8 @@ class TranscriptionServer:
             query = uri.split("transcript://search/", 1)[1]
             results = self.store.search(query)
             data = [{"recording_id": r.recording_id, "title": r.title,
-                      "snippet": r.transcript[:200]} for r in results]
+                      "snippet": r.transcript[:200],
+                      "transcript_state": r.transcript_state} for r in results]
             return self._res(uri, data)
 
         elif uri.startswith("transcript://") and "/" in uri.replace("transcript://", "", 1):

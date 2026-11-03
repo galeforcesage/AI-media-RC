@@ -9,11 +9,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import hashlib
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from utils.tracing import start_trace, end_trace
+from utils.metrics import http_requests_total, http_request_duration, http_errors_total
+from services.a2ui_validator import validate_surface, SurfaceValidationError
+from services.ui_surface import confirmation_surface
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,12 @@ class PlaybackRequest(BaseModel):
     payload: Optional[Dict[str, Any]] = None
 
 
+class UIActionRequest(BaseModel):
+    """Opaque action submitted from a trusted dynamic surface."""
+    action_id: str
+    action: str
+
+
 class MetadataRequest(BaseModel):
     """Request body for /metadata."""
     target: str = "sagetv"
@@ -73,18 +86,106 @@ class SystemRequest(BaseModel):
 # Centralized error wrapper
 # ------------------------------------------------------------------
 
-async def _safe_execute(coro):
-    """Await a coroutine and convert errors to HTTPException."""
+async def _safe_execute(coro, operation: str = "request"):
+    """Await a coroutine and convert errors to HTTPException. Traces the execution."""
+    root_span = start_trace(f"http.{operation}", {"http.operation": operation})
+    start = time.time()
     try:
         result = await coro
         if isinstance(result, dict) and "error" in result:
+            root_span.set_error(result["error"])
+            http_errors_total.inc(labels={"operation": operation})
+            end_trace(root_span)
             raise HTTPException(status_code=422, detail=result["error"])
+        http_requests_total.inc(labels={"operation": operation})
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         return result
     except HTTPException:
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         raise
     except Exception as exc:
         logger.exception("Unhandled transport error")
+        root_span.set_error(str(exc))
+        http_errors_total.inc(labels={"operation": operation})
+        http_request_duration.observe(time.time() - start)
+        end_trace(root_span)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _ui_owner_key(request: Request) -> str:
+    """Bind pending actions to the authenticated app session when available."""
+    session_token = request.cookies.get("app_session", "")
+    if session_token:
+        return hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+    forwarded = request.headers.get("x-forwarded-for", "")
+    host = forwarded.split(",", 1)[0].strip()
+    if not host and request.client:
+        host = request.client.host
+    return f"anonymous:{host or 'unknown'}"
+
+
+def _prepare_ui_result(
+    result: Dict[str, Any],
+    request: Request,
+    systems: list[str] | None,
+) -> Dict[str, Any]:
+    """Replace raw privileged operations with opaque actions and validate surfaces."""
+    orch = _require_orchestrator()
+    ui_config = orch.config.get("ui", {})
+    max_components = int(ui_config.get("max_components_per_surface", 100))
+
+    if result.get("status") == "confirmation_required":
+        raw = result.pop("confirmation", None) or {}
+        tool = raw.get("tool")
+        args = raw.get("args")
+        if not isinstance(tool, str) or not isinstance(args, dict):
+            return {
+                "error": "Invalid confirmation request",
+                "status": "error",
+            }
+        pending = orch.pending_actions.create(
+            owner_key=_ui_owner_key(request),
+            tool=tool,
+            args=args,
+            systems=systems,
+        )
+        result["confirmation"] = {
+            "pending_action_id": pending.action_id,
+            "expires_at": pending.expires_at,
+        }
+        if ui_config.get("enabled", False):
+            result.setdefault("ui_messages", []).append(
+                confirmation_surface(
+                    pending_action_id=pending.action_id,
+                    message=result.get("response", "Confirmation required"),
+                    expires_at=pending.expires_at,
+                )
+            )
+
+    episode_meta = result.get("episode_meta")
+    if isinstance(episode_meta, list) and episode_meta:
+        result["ui_messages"] = [
+            message
+            for message in result.get("ui_messages", [])
+            if not any(
+                component.get("component") == "RecordingList"
+                for component in message.get("components", [])
+            )
+        ]
+
+    validated = []
+    for message in result.get("ui_messages", []):
+        try:
+            validated.append(validate_surface(message, max_components))
+        except SurfaceValidationError as exc:
+            logger.warning("Dropping invalid UI surface: %s", exc)
+    if validated:
+        result["ui_messages"] = validated
+    else:
+        result.pop("ui_messages", None)
+    return result
 
 
 # ------------------------------------------------------------------
@@ -92,19 +193,30 @@ async def _safe_execute(coro):
 # ------------------------------------------------------------------
 
 @router.post("/query")
-async def query(request: QueryRequest):
+async def query(query_request: QueryRequest, request: Request):
     """
     Run a text or voice query through the LLM pipeline.
     Returns the LLM response and optionally a TTS audio path.
     """
     orch = _require_orchestrator()
+
+    async def execute_query():
+        result = await orch.run_query(
+            query_request.prompt,
+            synthesize=query_request.synthesize,
+            metadata=query_request.metadata,
+            systems=query_request.systems,
+        )
+        return _prepare_ui_result(result, request, query_request.systems)
+
     return await _safe_execute(
-        orch.run_query(request.prompt, synthesize=request.synthesize, metadata=request.metadata, systems=request.systems)
+        execute_query(),
+        operation="query",
     )
 
 
 @router.post("/query/stream")
-async def query_stream(request: QueryRequest):
+async def query_stream(query_request: QueryRequest, request: Request):
     """
     SSE streaming variant of /query.
     Emits status events as the agent works, token events as the LLM
@@ -124,13 +236,18 @@ async def query_stream(request: QueryRequest):
         result = {"error": "Cancelled"}
         try:
             result = await orch.run_query(
-                request.prompt,
-                synthesize=request.synthesize,
-                metadata=request.metadata,
-                systems=request.systems,
+                query_request.prompt,
+                synthesize=query_request.synthesize,
+                metadata=query_request.metadata,
+                systems=query_request.systems,
                 status_callback=status_callback,
                 token_callback=token_callback,
             )
+            result = _prepare_ui_result(
+                result, request, query_request.systems
+            )
+            for message in result.get("ui_messages", []):
+                await event_queue.put({"type": "ui", "message": message})
         except asyncio.CancelledError:
             logger.info("Query cancelled by client disconnect")
         except Exception as exc:
@@ -155,6 +272,35 @@ async def query_stream(request: QueryRequest):
                 task.cancel()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/ui/action")
+async def ui_action(action_request: UIActionRequest, request: Request):
+    """Confirm or cancel one opaque, single-use pending action."""
+    orch = _require_orchestrator()
+    owner_key = _ui_owner_key(request)
+    if action_request.action == "cancel":
+        if not orch.pending_actions.cancel(action_request.action_id, owner_key):
+            raise HTTPException(status_code=404, detail="Pending action not found or expired")
+        return {"status": "cancelled", "response": "Action cancelled."}
+    if action_request.action != "confirm":
+        raise HTTPException(status_code=400, detail="Unsupported UI action")
+
+    pending = orch.pending_actions.consume(action_request.action_id, owner_key)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="Pending action not found or expired")
+    result = await orch.agent.execute_confirmed_tool(
+        pending.tool,
+        pending.args,
+        systems=pending.systems,
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=422, detail=result["error"])
+    return {
+        "status": "ok",
+        "response": result.get("message") or f"{pending.tool} completed.",
+        "result": result,
+    }
 
 
 @router.post("/query/voice")
@@ -627,5 +773,3 @@ async def alerts_clear():
         return {"success": False, "error": "unexpected response"}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-

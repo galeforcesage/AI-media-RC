@@ -1,0 +1,19 @@
+{
+  "catalog_id": "urn:llm-remote:a2ui:catalog:v1",
+  "protocol": "a2ui-v0.9.1",
+  "components": {
+    "RecordingList": {
+      "description": "Read-only recording results compiled from DVR tool data.",
+      "required_props": ["items", "count"]
+    },
+    "ConfirmationCard": {
+      "description": "Opaque single-use confirmation for a server-held action.",
+      "required_props": ["message", "operation", "expires_at"],
+      "actions": ["confirm", "cancel"]
+    },
+    "ErrorNotice": {
+      "description": "Structured error with safe text only.",
+      "required_props": ["message"]
+    }
+  }
+}
