@@ -10,10 +10,15 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+class TranscriptionPreempted(RuntimeError):
+    """Raised when broker reclamation reaches a Whisper segment boundary."""
 
 
 def _get_available_ram_gb() -> float:
@@ -80,6 +85,8 @@ class WhisperEngine:
         self._compute_type = compute_type
         self._cpu_threads = cpu_threads
         self._model = None
+        self._interrupt = threading.Event()
+        self._running = threading.Event()
 
     @property
     def model_name(self) -> str:
@@ -114,6 +121,22 @@ class WhisperEngine:
         )
         logger.info("Whisper model loaded in %.1fs", time.time() - start)
 
+    def unload(self) -> None:
+        self._model = None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("CUDA cache release failed", exc_info=True)
+
+    def request_interrupt(self) -> None:
+        self._interrupt.set()
+
+    @property
+    def running(self) -> bool:
+        return self._running.is_set()
+
     def transcribe(self, audio_path: str, language: str = "en") -> Tuple[str, List[Dict], Dict]:
         """Transcribe an audio file.
 
@@ -128,34 +151,43 @@ class WhisperEngine:
         logger.info("Transcribing: %s", audio_path)
         start = time.time()
 
-        segments_iter, info = self._model.transcribe(
-            audio_path,
-            language=language,
-            beam_size=5,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-        )
+        self._interrupt.clear()
+        self._running.set()
+        try:
+            segments_iter, info = self._model.transcribe(
+                audio_path,
+                language=language,
+                beam_size=5,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+            )
 
-        full_text_parts = []
-        segments = []
-        for seg in segments_iter:
-            full_text_parts.append(seg.text.strip())
-            segments.append({
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "text": seg.text.strip(),
-                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
-                "words": [
-                    {
-                        "start": round(word.start, 2),
-                        "end": round(word.end, 2),
-                        "word": word.word.strip(),
-                        "confidence": round(float(word.probability), 3),
-                    }
-                    for word in (seg.words or [])
-                ],
-            })
+            full_text_parts = []
+            segments = []
+            for seg in segments_iter:
+                if self._interrupt.is_set():
+                    raise TranscriptionPreempted(
+                        "GPU lease reclaimed at a Whisper segment boundary"
+                    )
+                full_text_parts.append(seg.text.strip())
+                segments.append({
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "text": seg.text.strip(),
+                    "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                    "words": [
+                        {
+                            "start": round(word.start, 2),
+                            "end": round(word.end, 2),
+                            "word": word.word.strip(),
+                            "confidence": round(float(word.probability), 3),
+                        }
+                        for word in (seg.words or [])
+                    ],
+                })
+        finally:
+            self._running.clear()
 
         elapsed = time.time() - start
         full_text = " ".join(full_text_parts)
@@ -183,6 +215,8 @@ class WhisperEngine:
             self.load()
         if not os.path.exists(audio_path):
             return []
+        self._interrupt.clear()
+        self._running.set()
         try:
             segments_iter, _info = self._model.transcribe(
                 audio_path,
@@ -192,30 +226,38 @@ class WhisperEngine:
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
             )
+            out: List[Dict] = []
+            for seg in segments_iter:
+                if self._interrupt.is_set():
+                    raise TranscriptionPreempted(
+                        "GPU lease reclaimed at a Whisper segment boundary"
+                    )
+                text = seg.text.strip()
+                if not text:
+                    continue
+                out.append({
+                    "start": round(seg.start + time_offset, 2),
+                    "end": round(seg.end + time_offset, 2),
+                    "text": text,
+                    "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
+                    "words": [
+                        {
+                            "start": round(word.start + time_offset, 2),
+                            "end": round(word.end + time_offset, 2),
+                            "word": word.word.strip(),
+                            "confidence": round(float(word.probability), 3),
+                        }
+                        for word in (seg.words or [])
+                    ],
+                })
+            return out
+        except TranscriptionPreempted:
+            raise
         except Exception:
             logger.exception("Gap-fill transcribe failed for %s", audio_path)
             return []
-        out: List[Dict] = []
-        for seg in segments_iter:
-            text = seg.text.strip()
-            if not text:
-                continue
-            out.append({
-                "start": round(seg.start + time_offset, 2),
-                "end": round(seg.end + time_offset, 2),
-                "text": text,
-                "confidence": round(max(0.0, min(1.0, math.exp(seg.avg_logprob))), 3),
-                "words": [
-                    {
-                        "start": round(word.start + time_offset, 2),
-                        "end": round(word.end + time_offset, 2),
-                        "word": word.word.strip(),
-                        "confidence": round(float(word.probability), 3),
-                    }
-                    for word in (seg.words or [])
-                ],
-            })
-        return out
+        finally:
+            self._running.clear()
 
     def segments_to_vtt(self, segments: List[Dict]) -> str:
         """Convert segments to WebVTT subtitle format with optional speaker labels."""

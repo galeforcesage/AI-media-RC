@@ -19,7 +19,8 @@ from .models import TranscriptionJob
 from .progressive import caption_snapshot_is_usable
 from .queue import TranscriptionQueue
 from .store import MetadataStore
-from .whisper_engine import WhisperEngine
+from .gpu_broker import GpuBroker, GpuBrokerUnavailable
+from .whisper_engine import WhisperEngine, TranscriptionPreempted
 from . import diarization
 from . import cc_extractor
 
@@ -35,6 +36,7 @@ class TranscriptionWorker:
         store: MetadataStore,
         extractor: AudioExtractor,
         engine: WhisperEngine,
+        gpu_broker: Optional[GpuBroker] = None,
         concurrency: int = 1,
         poll_interval: float = 10.0,
     ):
@@ -42,6 +44,7 @@ class TranscriptionWorker:
         self.store = store
         self.extractor = extractor
         self.engine = engine
+        self.gpu_broker = gpu_broker
         self.enrichment: Optional[MetadataEnrichmentPipeline] = None
         self.concurrency = concurrency
         self.poll_interval = poll_interval
@@ -204,6 +207,20 @@ class TranscriptionWorker:
                     transcription_mode = "stt"
 
         # Step 2: Transcribe according to chosen mode
+        gpu_lease = False
+        if self.gpu_broker and (
+            transcription_mode != "cc"
+            or (diarization.is_available() and not (is_incremental and not is_final))
+        ):
+            try:
+                await self.gpu_broker.acquire(job.job_id)
+                gpu_lease = True
+            except GpuBrokerUnavailable as exc:
+                logger.warning("GPU broker unavailable for %s: %s", job.job_id, exc)
+                self.queue.mark_for_retry(job.job_id, f"GPU broker: {exc}")
+                self.extractor.cleanup(audio_path)
+                return
+
         if transcription_mode == "cc":
             # Use CC segments verbatim, strip any speaker prefixes for clean text.
             segments = []
@@ -254,6 +271,11 @@ class TranscriptionWorker:
                         None, self.engine.transcribe_clip, clip_path, gap_start
                     )
                     stt_segments.extend(new_segs)
+                except TranscriptionPreempted as exc:
+                    logger.warning("Transcription preempted for %s: %s", job.job_id, exc)
+                    self.queue.mark_for_retry(job.job_id, str(exc))
+                    self.extractor.cleanup(audio_path)
+                    return
                 except Exception:
                     logger.exception("Gap-fill transcribe failed [%.2f-%.2f]", gap_start, gap_end)
                 finally:
@@ -281,8 +303,15 @@ class TranscriptionWorker:
                 # Tag STT segments with source for downstream consumers
                 for seg in segments:
                     seg.setdefault("source", "stt")
+            except TranscriptionPreempted as e:
+                logger.warning("Transcription preempted for %s: %s", job.job_id, e)
+                self.queue.mark_for_retry(job.job_id, str(e))
+                self.extractor.cleanup(audio_path)
+                return
             except Exception as e:
                 logger.error("Transcription failed for %s: %s", job.job_id, e)
+                if gpu_lease:
+                    await self.gpu_broker.abort(str(e))
                 self.queue.mark_for_retry(job.job_id, f"Transcription: {e}")
                 self.extractor.cleanup(audio_path)
                 return
@@ -314,6 +343,17 @@ class TranscriptionWorker:
                     logger.info("Speaker labels assigned to %d segments", len(segments))
             except Exception:
                 logger.exception("Diarization failed for %s (non-blocking, continuing without speakers)", job.job_id)
+
+        if gpu_lease:
+            if self.gpu_broker.preempting:
+                self.queue.mark_for_retry(
+                    job.job_id, "GPU lease reclaimed for higher-priority work"
+                )
+                self.extractor.cleanup(audio_path)
+                return
+            await loop.run_in_executor(None, self.engine.unload)
+            await loop.run_in_executor(None, diarization.unload)
+            await self.gpu_broker.complete()
 
         # Step 3: Reconcile evidence into the same progressive transcript.
         store_id = base_recording_id if is_incremental else job.recording_id
