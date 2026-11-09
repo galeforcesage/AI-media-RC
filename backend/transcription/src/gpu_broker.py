@@ -67,6 +67,7 @@ class GpuBroker:
         provider_id: str = "sagetv-cl-ollama",
         peak_vram_mb: int = 4800,
         poll_interval: float = 0.5,
+        renew_interval: float = 120.0,
     ) -> None:
         self.enabled = enabled
         self.url = url.rstrip("/")
@@ -79,12 +80,14 @@ class GpuBroker:
         self.provider_id = provider_id
         self.peak_vram_mb = peak_vram_mb
         self.poll_interval = poll_interval
+        self.renew_interval = renew_interval
         self.worker_id = f"{application_id}-{os.getpid()}"
         self._interrupt = interrupt
         self._is_running = is_running
         self._unload = unload
         self._session: Optional[aiohttp.ClientSession] = None
         self._action_task: Optional[asyncio.Task] = None
+        self._renew_task: Optional[asyncio.Task] = None
         self._lease: Optional[_Lease] = None
         self._lock = asyncio.Lock()
         self._preempting = False
@@ -145,7 +148,7 @@ class GpuBroker:
             "placement": {
                 "remote_capable": False,
                 "allowed_topologies": ["LOCAL", "LAN"],
-                "allowed_provider_types": ["OLLAMA_ENDPOINT"],
+                "allowed_provider_types": ["MANAGED_GPU"],
                 "checkpoint_required_on_intermittent": False,
             },
         }
@@ -230,7 +233,21 @@ class GpuBroker:
                 generation=int(grant.get("lease_generation", 1)),
             )
             self._preempting = False
-            await self._request("POST", f"/v1/requests/{request_id}/running")
+            status, data = await self._request(
+                "POST", f"/v1/requests/{request_id}/running"
+            )
+            if status not in (200, 201, 204):
+                lease = self._lease
+                self._lease = None
+                await self._request(
+                    "POST",
+                    f"/v1/leases/{lease.lease_id}/release",
+                    {"generation": lease.generation},
+                )
+                raise GpuBrokerUnavailable(
+                    f"GPU request could not enter running state: {status} {data}"
+                )
+            self._renew_task = asyncio.create_task(self._renew_loop())
             logger.info(
                 "GPU lease granted for %s on %s (lease=%s)",
                 work_id,
@@ -242,6 +259,7 @@ class GpuBroker:
         if not self.enabled:
             return
         async with self._lock:
+            await self._stop_renewal()
             lease = self._lease
             self._lease = None
             if lease is None or self._preempting:
@@ -258,6 +276,7 @@ class GpuBroker:
         if not self.enabled:
             return
         async with self._lock:
+            await self._stop_renewal()
             lease = self._lease
             self._lease = None
             if lease is None or self._preempting:
@@ -267,6 +286,49 @@ class GpuBroker:
             )
             if status not in (200, 201, 204):
                 logger.warning("GPU request failure report failed: %s %s", status, data)
+
+    async def _renew_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.renew_interval)
+                lease = self._lease
+                if lease is None or self._preempting:
+                    return
+                status, data = await self._request(
+                    "POST",
+                    f"/v1/leases/{lease.lease_id}/renew",
+                    {"generation": lease.generation},
+                )
+                if status != 200:
+                    logger.error("GPU lease renewal failed: %s %s", status, data)
+                    self._preempting = True
+                    self._interrupt()
+                    return
+                if self._lease is lease:
+                    lease.generation = int(data.get("generation", lease.generation))
+                    logger.debug(
+                        "Renewed GPU lease %s (generation=%d)",
+                        lease.lease_id,
+                        lease.generation,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("GPU lease renewal failed")
+                self._preempting = True
+                self._interrupt()
+                return
+
+    async def _stop_renewal(self) -> None:
+        task = self._renew_task
+        self._renew_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _action_loop(self) -> None:
         while True:
@@ -324,6 +386,7 @@ class GpuBroker:
             return
 
         if phase == "COMMIT":
+            await self._stop_renewal()
             await asyncio.to_thread(self._unload)
             await self._complete_action(
                 claimed,
@@ -360,6 +423,7 @@ class GpuBroker:
             logger.warning("GPU action completion failed: %s %s", status, data)
 
     async def shutdown(self) -> None:
+        await self._stop_renewal()
         if self._action_task:
             self._action_task.cancel()
             try:

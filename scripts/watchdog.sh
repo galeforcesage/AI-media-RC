@@ -180,7 +180,8 @@ run_watchdog() {
         #   137 = SIGKILL (kill -9, or OOM killer)
         #   143 = SIGTERM (kill, systemctl stop)
         #   130 = SIGINT  (Ctrl-C)
-        # These are almost always intentional — do NOT restart.
+        # SIGINT/SIGTERM are intentional stops. SIGKILL may be an OOM kill or
+        # external termination, so it must go through normal crash recovery.
         # A real crash (segfault=139, abort=134) or non-zero app exit SHOULD restart.
         # Code 0 (clean exit) also restarts — services should run forever;
         # a clean exit is unexpected and likely a bug.
@@ -191,9 +192,8 @@ run_watchdog() {
                 break
                 ;;
             137)  # SIGKILL
-                echo "[$(date '+%F %T')] $svc killed by SIGKILL (code 137) — manual kill or OOM, not restarting" >> "$wlog"
-                rm -f "$pidfile"
-                break
+                echo "[$(date '+%F %T')] $svc killed by SIGKILL (code 137) — restarting with crash-loop protection" >> "$wlog"
+                emit_alert "$svc" "warning" "sigkill_restart" "killed by SIGKILL or OOM; restarting"
                 ;;
             143)  # SIGTERM
                 echo "[$(date '+%F %T')] $svc killed by SIGTERM (code 143), not restarting" >> "$wlog"
