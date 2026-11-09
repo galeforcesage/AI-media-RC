@@ -5,8 +5,9 @@ Closed Caption extraction for the transcription pipeline.
 Strategy:
   1. Try `ccextractor` first - best for ATSC/MPEG-TS CEA-608/708 (most OTA recordings).
   2. Fall back to ffmpeg subtitle stream extraction for IPTV / explicit subtitle tracks.
-  3. Return whisper-compatible segment list: [{"start", "end", "text"}, ...].
-  4. analyze() computes coverage %, max gap, etc. so the worker can decide CC-only
+  3. Fall back to ffmpeg's lavfi subcc output for captions embedded in video user data.
+  4. Return whisper-compatible segment list: [{"start", "end", "text"}, ...].
+  5. analyze() computes coverage %, max gap, etc. so the worker can decide CC-only
      vs STT-full vs gap-fill.
 
 Designed to be cheap to call: ccextractor reads only a small portion of the stream
@@ -76,8 +77,11 @@ def _parse_srt(srt_text: str) -> List[Dict]:
         start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000.0
         end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000.0
         text = " ".join(lines[text_start_idx:]).strip()
-        # Strip simple HTML/font tags ccextractor sometimes emits
+        # Strip HTML/font and ASS positioning tags emitted by ffmpeg subcc.
         text = re.sub(r"<[^>]+>", "", text).strip()
+        text = re.sub(r"\{\\[^}]+\}", "", text)
+        text = text.replace(r"\h", " ")
+        text = re.sub(r"\s+", " ", text).strip()
         if not text:
             continue
         segments.append({"start": round(start, 2), "end": round(end, 2), "text": text})
@@ -219,6 +223,46 @@ def _run_ffmpeg_subtitles(video_path: str) -> Optional[List[Dict]]:
             pass
 
 
+def _run_ffmpeg_subcc(video_path: str) -> Optional[List[Dict]]:
+    """Extract CEA-608/708 carried in video user data via lavfi's subcc output."""
+    if not shutil.which("ffmpeg"):
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
+        out_path = tmp.name
+    try:
+        escaped = video_path.replace("\\", "/").replace("'", r"\'")
+        movie_input = f"movie='{escaped}'[out0+subcc]"
+        cmd = [
+            "nice", "-n", "19", "ionice", "-c", "3",
+            "ffmpeg", "-loglevel", "error",
+            "-f", "lavfi", "-i", movie_input,
+            "-map", "0:s:0", "-c:s", "srt", "-y", out_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            if proc.returncode != 0:
+                logger.debug(
+                    "ffmpeg subcc exit %d: %s",
+                    proc.returncode, proc.stderr[-300:] if proc.stderr else "",
+                )
+            return None
+        with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+            segments = _parse_srt(f.read())
+        return segments or None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg subcc extraction timed out for %s", video_path)
+        return None
+    except Exception:
+        logger.exception("ffmpeg subcc extraction failed for %s", video_path)
+        return None
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except OSError:
+            pass
+
+
 def extract(video_path: str) -> Optional[List[Dict]]:
     """Try to extract closed captions from a video file.
 
@@ -237,6 +281,15 @@ def extract(video_path: str) -> Optional[List[Dict]]:
     segments = _run_ffmpeg_subtitles(video_path)
     if segments:
         logger.info("CC extracted via ffmpeg: %d segments from %s", len(segments), os.path.basename(video_path))
+        return segments
+    # Broadcast CEA-608/708 often lives inside MPEG video user data rather than
+    # a container subtitle stream (Channels DVR recordings use this form).
+    segments = _run_ffmpeg_subcc(video_path)
+    if segments:
+        logger.info(
+            "CC extracted via ffmpeg subcc: %d segments from %s",
+            len(segments), os.path.basename(video_path),
+        )
         return segments
     return None
 

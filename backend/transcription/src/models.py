@@ -24,6 +24,7 @@ class TranscriptionJob:
     created_at: float = 0.0
     updated_at: float = 0.0
     duration: float = 0.0
+    priority: int = 0
 
     def __post_init__(self):
         if not self.job_id:
@@ -50,7 +51,9 @@ class TranscriptMetadata:
     topics: List[str] = field(default_factory=list)
     scenes: List[Dict] = field(default_factory=list)
     vtt: str = ""
-    source: str = "stt"  # 'stt' | 'cc' | 'mixed' — how the transcript was produced
+    source: str = "stt"  # stt | cc | mixed | progressive
+    transcript_state: str = "final"  # live | stable | final
+    segments: List[Dict] = field(default_factory=list)
     created_at: float = 0.0
 
     def __post_init__(self):

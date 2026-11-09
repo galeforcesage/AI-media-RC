@@ -57,7 +57,7 @@ SVC_DIR[transcription]="$ROOT/backend/transcription"
 _NCPU=$(nproc 2>/dev/null || echo 4)
 _WHISPER_THREADS=$(( _NCPU / 4 > 0 ? _NCPU / 4 : 1 ))
 _FFMPEG_THREADS=$(( _WHISPER_THREADS / 2 > 0 ? _WHISPER_THREADS / 2 : 1 ))
-SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
+SVC_CMD[transcription]="env OMP_NUM_THREADS=$_WHISPER_THREADS MKL_NUM_THREADS=$_WHISPER_THREADS OPENBLAS_NUM_THREADS=$_WHISPER_THREADS TORCH_NUM_THREADS=$_WHISPER_THREADS GPU_BROKER_ENABLED=1 GPU_BROKER_URL=http://127.0.0.1:7235 GPU_BROKER_PROVIDER=sagetv-cl-ollama GPU_BROKER_ENV_FILE=/home/sagetv/.config/gpu-broker/agent.env nice -n 19 $TRANS_VENV main.py --debug --whisper-threads $_WHISPER_THREADS --ffmpeg-threads $_FFMPEG_THREADS --channels-dir /media/sagetv/ChannelsDVR8TB/ChannelsDVR/TV /media/sagetv/ChannelsDVR8TB/ChannelsDVR/PlayOn /media/sagetv/ChannelsDVR8TB/ChannelsDVR/Movies"
 SVC_LOG[transcription]="/tmp/transcription.log"
 SVC_PORT[transcription]=8770
 
@@ -180,7 +180,8 @@ run_watchdog() {
         #   137 = SIGKILL (kill -9, or OOM killer)
         #   143 = SIGTERM (kill, systemctl stop)
         #   130 = SIGINT  (Ctrl-C)
-        # These are almost always intentional — do NOT restart.
+        # SIGINT/SIGTERM are intentional stops. SIGKILL may be an OOM kill or
+        # external termination, so it must go through normal crash recovery.
         # A real crash (segfault=139, abort=134) or non-zero app exit SHOULD restart.
         # Code 0 (clean exit) also restarts — services should run forever;
         # a clean exit is unexpected and likely a bug.
@@ -191,9 +192,8 @@ run_watchdog() {
                 break
                 ;;
             137)  # SIGKILL
-                echo "[$(date '+%F %T')] $svc killed by SIGKILL (code 137) — manual kill or OOM, not restarting" >> "$wlog"
-                rm -f "$pidfile"
-                break
+                echo "[$(date '+%F %T')] $svc killed by SIGKILL (code 137) — restarting with crash-loop protection" >> "$wlog"
+                emit_alert "$svc" "warning" "sigkill_restart" "killed by SIGKILL or OOM; restarting"
                 ;;
             143)  # SIGTERM
                 echo "[$(date '+%F %T')] $svc killed by SIGTERM (code 143), not restarting" >> "$wlog"

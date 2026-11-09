@@ -40,6 +40,17 @@
         "embed_model": "all-MiniLM-L6-v2",
         "encode_batch_size": 64
     },
+    "ui": {
+        "enabled": true,
+        "protocol": "a2ui-v0.9.1",
+        "mode": "deterministic",
+        "renderer": "local-web-components",
+        "catalog_id": "urn:llm-remote:a2ui:catalog:v1",
+        "allow_model_layout": false,
+        "max_components_per_surface": 100,
+        "pending_action_ttl_seconds": 300,
+        "text_fallback": true
+    },
     "mcp": {
         "sagetv_host": "127.0.0.1",
         "sagetv_port": 8766,

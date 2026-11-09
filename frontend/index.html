@@ -11,7 +11,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css?v=3.4.2">
+<link rel="stylesheet" href="css/style.css?v=3.4.3">
 </head>
 <body>
   <!-- Region 1: Header -->
@@ -324,6 +324,7 @@
       <p>Loading...</p>
     </div>
     <div class="transcript-actions" id="transcript-actions" hidden>
+      <button type="button" id="transcript-ask-copilot" class="btn-small transcript-copilot-btn">Copy &amp; Ask Copilot</button>
       <button type="button" id="transcript-edit" class="btn-small">&#9998; Edit</button>
       <button type="button" id="transcript-save" class="btn-small" hidden>&#128190; Save</button>
       <button type="button" id="transcript-cancel-edit" class="btn-small" hidden>Cancel</button>
@@ -342,11 +343,12 @@
   </dialog>
 
   <script src="js/api.js?v=3.4.2"></script>
-  <script src="js/state.js?v=3.4.2"></script>
-  <script src="js/ui.js?v=3.4.2"></script>
+  <script src="js/state.js?v=3.4.3"></script>
+  <script src="js/ui.js?v=3.4.4"></script>
+  <script src="js/a2ui.js?v=1.0.0"></script>
   <script src="js/pcm16-streamer.js?v=3.4.2"></script>
   <script src="js/voice.js?v=3.4.2"></script>
-  <script src="js/app.js?v=3.4.8"></script>
+  <script src="js/app.js?v=3.4.13"></script>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(function(err) {

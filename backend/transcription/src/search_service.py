@@ -91,12 +91,16 @@ class TranscriptSearchService:
             ep = r.get("episode_title", "")
             start = r.get("start_time", 0)
             snippet = r.get("snippet", "").replace("<b>", "").replace("</b>", "")
+            state = str(r.get("transcript_state") or "final").upper()
+            trust = "" if state == "FINAL" else f"[{state} transcript] "
 
             time_str = _format_time(start)
             if ep:
-                lines.append(f'From "{title}" - "{ep}" at {time_str}: {snippet}')
+                lines.append(
+                    f'{trust}From "{title}" - "{ep}" at {time_str}: {snippet}'
+                )
             else:
-                lines.append(f'From "{title}" at {time_str}: {snippet}')
+                lines.append(f'{trust}From "{title}" at {time_str}: {snippet}')
 
         return "\n".join(lines)
 

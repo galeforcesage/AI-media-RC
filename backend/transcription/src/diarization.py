@@ -10,6 +10,7 @@ to character/role names from metadata.
 from __future__ import annotations
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +19,22 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded pyannote pipeline
 _pipeline = None
 _pipeline_failed = False
+_running = threading.Event()
+
+
+def is_running() -> bool:
+    return _running.is_set()
+
+
+def unload() -> None:
+    global _pipeline
+    _pipeline = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        logger.debug("Diarization CUDA cache release failed", exc_info=True)
 
 
 def _get_hf_token() -> Optional[str]:
@@ -138,33 +155,34 @@ def diarize(audio_path: str) -> List[Dict[str, Any]]:
         {speaker: "SPEAKER_00", start: float, end: float}
     sorted by start time.
     """
-    pipeline = _load_pipeline()
-    if pipeline is None:
-        return []
+    _running.set()
+    try:
+        pipeline = _load_pipeline()
+        if pipeline is None:
+            return []
 
-    logger.info("Running diarization on %s", audio_path)
-    start = time.time()
-    # Load audio ourselves to bypass torchcodec AudioDecoder issue
-    audio_input = _load_audio_as_waveform(audio_path)
-    result = pipeline(audio_input)
-    elapsed = time.time() - start
-    logger.info("Diarization complete in %.1fs", elapsed)
+        logger.info("Running diarization on %s", audio_path)
+        start = time.time()
+        audio_input = _load_audio_as_waveform(audio_path)
+        result = pipeline(audio_input)
+        elapsed = time.time() - start
+        logger.info("Diarization complete in %.1fs", elapsed)
 
-    # Newer pyannote returns DiarizeOutput wrapper; extract Annotation
-    annotation = getattr(result, "speaker_diarization", result)
+        annotation = getattr(result, "speaker_diarization", result)
+        turns = []
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
+            turns.append({
+                "speaker": speaker,
+                "start": round(turn.start, 2),
+                "end": round(turn.end, 2),
+            })
+        turns.sort(key=lambda t: t["start"])
 
-    turns = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
-        turns.append({
-            "speaker": speaker,
-            "start": round(turn.start, 2),
-            "end": round(turn.end, 2),
-        })
-    turns.sort(key=lambda t: t["start"])
-
-    n_speakers = len({t["speaker"] for t in turns})
-    logger.info("Diarization found %d speakers, %d turns", n_speakers, len(turns))
-    return turns
+        n_speakers = len({t["speaker"] for t in turns})
+        logger.info("Diarization found %d speakers, %d turns", n_speakers, len(turns))
+        return turns
+    finally:
+        _running.clear()
 
 
 def align_speakers_to_segments(
