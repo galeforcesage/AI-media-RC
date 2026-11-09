@@ -32,7 +32,7 @@ from src.worker import TranscriptionWorker
 from src.enrichment import MetadataEnrichmentPipeline
 from src.transcript_index import TranscriptIndex
 from src.sidecar import TranscriptSidecar
-from src.discovery import discover_all
+from src.discovery import SageTVRecordingValidator, discover_all
 from src.progressive import LiveTranscriptMonitor
 from src import diarization
 
@@ -131,11 +131,16 @@ async def run(args: argparse.Namespace) -> None:
             server.index.delete_recording(recording_id)
             logging.getLogger(__name__).info("Cleaned up transcript data for deleted file: %s", recording_id)
 
+        sagetv_validator = SageTVRecordingValidator(
+            sagetv_mcp_host, sagetv_mcp_port
+        )
+
         # Start watchers for each discovered directory
         for i, d in enumerate(sagetv_dirs):
             name = f"sagetv-{i}" if len(sagetv_dirs) > 1 else "sagetv"
             watcher = FileWatcher(name, d, "sagetv", queue, enable_live=not args.no_live,
-                                  on_file_deleted=on_file_deleted)
+                                  on_file_deleted=on_file_deleted,
+                                  recording_validator=sagetv_validator)
             live_monitor.register(watcher)
             tasks.append(asyncio.create_task(watcher.start()))
             logging.getLogger(__name__).info("Watching SageTV dir: %s", d)

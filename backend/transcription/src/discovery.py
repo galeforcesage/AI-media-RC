@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Recognised media extensions for quick "has recordings?" check
 _MEDIA_EXTS = {".mpg", ".ts", ".mkv", ".mp4", ".avi"}
+_SAGETV_RECORDING_NAME_RE = re.compile(r"-(?P<airing_id>\d+)-\d+$")
 
 
 async def _mcp_call_tool(host: str, port: int, tool_name: str,
@@ -52,6 +55,66 @@ async def _mcp_call_tool(host: str, port: int, tool_name: str,
     except Exception as exc:
         logger.warning("MCP call to %s:%d tool=%s failed: %s", host, port, tool_name, exc)
         return None
+
+
+class SageTVRecordingValidator:
+    """Reject SageTV live-TV buffers while preserving real recordings."""
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8766,
+        negative_ttl: float = 60.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.negative_ttl = negative_ttl
+        self._cache: Dict[str, tuple[bool, float]] = {}
+
+    async def __call__(self, file_path: str) -> Optional[bool]:
+        match = _SAGETV_RECORDING_NAME_RE.search(Path(file_path).stem)
+        if not match:
+            return True
+
+        airing_id = match.group("airing_id")
+        cached = self._cache.get(airing_id)
+        if cached:
+            accepted, cached_at = cached
+            if accepted or time.monotonic() - cached_at < self.negative_ttl:
+                return accepted
+            self._cache.pop(airing_id, None)
+
+        result = await _mcp_call_tool(
+            self.host,
+            self.port,
+            "sagetv_get_airing",
+            {"airing_id": airing_id},
+        )
+        if result is None:
+            return None
+        if not result.get("success"):
+            logger.warning(
+                "SageTV airing lookup rejected %s: %s",
+                file_path,
+                result.get("message") or result.get("error") or "not found",
+            )
+            self._cache[airing_id] = (False, time.monotonic())
+            return False
+
+        data = result.get("data") or {}
+        airing = data.get("Airing") or data.get("airing") or data
+        if not isinstance(airing, dict):
+            return None
+
+        is_recording = not bool(airing.get("IsNotManualOrFavorite", False))
+        self._cache[airing_id] = (is_recording, time.monotonic())
+        if not is_recording:
+            logger.info(
+                "Skipping SageTV live-TV/orphan segment for airing %s: %s",
+                airing_id,
+                file_path,
+            )
+        return is_recording
 
 
 async def discover_sagetv_dirs(host: str = "127.0.0.1", port: int = 8766) -> List[str]:

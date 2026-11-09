@@ -16,7 +16,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Awaitable, Callable, Dict, Optional, Set
 
 from .models import TranscriptionJob
 from .queue import TranscriptionQueue
@@ -53,6 +53,9 @@ class FileWatcher:
         queue: TranscriptionQueue,
         enable_live: bool = True,
         on_file_deleted=None,
+        recording_validator: Optional[
+            Callable[[str], Awaitable[Optional[bool]]]
+        ] = None,
     ):
         self.name = name
         self.watch_dir = watch_dir
@@ -60,6 +63,7 @@ class FileWatcher:
         self.queue = queue
         self.enable_live = enable_live
         self.on_file_deleted = on_file_deleted  # callback(recording_id: str)
+        self.recording_validator = recording_validator
         self._known_files: Dict[str, float] = {}  # path -> mtime at first sight
         self._pending: Dict[str, float] = {}  # path -> last_modified
         self._pending_size: Dict[str, int] = {}  # path -> last known size
@@ -91,7 +95,7 @@ class FileWatcher:
                      len(self._known_files))
         while self._running:
             try:
-                self._scan()
+                await self._scan()
             except Exception:
                 logger.exception("Watcher '%s' scan error", self.name)
             await asyncio.sleep(POLL_INTERVAL)
@@ -117,7 +121,7 @@ class FileWatcher:
     def stop(self) -> None:
         self._running = False
 
-    def _scan(self) -> None:
+    async def _scan(self) -> None:
         watch_path = Path(self.watch_dir)
         if not watch_path.is_dir():
             return
@@ -154,6 +158,16 @@ class FileWatcher:
                 continue  # Ignore empty/partial files
 
             if path_str not in self._known_files:
+                if self.recording_validator:
+                    accepted = await self.recording_validator(path_str)
+                    if accepted is None:
+                        logger.warning(
+                            "Recording validation unavailable; will retry: %s",
+                            path_str,
+                        )
+                        continue
+                    if not accepted:
+                        continue
                 # New file — start debounce
                 self._known_files[path_str] = mtime
                 self._pending[path_str] = mtime
